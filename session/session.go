@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/wzhooh/agentkit/llm"
+	"github.com/MIZUDINOV/awesome-go-agents/llm"
 )
 
 // Session is the durable handle over an append-only event log. Append appends

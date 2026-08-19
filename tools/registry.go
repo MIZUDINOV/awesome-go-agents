@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/wzhooh/agentkit/llm"
+	"github.com/MIZUDINOV/awesome-go-agents/llm"
 )
 
 // Hook is a pipeline extension point invoked before/after execution.

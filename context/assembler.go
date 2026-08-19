@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/wzhooh/agentkit/llm"
+	"github.com/MIZUDINOV/awesome-go-agents/llm"
 )
 
 // Section is one ordered block of the system prompt.

@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wzhooh/agentkit/llm"
+	"github.com/MIZUDINOV/awesome-go-agents/llm"
 )
 
 type toolAccumulator struct {

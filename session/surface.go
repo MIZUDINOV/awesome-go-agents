@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/wzhooh/agentkit/llm"
+	"github.com/MIZUDINOV/awesome-go-agents/llm"
 )
 
 // CompactedRegion describes a slice of events that has been summarised. The

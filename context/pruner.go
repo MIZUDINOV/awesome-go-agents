@@ -3,7 +3,7 @@ package context
 import (
 	"strings"
 
-	"github.com/wzhooh/agentkit/llm"
+	"github.com/MIZUDINOV/awesome-go-agents/llm"
 )
 
 // PruneCaps bound how a single tool result is truncated deterministically

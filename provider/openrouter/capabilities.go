@@ -1,6 +1,6 @@
 package openrouter
 
-import "github.com/wzhooh/agentkit/llm"
+import "github.com/MIZUDINOV/awesome-go-agents/llm"
 
 // Catalog maps model ids to capability metadata. This is the production source
 // of truth for compaction thresholds; it replaces hard-coded agent constants.

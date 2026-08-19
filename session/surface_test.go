@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/wzhooh/agentkit/llm"
+	"github.com/MIZUDINOV/awesome-go-agents/llm"
 )
 
 func TestSurfaceProjectsOnlySurfaceEvents(t *testing.T) {

@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/wzhooh/agentkit/session"
+	"github.com/MIZUDINOV/awesome-go-agents/session"
 )
 
 // Store is a PostgreSQL-backed session.Store.

@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/wzhooh/agentkit/llm"
+	"github.com/MIZUDINOV/awesome-go-agents/llm"
 )
 
 // Client is the OpenRouter llm.Provider implementation.

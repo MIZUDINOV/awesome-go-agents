@@ -1,4 +1,4 @@
-module github.com/wzhooh/agentkit
+module github.com/MIZUDINOV/awesome-go-agents
 
 go 1.26.6
 
