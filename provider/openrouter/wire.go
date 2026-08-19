@@ -191,8 +191,15 @@ func buildRequest(modelName string, req *llm.Request, config GenerateConfig, str
 			choice = "auto"
 		}
 		request["tool_choice"] = choice
-		if config.ParallelToolCalls != nil {
-			request["parallel_tool_calls"] = *config.ParallelToolCalls
+		// The durable scheduler forces sequential tool execution
+		// (H-SCHED-001). llm.Request.ParallelToolCalls (the neutral signal)
+		// wins over the opaque config.
+		parallel := config.ParallelToolCalls
+		if req.ParallelToolCalls != nil {
+			parallel = req.ParallelToolCalls
+		}
+		if parallel != nil {
+			request["parallel_tool_calls"] = *parallel
 		}
 	}
 	if len(req.StructuredOutputSchema) > 0 {

@@ -64,12 +64,12 @@ type ToolCallResult struct {
 
 // Part is one unit of message content.
 type Part struct {
-	Type       PartType        `json:"type"`
-	Text       string          `json:"text,omitempty"`
-	Media      *MediaContent   `json:"media,omitempty"`
+	Type       PartType         `json:"type"`
+	Text       string           `json:"text,omitempty"`
+	Media      *MediaContent    `json:"media,omitempty"`
 	ToolCall   *ToolCallRequest `json:"tool_call,omitempty"`
 	ToolResult *ToolCallResult  `json:"tool_result,omitempty"`
-	Reasoning  string          `json:"reasoning,omitempty"`
+	Reasoning  string           `json:"reasoning,omitempty"`
 
 	// Custom carries provider-specific part enrichment (e.g. OpenRouter
 	// file parts, annotations) as opaque JSON.
@@ -80,8 +80,8 @@ type Part struct {
 // persists reasoning details, annotations, or routing diagnostics without
 // polluting the visible content.
 type Message struct {
-	Role     Role       `json:"role"`
-	Parts    []Part     `json:"parts,omitempty"`
+	Role     Role           `json:"role"`
+	Parts    []Part         `json:"parts,omitempty"`
 	Metadata map[string]any `json:"metadata,omitempty"`
 }
 

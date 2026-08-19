@@ -6,8 +6,8 @@ import "encoding/json"
 // needs to decide whether and how to call it. Runtime concerns (executor,
 // renderers, concurrency, timeout) live in agentkit/tools, never here.
 type ToolDefinition struct {
-	Name        string          `json:"name"`
-	Description string          `json:"description"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
 	// InputSchema is the JSON Schema (object type) for the tool arguments.
 	InputSchema json.RawMessage `json:"input_schema"`
 	// Strict requests strict JSON Schema adherence when the provider supports

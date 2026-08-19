@@ -1,8 +1,6 @@
 package context
 
 import (
-	"strings"
-
 	"github.com/MIZUDINOV/awesome-go-agents/llm"
 )
 
@@ -22,15 +20,26 @@ func DefaultPruneCaps() PruneCaps {
 	return PruneCaps{ThresholdChars: 8192, HeadChars: 4096, TailChars: 1024}
 }
 
-// PruneResult truncates a single tool result string in place, inserting a
-// mid-marker. Returns the possibly-shortened string.
+// PruneResult truncates a single tool result string, inserting a mid-marker.
+// Truncation is Unicode-safe: caps are measured in Unicode code points, so a
+// multi-byte rune is never split (H-PRUNE-004). Returns the possibly-shortened
+// string without mutating the input.
 func (c PruneCaps) PruneResult(text string) string {
-	if len(text) <= c.ThresholdChars {
+	runes := []rune(text)
+	if len(runes) <= c.ThresholdChars {
 		return text
 	}
-	head := text[:min(c.HeadChars, len(text))]
-	tail := text[len(text)-min(c.TailChars, len(text)):]
-	return head + "\n... pruned ...\n" + tail
+	headCount := clamp(c.HeadChars, 0, len(runes))
+	tailCount := clamp(c.TailChars, 0, len(runes))
+	if headCount+tailCount >= len(runes) {
+		// Nothing meaningful can be removed; keep the original intact rather
+		// than returning something longer than the source.
+		return text
+	}
+	head := string(runes[:headCount])
+	tail := string(runes[len(runes)-tailCount:])
+	const marker = "\n... pruned ...\n"
+	return head + marker + tail
 }
 
 // PruneMessages rewrites oversized tool results across a message slice,
@@ -65,23 +74,26 @@ type SpillRef struct {
 }
 
 // Spill caps inline output and returns a SpillRef when the result exceeds the
-// maxInlineBytes.
+// maxInlineBytes. Both caps are measured in Unicode code points so multi-byte
+// runes are never split; the preview is taken from the tail.
 func Spill(maxInlineBytes int, previewTail int, full string, artifact string) (string, *SpillRef) {
-	if len(full) <= maxInlineBytes {
+	runes := []rune(full)
+	if len(runes) <= maxInlineBytes {
 		return full, nil
 	}
 	preview := full
-	if previewTail > 0 && len(preview) > previewTail {
-		preview = preview[len(preview)-previewTail:]
+	if previewTail > 0 && len(runes) > previewTail {
+		preview = string(runes[len(runes)-previewTail:])
 	}
 	return preview, &SpillRef{Artifact: artifact, Preview: preview}
 }
 
-func min(a, b int) int {
-	if a < b {
-		return a
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
 	}
-	return b
+	if v > hi {
+		return hi
+	}
+	return v
 }
-
-var _ = strings.TrimSpace

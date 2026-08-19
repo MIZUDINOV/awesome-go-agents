@@ -2,12 +2,16 @@ package session
 
 import (
 	"context"
-	"encoding/json"
 	"sync"
 )
 
 // Store persists the append-only event log. The real deployment uses
 // PGSessionStore (PostgreSQL); MemoryStore is used in tests and embedded runs.
+//
+// Contract: Append atomically assigns strictly increasing per-session sequence
+// numbers to the batch (contiguous, no gaps within one batch) and returns the
+// seq of the last event. The input slice is never mutated; callers read back
+// per-event seqs from the returned last seq assuming contiguity.
 type Store interface {
 	// Append persists events and returns the seq assigned to the last one.
 	Append(ctx context.Context, sessionID string, events []Event) (uint64, error)
@@ -20,11 +24,18 @@ type Store interface {
 }
 
 // MemoryStore is an in-memory, concurrency-safe Store for tests and embedded
-// use. It does not survive restarts.
+// use. It does not survive restarts. Events are deep-copied into internal
+// storage so later caller mutations never leak into committed history
+// (H-SESSION-004).
 type MemoryStore struct {
-	mu       sync.RWMutex
-	next     map[string]uint64
-	events   map[string][]Event
+	mu     sync.RWMutex
+	next   map[string]uint64
+	events map[string][]Event
+
+	// Fenced single-writer state.
+	leases      map[string]Lease
+	fences      map[string]uint64
+	checkpoints map[string][]CompactionCheckpoint
 }
 
 // NewMemoryStore returns an empty MemoryStore.
@@ -32,19 +43,29 @@ func NewMemoryStore() *MemoryStore {
 	return &MemoryStore{
 		next:   make(map[string]uint64),
 		events: make(map[string][]Event),
+		leases: make(map[string]Lease),
+		fences: make(map[string]uint64),
 	}
 }
 
 func (s *MemoryStore) Append(_ context.Context, sessionID string, events []Event) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.events == nil {
+		s.next = make(map[string]uint64)
+		s.events = make(map[string][]Event)
+	}
 	next := s.next[sessionID] + 1
+	stored := make([]Event, 0, len(events))
 	for i := range events {
-		events[i].Seq = next
+		e := events[i].Clone()
+		e.Seq = next
+		e.FormatVersion = e.NormalizedFormatVersion()
+		stored = append(stored, e)
 		next++
 	}
 	s.next[sessionID] = next - 1
-	s.events[sessionID] = append(s.events[sessionID], events...)
+	s.events[sessionID] = append(s.events[sessionID], stored...)
 	return next - 1, nil
 }
 
@@ -55,7 +76,7 @@ func (s *MemoryStore) Load(_ context.Context, sessionID string, afterSeq uint64,
 	var out []Event
 	for _, e := range all {
 		if e.Seq > afterSeq {
-			out = append(out, cloneEvent(e))
+			out = append(out, e.Clone())
 			if limit > 0 && len(out) >= limit {
 				break
 			}
@@ -71,14 +92,14 @@ func (s *MemoryStore) Tail(_ context.Context, sessionID string, limit int) ([]Ev
 	if limit <= 0 || len(all) <= limit {
 		out := make([]Event, len(all))
 		for i, e := range all {
-			out[i] = cloneEvent(e)
+			out[i] = e.Clone()
 		}
 		return out, nil
 	}
 	start := len(all) - limit
 	out := make([]Event, limit)
 	for i := range out {
-		out[i] = cloneEvent(all[start+i])
+		out[i] = all[start+i].Clone()
 	}
 	return out, nil
 }
@@ -87,14 +108,6 @@ func (s *MemoryStore) Sequence(_ context.Context, sessionID string) (uint64, err
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.next[sessionID], nil
-}
-
-func cloneEvent(e Event) Event {
-	e.Data = append(json.RawMessage(nil), e.Data...)
-	if e.SourceSeqs != nil {
-		e.SourceSeqs = append([]uint64(nil), e.SourceSeqs...)
-	}
-	return e
 }
 
 // ensure Store is satisfied

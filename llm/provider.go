@@ -28,6 +28,10 @@ type Request struct {
 	Tools []*ToolDefinition
 	// ToolChoice forces tool usage. Empty means "auto" when Tools exist.
 	ToolChoice ToolChoice
+	// ParallelToolCalls, when set, requests parallel tool calls. The durable
+	// scheduler keeps this false so tool ordering and fencing are
+	// deterministic (H-SCHED-001); nil defers to the provider/config default.
+	ParallelToolCalls *bool
 	// MaxTokens bounds the completion. Zero means provider default.
 	MaxTokens int64
 	// Config is provider-specific configuration (e.g. GenerateConfig for

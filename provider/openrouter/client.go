@@ -26,9 +26,15 @@ type Client struct {
 	HTTPReferer string
 	AppTitle    string
 
-	// CapabilitiesFor overrides model capability resolution (defaults to the
-	// built-in static defaults). Used for tests and model catalogs.
-	CapabilitiesFor func(model string) llm.Capabilities
+	// ModelCatalog is the authoritative model capability source. When set,
+	// Capabilities resolves from it and returns ErrUnknownModel for models
+	// that are not present (no unsafe static fallback).
+	ModelCatalog Catalog
+
+	// CapabilitiesFor is a resolver override with priority over ModelCatalog.
+	// It must return found=false for models whose capacity is unknown; keep it
+	// nil unless a custom source is required.
+	CapabilitiesFor func(model string) (llm.Capabilities, bool)
 }
 
 // New returns an OpenRouter Provider. API key is required.
@@ -48,17 +54,26 @@ func New(apiKey string, logger *slog.Logger) *Client {
 
 func (c *Client) Name() string { return ProviderName }
 
-// Capabilities resolves model capacity. Static defaults are returned unless a
-// caller provides CapabilitiesFor (production wires the model catalog).
+// Capabilities resolves model capacity from the configured authoritative
+// source (CapabilitiesFor override, then ModelCatalog). An unknown model or a
+// missing source is an explicit error: capabilities are never guessed from a
+// hard-coded default window.
 func (c *Client) Capabilities(_ context.Context, model string) (llm.Capabilities, error) {
 	if c.CapabilitiesFor != nil {
-		return c.CapabilitiesFor(model), nil
+		caps, ok := c.CapabilitiesFor(model)
+		if ok {
+			return caps, nil
+		}
+		return llm.Capabilities{}, &ErrUnknownModel{Model: model}
 	}
-	return llm.Capabilities{
-		Provider: ProviderName, Model: model,
-		ContextWindow: 1_000_000, MaxOutput: 256_000,
-		SupportsTools: true, SupportsMedia: true, SupportsSystem: true, SupportsReasoning: true,
-	}, nil
+	if c.ModelCatalog != nil {
+		caps, ok := c.ModelCatalog.CapabilitiesFor(model)
+		if ok {
+			return caps, nil
+		}
+		return llm.Capabilities{}, &ErrUnknownModel{Model: model}
+	}
+	return llm.Capabilities{}, ErrNoCapabilitySource
 }
 
 func (c *Client) Generate(ctx context.Context, req *llm.Request, cb llm.StreamCallback) (*llm.Response, error) {
@@ -183,7 +198,7 @@ func requestMetadataValue(payload map[string]any, key string) string {
 func wrapProviderError(e *Error) *llm.Error {
 	kind := classifyError(e)
 	return &llm.Error{
-		Kind: kind, Message: e.Message, ProviderCode: e.ProviderCode,
+		Kind: kind, Code: e.Type, Message: e.Message, ProviderCode: e.ProviderCode,
 		StatusCode: e.StatusCode, Retryable: e.Temporary(),
 		StreamStarted: e.StreamStarted, Cause: e,
 	}
@@ -193,11 +208,18 @@ func classifyError(e *Error) llm.ErrorKind {
 	switch e.Type {
 	case "rate_limit_exceeded":
 		return llm.ErrorKindRateLimit
+	case "context_length_exceeded", "prompt_too_long", "max_context_length", "context_window_exceeded":
+		return llm.ErrorKindContextOverflow
 	case "provider_overloaded", "provider_unavailable", "timeout", "server", "network", "premature_eof":
 		return llm.ErrorKindProvider
 	case "authentication_error", "invalid_api_key", "permission":
 		return llm.ErrorKindAuth
 	case "invalid_request_error", "bad_request":
+		// OpenRouter frequently surfaces overflow as an invalid request whose
+		// message names the model's context limit (H-OVERFLOW-001).
+		if isContextOverflowMessage(e.Message) {
+			return llm.ErrorKindContextOverflow
+		}
 		return llm.ErrorKindInvalidRequest
 	}
 	if e.StatusCode == http.StatusUnauthorized || e.StatusCode == http.StatusForbidden {
@@ -206,7 +228,26 @@ func classifyError(e *Error) llm.ErrorKind {
 	if e.StatusCode == http.StatusTooManyRequests || e.StatusCode >= 500 {
 		return llm.ErrorKindProvider
 	}
+	if (e.StatusCode == http.StatusBadRequest || e.StatusCode == http.StatusRequestEntityTooLarge) && isContextOverflowMessage(e.Message) {
+		return llm.ErrorKindContextOverflow
+	}
 	return llm.ErrorKindUnknown
+}
+
+// isContextOverflowMessage is a conservative message heuristic used only when
+// OpenRouter does not supply a structured overflow error type.
+func isContextOverflowMessage(message string) bool {
+	lower := strings.ToLower(message)
+	for _, marker := range []string{
+		"context length", "maximum context", "context window",
+		"prompt is too long", "exceeds the model's context", "max context",
+		"too many tokens in request",
+	} {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func defaultHTTPClient() *http.Client {

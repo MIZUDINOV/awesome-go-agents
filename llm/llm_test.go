@@ -19,6 +19,16 @@ func TestIsContextOverflow(t *testing.T) {
 	}
 }
 
+func TestErrorCode(t *testing.T) {
+	err := &Error{Kind: ErrorKindContextOverflow, Code: "context_length_exceeded", Message: "exceeded"}
+	if err.Code != "context_length_exceeded" {
+		t.Errorf("code = %q", err.Code)
+	}
+	if !IsContextOverflow(err) {
+		t.Error("expected overflow classification via Kind")
+	}
+}
+
 func TestIsRetryable(t *testing.T) {
 	if !IsRetryable(&Error{Kind: ErrorKindNetwork, Retryable: true}) {
 		t.Error("expected retryable true")

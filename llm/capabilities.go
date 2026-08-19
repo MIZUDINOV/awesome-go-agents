@@ -12,8 +12,8 @@ type Capabilities struct {
 	// MaxOutput is the model's maximum completion length in tokens.
 	MaxOutput int64
 
-	SupportsTools   bool
-	SupportsMedia   bool
-	SupportsSystem  bool
+	SupportsTools     bool
+	SupportsMedia     bool
+	SupportsSystem    bool
 	SupportsReasoning bool
 }

@@ -10,22 +10,27 @@ import (
 type ErrorKind string
 
 const (
-	ErrorKindUnknown        ErrorKind = "unknown"
-	ErrorKindNetwork        ErrorKind = "network"
-	ErrorKindRateLimit      ErrorKind = "rate_limit"
-	ErrorKindProvider       ErrorKind = "provider"
-	ErrorKindAuth           ErrorKind = "auth"
-	ErrorKindInvalidRequest ErrorKind = "invalid_request"
+	ErrorKindUnknown         ErrorKind = "unknown"
+	ErrorKindNetwork         ErrorKind = "network"
+	ErrorKindRateLimit       ErrorKind = "rate_limit"
+	ErrorKindProvider        ErrorKind = "provider"
+	ErrorKindAuth            ErrorKind = "auth"
+	ErrorKindInvalidRequest  ErrorKind = "invalid_request"
 	ErrorKindContextOverflow ErrorKind = "context_overflow"
-	ErrorKindPrematureEOF   ErrorKind = "premature_eof"
+	ErrorKindPrematureEOF    ErrorKind = "premature_eof"
 )
 
 // Error is the provider-neutral error returned by a Provider. Providers SHOULD
-// populate Kind and Retryable so the loop does not need provider-specific
+// populate Kind, Code and Retryable so the loop does not need provider-specific
 // knowledge. StreamStarted distinguishes a failure partway through a stream
 // (not safe to blind-retry a side-effecting turn).
 type Error struct {
-	Kind          ErrorKind
+	Kind ErrorKind
+	// Code is a stable, provider-specific machine-readable error code from the
+	// provider's own taxonomy (e.g. the OpenRouter error type). It is the
+	// canonical identifier for error mapping and does not change between
+	// releases; leave empty when the provider has no distinct code.
+	Code          string
 	Message       string
 	ProviderCode  string
 	StatusCode    int
@@ -39,6 +44,10 @@ func (e *Error) Error() string {
 	var builder strings.Builder
 	builder.WriteString("agentkit llm error: kind=")
 	builder.WriteString(string(e.Kind))
+	if e.Code != "" {
+		builder.WriteString(" code=")
+		builder.WriteString(e.Code)
+	}
 	if e.StatusCode != 0 {
 		builder.WriteString(" status=")
 		builder.WriteString(itoa(e.StatusCode))

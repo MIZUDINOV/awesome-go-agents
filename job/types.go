@@ -23,12 +23,12 @@ const (
 
 // Descriptor describes a job for listing.
 type Descriptor struct {
-	ID        ID
-	Kind      string // e.g. "shell"
-	Status    State
-	StartedAt time.Time
+	ID         ID
+	Kind       string // e.g. "shell"
+	Status     State
+	StartedAt  time.Time
 	FinishedAt *time.Time
-	ExitCode  int
+	ExitCode   int
 }
 
 // OutputOptions controls job_output.
@@ -51,6 +51,17 @@ type Manager interface {
 	Output(ctx context.Context, id ID, opts OutputOptions) (Output, error)
 	// Kill requests cancellation of a job.
 	Kill(ctx context.Context, id ID, reason string) error
+}
+
+// ScopedManager is the owner-scoped job seam used by agent tools. Every
+// operation is scoped by owner (session/agent id): cross-owner access is
+// denied, kills are idempotent, and finished jobs respect retention
+// (H-JOB-001..006).
+type ScopedManager interface {
+	Start(ctx context.Context, spec Spec, owner string) (ID, error)
+	List(ctx context.Context, owner string) ([]Descriptor, error)
+	Output(ctx context.Context, id ID, opts OutputOptions, owner string) (Output, error)
+	Kill(ctx context.Context, id ID, reason string, owner string) error
 }
 
 // Spec describes what a job runs. For shell jobs, Command/Workdir are used.

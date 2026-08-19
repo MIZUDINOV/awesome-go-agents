@@ -2,6 +2,7 @@ package openrouter
 
 import (
 	"encoding/json"
+	"errors"
 	"testing"
 
 	"github.com/MIZUDINOV/awesome-go-agents/llm"
@@ -9,7 +10,7 @@ import (
 
 func TestBuildRequestMessagesAndTools(t *testing.T) {
 	req := &llm.Request{
-		Model: "deepseek/deepseek-v3",
+		Model:  "deepseek/deepseek-v3",
 		System: []llm.Message{*llm.NewTextMessage(llm.RoleSystem, "sys")},
 		Messages: []llm.Message{
 			*llm.NewUserMessage("hello"),
@@ -60,21 +61,49 @@ func TestWrapProviderErrorClassification(t *testing.T) {
 	if !llmerr.Retryable {
 		t.Error("expected retryable")
 	}
+	if llmerr.Code != "rate_limit_exceeded" {
+		t.Errorf("code = %q", llmerr.Code)
+	}
+	// Structured overflow type must classify as context overflow.
+	overflow := wrapProviderError(&Error{Type: "context_length_exceeded", StatusCode: 400})
+	if overflow.Kind != llm.ErrorKindContextOverflow {
+		t.Errorf("overflow kind = %s", overflow.Kind)
+	}
+	// Message heuristic for invalid_request_error without structured type.
+	heuristic := wrapProviderError(&Error{Type: "invalid_request_error", StatusCode: 400, Message: "This model's maximum context length is 128000 tokens. You requested 200000 tokens."})
+	if heuristic.Kind != llm.ErrorKindContextOverflow {
+		t.Errorf("heuristic overflow kind = %s", heuristic.Kind)
+	}
 }
 
 func TestCatalogCapabilities(t *testing.T) {
 	cat := Catalog{}
 	cat.Model("m-small", 65536, 4096)
-	caps, _ := (&Client{}).Capabilities(nil, "m-small")
-	_ = caps
-	resolver := cat.CapabilitiesFor("m-small")
+	resolver, ok := cat.CapabilitiesFor("m-small")
+	if !ok {
+		t.Fatal("known model not found")
+	}
 	if resolver.ContextWindow != 65536 || resolver.MaxOutput != 4096 {
 		t.Errorf("resolved = %+v", resolver)
 	}
-	// Unknown model falls back to defaults.
-	unknown := cat.CapabilitiesFor("unknown")
-	if unknown.ContextWindow != 1_000_000 {
-		t.Errorf("unknown fallback window = %d", unknown.ContextWindow)
+	// Unknown model must fail visibly: no unsafe static fallback window.
+	if _, ok := cat.CapabilitiesFor("unknown"); ok {
+		t.Error("expected unknown model to be missing from catalog")
+	}
+	client := &Client{}
+	if _, err := client.Capabilities(nil, "m-small"); !errors.Is(err, ErrNoCapabilitySource) {
+		t.Errorf("expected ErrNoCapabilitySource, got %v", err)
+	}
+	client.ModelCatalog = cat
+	if _, err := client.Capabilities(nil, "unknown"); err == nil {
+		t.Error("expected unknown model error")
+	}
+	caps, err := client.Capabilities(nil, "m-small")
+	if err != nil {
+		t.Fatalf("capabilities: %v", err)
+	}
+	if caps.ContextWindow != 65536 {
+		t.Errorf("window = %d", caps.ContextWindow)
 	}
 }
 

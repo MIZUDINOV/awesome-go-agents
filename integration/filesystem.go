@@ -78,12 +78,56 @@ type FileSystem interface {
 	EditText(ctx context.Context, target Target, edit EditRequest, intent EditIntent) (EditResult, error)
 }
 
+// Observation is the per-owner visibility state of a target
+// (H-FS-OBS-001..006): unseen, absent, or present with a content version.
+type Observation int
+
+const (
+	// ObservationUnseen means the session has not read the target.
+	ObservationUnseen Observation = iota
+	// ObservationAbsent means the session observed the target missing.
+	ObservationAbsent
+	// ObservationPresent means the session read the target and knows a version.
+	ObservationPresent
+)
+
+// GrepMatch is one content-search hit (path-relative, 1-based line number).
+type GrepMatch struct {
+	Path string
+	Line int
+	Text string
+}
+
+// SearchFileSystem is the optional content-search extension of FileSystem
+// (glob/grep tools). Implementations search inside their containment root,
+// return deterministic results, and never build shell commands from patterns
+// (H-PROC-003).
+type SearchFileSystem interface {
+	// Glob lists files under dir matching pattern (deterministic, bounded).
+	Glob(ctx context.Context, dir, pattern string, maxResults int) ([]string, error)
+	// Grep scans regular text files under dir; maxMatches bounds results.
+	Grep(ctx context.Context, dir, pattern string, maxMatches int, maxBytesPerFile int64) ([]GrepMatch, error)
+}
+
+// ObservationRecorder is the optional observation extension of FileSystem.
+// Tools enforce read-before-edit through it (H-EDIT-004): an edit against an
+// unobserved target is refused unless the recorder exists and the target was
+// observed. Observations are scoped per owner (session/agent) and never leak
+// between users (H-FS-OBS-007).
+type ObservationRecorder interface {
+	// Observe records the observation of a target for an owner.
+	Observe(ctx context.Context, target Target, owner string, state Observation, version string) error
+	// Observed returns the recorded state, content version and whether the
+	// target has been observed at all.
+	Observed(ctx context.Context, target Target, owner string) (Observation, string, bool)
+}
+
 // Sentinel errors returned by FileSystem implementations.
 var (
-	ErrNotObserved = errors.New("file was not read before edit (read the file, then retry)")
-	ErrStaleVersion = errors.New("file version changed since it was read (re-read, then retry)")
-	ErrAlreadyExists = errors.New("file already exists (createIfAbsent)")
-	ErrAmbiguousMatch = errors.New("old_string matched more than once (use replace_all or a more specific match)")
+	ErrNotObserved       = errors.New("file was not read before edit (read the file, then retry)")
+	ErrStaleVersion      = errors.New("file version changed since it was read (re-read, then retry)")
+	ErrAlreadyExists     = errors.New("file already exists (createIfAbsent)")
+	ErrAmbiguousMatch    = errors.New("old_string matched more than once (use replace_all or a more specific match)")
 	ErrTargetOutsideRoot = errors.New("resolved target escapes the sandbox root")
 )
 

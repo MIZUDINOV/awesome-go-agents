@@ -99,7 +99,6 @@ func (e *Error) Temporary() bool {
 	return e.StatusCode == http.StatusTooManyRequests || e.StatusCode == http.StatusServiceUnavailable || e.StatusCode >= 500
 }
 
-
 // rawMetadata marshals an optional JSON value, returning nil for emptiness.
 func rawMetadata(value any) json.RawMessage {
 	if value == nil {

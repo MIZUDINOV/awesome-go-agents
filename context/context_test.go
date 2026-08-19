@@ -3,6 +3,7 @@ package context
 import (
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestMeterEstimate(t *testing.T) {
@@ -49,9 +50,9 @@ func TestPruneResult(t *testing.T) {
 
 func TestCheckpointText(t *testing.T) {
 	c := &Checkpoint{
-		PrimaryRequest: "Build a landing page",
+		PrimaryRequest:       "Build a landing page",
 		KeyTechnicalConcepts: []string{"Tailwind", "Angular"},
-		NextStep: "Write index.html",
+		NextStep:             "Write index.html",
 	}
 	text := c.Text()
 	for _, want := range []string{"Primary Request and Intent", "Key Technical Concepts", "Tailwind", "Next Step"} {
@@ -85,6 +86,42 @@ func TestAssembler(t *testing.T) {
 	}
 	if !strings.Contains(assembly.System, "Use read before edit.") {
 		t.Errorf("system missing section: %q", assembly.System)
+	}
+}
+
+func TestPruneResultUnicodeSafe(t *testing.T) {
+	caps := PruneCaps{ThresholdChars: 10, HeadChars: 4, TailChars: 2}
+	// 4-byte runes: byte slicing would cut a rune in half.
+	big := ""
+	for i := 0; i < 40; i++ {
+		big += "😀"
+	}
+	short := caps.PruneResult(big)
+	if !utf8.ValidString(short) {
+		t.Error("pruned result is not valid UTF-8")
+	}
+	if !strings.Contains(short, "... pruned ...") {
+		t.Errorf("missing marker: %q", short)
+	}
+	// Mixed ASCII + multibyte.
+	mixed := strings.Repeat("a", 20) + "привет мир" + strings.Repeat("b", 20)
+	mixedShort := caps.PruneResult(mixed)
+	if !utf8.ValidString(mixedShort) {
+		t.Error("mixed result not valid UTF-8")
+	}
+}
+
+func TestSpillUnicodeSafe(t *testing.T) {
+	full := strings.Repeat("😀", 20)
+	inline, ref := Spill(5, 3, full, "artifact/1.log")
+	if ref == nil {
+		t.Fatal("expected spill")
+	}
+	if !utf8.ValidString(inline) {
+		t.Error("inline not valid UTF-8")
+	}
+	if ref.Preview != string([]rune(full)[17:]) {
+		t.Errorf("preview = %q", ref.Preview)
 	}
 }
 
