@@ -101,13 +101,13 @@ func (s *Session) AppendCommitted(ctx context.Context, events []Event) (Committe
 	if err != nil {
 		return CommittedBatch{}, err
 	}
-	after := uint64(0)
-	if last > uint64(len(events)) {
-		after = last - uint64(len(events))
-	}
-	loaded, err := s.store.Load(ctx, s.ID, after, 0)
-	if err != nil {
-		return CommittedBatch{}, err
+	base := last - uint64(len(batchInput)) + 1
+	loaded := make([]Event, len(batchInput))
+	for i, event := range batchInput {
+		loaded[i] = event.Clone()
+		loaded[i].SessionID = s.ID
+		loaded[i].Seq = base + uint64(i)
+		loaded[i].Normalize()
 	}
 	s.mu.Lock()
 	if s.hydrated {

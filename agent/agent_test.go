@@ -26,9 +26,10 @@ type scriptedProvider struct {
 }
 
 type scriptedStep struct {
-	text   string
-	calls  []llm.ToolCallRequest
-	finish llm.FinishReason
+	text     string
+	calls    []llm.ToolCallRequest
+	metadata map[string]any
+	finish   llm.FinishReason
 }
 
 func (s *scriptedProvider) Name() string { return "scripted" }
@@ -52,6 +53,7 @@ func (s *scriptedProvider) Generate(ctx context.Context, req *llm.Request, cb ll
 		finish = llm.FinishReasonStop
 	}
 	msg := llm.NewAssistantMessage(step.text, "", step.calls)
+	msg.Metadata = step.metadata
 	return &llm.Response{Message: msg, FinishReason: finish, Model: req.Model}, nil
 }
 
@@ -60,7 +62,8 @@ func registerProbe(t *testing.T, registry *tools.Registry, name string, failAfte
 	t.Helper()
 	registry.MustRegister(&tools.Definition{
 		Name: name, Description: "probe",
-		InputSchema: jsonRaw(`{"type":"object","properties":{"count":{"type":"integer"}},"additionalProperties":false}`),
+		InputSchema:  jsonRaw(`{"type":"object","properties":{"count":{"type":"integer"}},"additionalProperties":false}`),
+		OutputSchema: tools.AnyOutputSchema,
 		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
 			if counter != nil {
 				*counter++
@@ -78,6 +81,48 @@ func newMemoryStore() *session.MemoryStore { return session.NewMemoryStore() }
 type hostClaimStore struct {
 	*session.MemoryStore
 	claims, renewals, releases int
+}
+
+type cancelOnAdmittedStore struct {
+	*session.MemoryStore
+	cancel context.CancelFunc
+}
+
+type cleanupLeaseStore struct {
+	*session.MemoryStore
+	releases, canceledReleases int
+}
+
+func (s *cleanupLeaseStore) ReleaseLease(ctx context.Context, lease session.Lease) error {
+	if err := ctx.Err(); err != nil {
+		s.canceledReleases++
+		return err
+	}
+	s.releases++
+	return s.MemoryStore.ReleaseLease(context.Background(), lease)
+}
+
+type blockingProvider struct{ started chan struct{} }
+
+func (p *blockingProvider) Name() string { return "blocking" }
+
+func (p *blockingProvider) Generate(ctx context.Context, _ *llm.Request, _ llm.StreamCallback) (*llm.Response, error) {
+	close(p.started)
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (s *cancelOnAdmittedStore) AppendFencedCommitted(ctx context.Context, lease session.Lease, events []session.Event) (session.CommittedBatch, error) {
+	batch, err := s.MemoryStore.AppendFencedCommitted(ctx, lease, events)
+	if err == nil {
+		for _, event := range events {
+			if event.Type == session.EventToolAdmitted {
+				s.cancel()
+				break
+			}
+		}
+	}
+	return batch, err
 }
 
 func (s *hostClaimStore) ClaimLease(ctx context.Context, sessionID, owner string, ttl time.Duration, tenantID string) (session.Lease, error) {
@@ -199,6 +244,225 @@ func TestDurableAppendAndReplay(t *testing.T) {
 	}
 }
 
+func TestToolResultRoundTripAndReasoningMetadata(t *testing.T) {
+	store := newMemoryStore()
+	registry := tools.New(tools.Options{})
+	registry.MustRegister(&tools.Definition{
+		Name: "roundtrip", InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
+		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+			return map[string]any{"ok": true}, nil
+		},
+		RenderModel: func(any) (any, error) { return "model-facing", nil },
+	})
+	chat := &scriptedProvider{steps: []scriptedStep{
+		{calls: []llm.ToolCallRequest{{CallID: "call-1", Name: "roundtrip", Arguments: json.RawMessage(`{}`)}}, metadata: map[string]any{
+			"openrouter": map[string]any{"reasoning_details": []any{map[string]any{"type": "reasoning.text"}}},
+		}},
+		{text: "done"},
+	}}
+	loop := NewLoop("tool-roundtrip", store, registry, chat, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
+	if _, err := loop.Run(context.Background(), "run"); err != nil {
+		t.Fatal(err)
+	}
+
+	chat.mu.Lock()
+	calls := append([]llm.Request(nil), chat.calls...)
+	chat.mu.Unlock()
+	if len(calls) != 2 {
+		t.Fatalf("provider calls=%d, want 2", len(calls))
+	}
+	var assistant, tool *llm.Message
+	for _, message := range calls[1].Messages {
+		message := message
+		switch message.Role {
+		case llm.RoleAssistant:
+			assistant = &message
+		case llm.RoleTool:
+			tool = &message
+		}
+	}
+	if assistant == nil || len(assistant.ToolCalls()) != 1 || assistant.ToolCalls()[0].CallID != "call-1" {
+		t.Fatalf("assistant tool calls=%+v", assistant)
+	}
+	if tool == nil || len(tool.ToolResults()) != 1 || tool.ToolResults()[0].CallID != "call-1" || string(tool.ToolResults()[0].Output) != `"model-facing"` {
+		t.Fatalf("tool result=%+v", tool)
+	}
+	events, err := store.Load(context.Background(), "tool-roundtrip", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundCanonical := false
+	for _, event := range events {
+		if event.Type != session.EventToolResult || event.CallID != "call-1" {
+			continue
+		}
+		var payload struct {
+			Output  json.RawMessage `json:"output"`
+			Content json.RawMessage `json:"content"`
+		}
+		if json.Unmarshal(event.Data, &payload) == nil && string(payload.Output) == `{"ok":true}` && string(payload.Content) == `"model-facing"` {
+			foundCanonical = true
+		}
+	}
+	if !foundCanonical {
+		t.Fatal("canonical and model-facing tool result projections were not persisted separately")
+	}
+	if assistant.Metadata["openrouter"] == nil {
+		t.Fatalf("assistant metadata was not replayed: %+v", assistant.Metadata)
+	}
+}
+
+func TestCancellationBeforeDispatchPersistsAbortedToolResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &cancelOnAdmittedStore{MemoryStore: session.NewMemoryStore(), cancel: cancel}
+	registry := tools.New(tools.Options{})
+	executed := 0
+	registry.MustRegister(&tools.Definition{
+		Name: "cancel_probe", InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
+		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+			executed++
+			return "unexpected", nil
+		},
+	})
+	chat := &scriptedProvider{steps: []scriptedStep{{calls: []llm.ToolCallRequest{{CallID: "cancel-1", Name: "cancel_probe", Arguments: json.RawMessage(`{}`)}}}}}
+	loop := NewLoop("cancel-before-dispatch", store, registry, chat, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
+	if _, err := loop.Run(ctx, "run"); !errors.Is(err, ErrStopped) {
+		t.Fatalf("run error=%v", err)
+	}
+	if executed != 0 {
+		t.Fatalf("tool executed %d times", executed)
+	}
+	events, err := store.Load(context.Background(), "cancel-before-dispatch", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundResult, foundDispatch := false, false
+	for _, event := range events {
+		if event.Type == session.EventToolDispatched {
+			foundDispatch = true
+		}
+		if event.Type == session.EventToolResult && event.CallID == "cancel-1" && strings.Contains(string(event.Data), "ABORTED_BEFORE_DISPATCH") {
+			foundResult = true
+		}
+	}
+	if !foundResult || foundDispatch {
+		t.Fatalf("aborted result=%v dispatched=%v", foundResult, foundDispatch)
+	}
+}
+
+func TestLeaseReleaseUsesCleanupContextAfterCancellation(t *testing.T) {
+	store := &cleanupLeaseStore{MemoryStore: session.NewMemoryStore()}
+	provider := &blockingProvider{started: make(chan struct{})}
+	loop := NewLoop("cleanup-lease", store, tools.New(tools.Options{}), provider, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := loop.Run(ctx, "run")
+		done <- err
+	}()
+	select {
+	case <-provider.started:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("provider did not start")
+	}
+	if err := <-done; !errors.Is(err, ErrStopped) {
+		t.Fatalf("run error=%v", err)
+	}
+	if store.releases != 1 || store.canceledReleases != 0 {
+		t.Fatalf("lease release count=%d canceled=%d", store.releases, store.canceledReleases)
+	}
+}
+
+func TestAgentRestoresClaimedInputWithoutCompletedTurn(t *testing.T) {
+	store := newMemoryStore()
+	inputID := "inbox-crashed"
+	if _, err := store.Append(context.Background(), "restore-inbox", []session.Event{
+		{ID: inputID + ":queued", SessionID: "restore-inbox", Type: session.EventInboxQueued, Data: session.InboxPayloadJSON(inputID, "follow_up", "resume me")},
+		{ID: inputID + ":input", SessionID: "restore-inbox", RunID: "crashed-run", TurnID: "turn-0001", Type: session.EventUserMessage, Data: session.UserTextWithInbox("resume me", inputID)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	chat := &scriptedProvider{steps: []scriptedStep{{text: "resumed"}}}
+	loop := NewLoop("restore-inbox", store, tools.New(tools.Options{}), chat, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
+	handle, err := NewAgent(loop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = handle.Dispose(context.Background()) }()
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), time.Second)
+	defer waitCancel()
+	if err := handle.WhenIdle(waitCtx); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Load(context.Background(), "restore-inbox", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundAssistant, foundCompleted := false, false
+	for _, event := range events {
+		foundAssistant = foundAssistant || event.Type == session.EventAssistantMessage
+		if event.Type == session.EventInboxCompleted && strings.Contains(string(event.Data), inputID) {
+			foundCompleted = true
+		}
+	}
+	if !foundAssistant || !foundCompleted {
+		t.Fatalf("restored input assistant=%v completed=%v", foundAssistant, foundCompleted)
+	}
+}
+
+func TestPendingApprovalResumesAfterAgentRestart(t *testing.T) {
+	store := newMemoryStore()
+	request := tools.ApprovalRequest{SessionID: "approval-resume", RunID: "run-old", CallID: "approval-1", ToolName: "protected", Arguments: json.RawMessage(`{}`), Reason: "test"}
+	requestData, _ := json.Marshal(request)
+	if _, err := store.Append(context.Background(), "approval-resume", []session.Event{
+		{ID: "approval-assistant", SessionID: "approval-resume", RunID: "run-old", TurnID: "turn-0001", StepID: "turn-0001-step-00", Type: session.EventAssistantMessage, Data: session.AssistantContent("", "", []session.ToolCall{{CallID: request.CallID, Name: request.ToolName, Arguments: request.Arguments}})},
+		{ID: "approval-call", SessionID: "approval-resume", RunID: "run-old", TurnID: "turn-0001", StepID: "turn-0001-step-00", CallID: request.CallID, Type: session.EventToolCall, Data: session.ToolCallPayload(request.CallID, request.ToolName, request.Arguments)},
+		{ID: "approval-admitted", SessionID: "approval-resume", RunID: "run-old", TurnID: "turn-0001", StepID: "turn-0001-step-00", CallID: request.CallID, Type: session.EventToolAdmitted, Data: json.RawMessage(`{"text":"admitted"}`)},
+		{ID: "approval-requested", SessionID: "approval-resume", RunID: request.RunID, TurnID: "turn-0001", StepID: "turn-0001-step-00", CallID: request.CallID, Type: session.EventApprovalRequested, Data: requestData},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registry := tools.New(tools.Options{})
+	executed := 0
+	registry.MustRegister(&tools.Definition{
+		Name: request.ToolName, InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
+		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+			executed++
+			return map[string]any{"ok": true}, nil
+		},
+	})
+	registry.AddPolicy(func(context.Context, tools.Execution) (tools.PolicyDecision, string, error) {
+		return tools.PolicyAsk, "test", nil
+	})
+	loop := NewLoop("approval-resume", store, registry, &scriptedProvider{}, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
+	handle, err := NewAgent(loop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = handle.Dispose(context.Background()) }()
+	if err := handle.Approve(context.Background(), request.CallID); err != nil {
+		t.Fatal(err)
+	}
+	if executed != 1 {
+		t.Fatalf("resumed executions=%d", executed)
+	}
+	events, err := store.Load(context.Background(), "approval-resume", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundResult := false
+	for _, event := range events {
+		if event.Type == session.EventToolResult && event.CallID == request.CallID {
+			foundResult = true
+		}
+	}
+	if !foundResult {
+		t.Fatal("approval result was not durably resumed")
+	}
+}
+
 func TestHostClaimedLeaseDoesNotCompeteWithHostHeartbeat(t *testing.T) {
 	store := &hostClaimStore{MemoryStore: session.NewMemoryStore()}
 	lease, err := store.MemoryStore.ClaimLease(context.Background(), "host-run", "host-worker", time.Minute, "")
@@ -233,6 +497,12 @@ func TestNoReExecutionOnRecovery(t *testing.T) {
 	}, {
 		ID: "prior-call", SessionID: "s9", CallID: "call-1", Type: session.EventToolCall,
 		Data: session.ToolCallPayload("call-1", "probe_sideeffect", jsonLit(`{}`)),
+	}, {
+		ID: "prior-dispatched", SessionID: "s9", CallID: "call-1", Type: session.EventToolDispatched,
+		Data: json.RawMessage(`{"text":"dispatched"}`),
+	}, {
+		ID: "prior-running", SessionID: "s9", CallID: "call-1", Type: session.EventToolRunning,
+		Data: json.RawMessage(`{"text":"running"}`),
 	}})
 	check(t, err)
 	check(t, store.ReleaseLease(context.Background(), lease))

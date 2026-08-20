@@ -114,7 +114,7 @@ func requireObservation(fs integration.FileSystem) (integration.ObservationRecor
 func readTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
 		Name: "read", Description: "Read a UTF-8 text file and return a bounded, line-numbered window. Use read (not cat) before editing; offsets are 1-based.",
-		Version: "1",
+		Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema: json.RawMessage(`{
 			"type":"object",
 			"properties":{
@@ -243,12 +243,21 @@ type readResult struct {
 	UI        map[string]any
 }
 
+// MarshalJSON keeps the internal model projection out of canonical durable
+// output; the same value is rendered separately by RenderModel.
+func (r *readResult) MarshalJSON() ([]byte, error) {
+	if r == nil {
+		return []byte("null"), nil
+	}
+	return json.Marshal(r.Canonical)
+}
+
 // ---------------------------------------------------------------------------
 // write
 
 func readImageTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
-		Name: "read_image", Description: "Read a sandbox-contained image and return typed media content.", Version: "1",
+		Name: "read_image", Description: "Read a sandbox-contained image and return typed media content.", Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema:     json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"],"additionalProperties":false}`),
 		ConcurrencySafe: true,
 		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
@@ -320,7 +329,7 @@ func readImageTool(deps Deps) *tools.Definition {
 func writeTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
 		Name: "write", Description: "Create a new UTF-8 file or fully replace an existing one. Overwriting a file you have not read is refused; use read first.",
-		Version: "1",
+		Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema: json.RawMessage(`{
 			"type":"object",
 			"properties":{
@@ -409,7 +418,7 @@ func writeTool(deps Deps) *tools.Definition {
 func editTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
 		Name: "edit", Description: "Apply a targeted literal replacement to a file you have read. old_string must match exactly once unless replace_all is true.",
-		Version: "1",
+		Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema: json.RawMessage(`{
 			"type":"object",
 			"properties":{
@@ -490,7 +499,7 @@ func editTool(deps Deps) *tools.Definition {
 func globTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
 		Name: "glob", Description: "List files matching a path pattern under a directory (deterministic, bounded).",
-		Version: "1",
+		Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema: json.RawMessage(`{
 			"type":"object",
 			"properties":{
@@ -568,7 +577,7 @@ func globTool(deps Deps) *tools.Definition {
 func grepTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
 		Name: "grep", Description: "Search file contents for a regex pattern (bounded). Use read on matched files for surrounding context.",
-		Version: "1",
+		Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema: json.RawMessage(`{
 			"type":"object",
 			"properties":{
@@ -657,7 +666,7 @@ func grepTool(deps Deps) *tools.Definition {
 func bashTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
 		Name: "bash", Description: "Run a command line in a fresh shell with a sandbox-checked working directory. Output is bounded; timeouts kill the whole process tree.",
-		Version: "1",
+		Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema: json.RawMessage(`{
 			"type":"object",
 			"properties":{
@@ -756,7 +765,7 @@ func bashTool(deps Deps) *tools.Definition {
 func jobStartTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
 		Name: "job_start", Description: "Start a long-running command as a background job; returns a durable job id.",
-		Version: "1",
+		Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema: json.RawMessage(`{
 			"type":"object",
 			"properties":{
@@ -816,7 +825,7 @@ func jobStartTool(deps Deps) *tools.Definition {
 
 func jobListTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
-		Name: "job_list", Description: "List background jobs owned by this session.", Version: "1",
+		Name: "job_list", Description: "List background jobs owned by this session.", Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema:     json.RawMessage(`{"type":"object","additionalProperties":false}`),
 		ConcurrencySafe: true,
 		Execute: func(ctx context.Context, ec tools.ExecContext, _ json.RawMessage) (any, error) {
@@ -835,7 +844,7 @@ func jobListTool(deps Deps) *tools.Definition {
 func jobOutputTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
 		Name: "job_output", Description: "Read a background job's output (optionally the delta since the last read).",
-		Version: "1",
+		Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema: json.RawMessage(`{
 			"type":"object",
 			"properties":{
@@ -893,7 +902,7 @@ func jobOutputTool(deps Deps) *tools.Definition {
 func jobKillTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
 		Name: "job_kill", Description: "Cancel a background job (idempotent; only the owning session may kill it).",
-		Version: "1",
+		Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema: json.RawMessage(`{
 			"type":"object",
 			"properties":{
@@ -936,7 +945,7 @@ func jobKillTool(deps Deps) *tools.Definition {
 
 func webSearchTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
-		Name: "web_search", Description: "Search the web through the host-provided bounded web port.", Version: "1",
+		Name: "web_search", Description: "Search the web through the host-provided bounded web port.", Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema:     json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer"}},"required":["query"],"additionalProperties":false}`),
 		ConcurrencySafe: true,
 		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
@@ -973,7 +982,7 @@ func webSearchTool(deps Deps) *tools.Definition {
 
 func webFetchTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
-		Name: "web_fetch", Description: "Fetch a bounded web document through the host-provided web port.", Version: "1",
+		Name: "web_fetch", Description: "Fetch a bounded web document through the host-provided web port.", Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema:     json.RawMessage(`{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["url"],"additionalProperties":false}`),
 		ConcurrencySafe: true,
 		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
@@ -1028,7 +1037,7 @@ func webFetchTool(deps Deps) *tools.Definition {
 
 func lspDiagnosticsTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
-		Name: "lsp_diagnostics", Description: "Read bounded diagnostics from the host-provided language server.", Version: "1",
+		Name: "lsp_diagnostics", Description: "Read bounded diagnostics from the host-provided language server.", Version: "1", OutputSchema: tools.AnyOutputSchema,
 		InputSchema:     json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"],"additionalProperties":false}`),
 		ConcurrencySafe: true,
 		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
@@ -1067,7 +1076,7 @@ func lspDiagnosticsTool(deps Deps) *tools.Definition {
 
 func terminalTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
-		Name: "terminal", Description: "Execute a command in the host-owned persistent terminal session.", Version: "1", MutatesWorkspace: true,
+		Name: "terminal", Description: "Execute a command in the host-owned persistent terminal session.", Version: "1", OutputSchema: tools.AnyOutputSchema, MutatesWorkspace: true,
 		InputSchema: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"}},"required":["command"],"additionalProperties":false}`),
 		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
 			if deps.Terminal == nil {

@@ -177,6 +177,7 @@ func projectSurfaceEvent(event Event) (*llm.Message, error) {
 			Reasoning string         `json:"reasoning"`
 			ToolCalls []ToolCall     `json:"tool_calls"`
 			Blocks    []ContentBlock `json:"blocks"`
+			Metadata  map[string]any `json:"metadata"`
 		}
 		if err := json.Unmarshal(event.Data, &payload); err != nil {
 			return nil, fmt.Errorf("session: decode assistant message: %w", err)
@@ -207,7 +208,7 @@ func projectSurfaceEvent(event Event) (*llm.Message, error) {
 					parts = append(parts, llm.Part{Type: llm.PartText, Custom: custom})
 				}
 			}
-			return &llm.Message{Role: llm.RoleAssistant, Parts: parts}, nil
+			return &llm.Message{Role: llm.RoleAssistant, Parts: parts, Metadata: payload.Metadata}, nil
 		}
 		calls := make([]llm.ToolCallRequest, 0, len(payload.ToolCalls))
 		for _, call := range payload.ToolCalls {
@@ -217,7 +218,9 @@ func projectSurfaceEvent(event Event) (*llm.Message, error) {
 				Arguments: append(json.RawMessage(nil), call.Arguments...),
 			})
 		}
-		return llm.NewAssistantMessage(payload.Text, payload.Reasoning, calls), nil
+		message := llm.NewAssistantMessage(payload.Text, payload.Reasoning, calls)
+		message.Metadata = payload.Metadata
+		return message, nil
 
 	case EventToolResult:
 		var payload struct {
@@ -231,35 +234,17 @@ func projectSurfaceEvent(event Event) (*llm.Message, error) {
 		if err := json.Unmarshal(event.Data, &payload); err != nil {
 			return nil, fmt.Errorf("session: decode tool result: %w", err)
 		}
-		if len(payload.Output) == 0 {
-			payload.Output = payload.Content
+		modelOutput := payload.Content
+		if len(modelOutput) == 0 {
+			modelOutput = payload.Output
 		}
-		if len(payload.Blocks) > 0 {
-			parts := make([]llm.Part, 0, len(payload.Blocks))
-			for _, block := range payload.Blocks {
-				switch block.Kind {
-				case BlockText, BlockReasoning:
-					parts = append(parts, llm.Part{Type: llm.PartText, Text: block.Text})
-				case BlockMedia:
-					if block.Media != nil {
-						data, _ := base64.StdEncoding.DecodeString(block.Media.Data)
-						parts = append(parts, llm.Part{Type: llm.PartMedia, Media: &llm.MediaContent{MediaType: block.Media.MediaType, URL: block.Media.URL, Data: data}})
-					}
-				case BlockToolResult:
-					if block.ToolResult != nil {
-						parts = append(parts, llm.Part{Type: llm.PartToolResult, ToolResult: &llm.ToolCallResult{CallID: block.ToolResult.CallID, Name: block.ToolResult.Name, Output: append(json.RawMessage(nil), block.ToolResult.Content...), IsError: block.ToolResult.Error != ""}})
-					}
-				case BlockExtension:
-					custom, _ := json.Marshal(block)
-					parts = append(parts, llm.Part{Type: llm.PartText, Custom: custom})
-				}
-			}
-			return &llm.Message{Role: llm.RoleTool, Parts: parts}, nil
+		if len(modelOutput) == 0 {
+			modelOutput = json.RawMessage(`null`)
 		}
 		return llm.NewToolResultMessage(llm.ToolCallResult{
 			CallID:  payload.CallID,
 			Name:    payload.Name,
-			Output:  append(json.RawMessage(nil), payload.Output...),
+			Output:  append(json.RawMessage(nil), modelOutput...),
 			IsError: payload.IsError,
 		}), nil
 

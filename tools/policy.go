@@ -24,6 +24,8 @@ var (
 type Execution struct {
 	SessionID string          `json:"session_id"`
 	RunID     string          `json:"run_id"`
+	TurnID    string          `json:"turn_id"`
+	StepID    string          `json:"step_id"`
 	CallID    string          `json:"call_id"`
 	Name      string          `json:"name"`
 	Arguments json.RawMessage `json:"arguments"`
@@ -45,6 +47,8 @@ type PostPolicy func(context.Context, Execution, *Result) (PolicyDecision, any, 
 type ApprovalRequest struct {
 	SessionID string          `json:"session_id"`
 	RunID     string          `json:"run_id"`
+	TurnID    string          `json:"turn_id"`
+	StepID    string          `json:"step_id"`
 	CallID    string          `json:"call_id"`
 	ToolName  string          `json:"tool_name"`
 	Arguments json.RawMessage `json:"arguments"`

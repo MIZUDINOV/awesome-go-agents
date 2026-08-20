@@ -258,7 +258,7 @@ func (s *MemoryStore) ReleaseLease(_ context.Context, lease Lease) error {
 }
 
 // Recover reconciles an interrupted session in memory: closes orphaned turns
-// and marks dangling tool calls unknown.
+// and settles calls according to the durable dispatch barrier.
 func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport, error) {
 	report := &RecoveryReport{}
 	s.mu.RLock()
@@ -267,14 +267,17 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 
 	openTurns := 0
 	openTurnID := ""
+	openRunID := ""
 	for _, e := range all {
 		if e.Type == EventTurnStart {
 			openTurns++
 			openTurnID = e.TurnID
+			openRunID = e.RunID
 		} else if e.Type == EventTurnEnd {
 			openTurns--
 			if openTurns == 0 {
 				openTurnID = ""
+				openRunID = ""
 			}
 		}
 	}
@@ -283,19 +286,31 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 	if openTurns > 0 {
 		report.TurnClosed = true
 		recovery = append(recovery, Event{
-			ID: "recover:turn-end:" + openTurnID, TurnID: openTurnID,
+			ID: "recover:turn-end:" + openTurnID, RunID: openRunID, TurnID: openTurnID,
 			Type: EventTurnEnd, SessionID: lease.SessionID,
 			Data: mustJSON(map[string]any{"reason": "interrupted"}),
 		})
 	}
 	dangling := danglingCallIDs(all)
+	callEvents := toolCallEvents(all)
+	dispatched := dispatchedCallIDs(all)
 	for _, callID := range dangling {
 		report.DanglingCalls = append(report.DanglingCalls, callID)
+		callEvent := callEvents[callID]
+		callName := ""
+		var callPayload ToolCall
+		if decodeJSON(callEvent.Data, &callPayload) == nil {
+			callName = callPayload.Name
+		}
+		code := "TOOL_OUTCOME_UNKNOWN"
+		if !dispatched[callID] {
+			code = "ABORTED_BEFORE_DISPATCH"
+		}
 		recovery = append(recovery, Event{
-			ID:   "recover:unknown:" + callID,
-			Type: EventToolResult, SessionID: lease.SessionID, CallID: callID,
+			ID: "recover:unknown:" + callID, RunID: callEvent.RunID, TurnID: callEvent.TurnID,
+			StepID: callEvent.StepID, Type: EventToolResult, SessionID: lease.SessionID, CallID: callID,
 			Data: mustJSON(map[string]any{
-				"call_id": callID, "is_error": true, "code": "TOOL_OUTCOME_UNKNOWN",
+				"call_id": callID, "name": callName, "is_error": true, "code": code,
 				"output": map[string]any{},
 			}),
 		})
@@ -307,6 +322,47 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 		report.EventsAppended = len(recovery)
 	}
 	return report, nil
+}
+
+func dispatchedCallIDs(events []Event) map[string]bool {
+	ids := make(map[string]bool)
+	for _, event := range events {
+		if (event.Type == EventToolDispatched || event.Type == EventToolRunning) && event.CallID != "" {
+			ids[event.CallID] = true
+		}
+	}
+	return ids
+}
+
+func toolCallEvents(events []Event) map[string]Event {
+	byID := make(map[string]Event)
+	for _, event := range events {
+		switch event.Type {
+		case EventToolCall:
+			var payload struct {
+				CallID string `json:"call_id"`
+			}
+			if decodeJSON(event.Data, &payload) == nil && payload.CallID != "" {
+				byID[payload.CallID] = event
+			}
+		case EventAssistantMessage:
+			var payload struct {
+				ToolCalls []ToolCall `json:"tool_calls"`
+			}
+			if decodeJSON(event.Data, &payload) != nil {
+				continue
+			}
+			for _, call := range payload.ToolCalls {
+				if call.CallID == "" {
+					continue
+				}
+				if _, exists := byID[call.CallID]; !exists {
+					byID[call.CallID] = Event{RunID: event.RunID, TurnID: event.TurnID, StepID: event.StepID, Data: ToolCallPayload(call.CallID, call.Name, call.Arguments)}
+				}
+			}
+		}
+	}
+	return byID
 }
 
 // SaveCompactionCheckpoint records a checkpoint ledger entry in memory.
@@ -336,6 +392,8 @@ func (s *MemoryStore) checkFence(lease Lease) error {
 func danglingCallIDs(events []Event) []string {
 	resultIDs := make(map[string]bool)
 	pendingApproval := make(map[string]bool)
+	resolvedApproval := make(map[string]bool)
+	dispatched := make(map[string]bool)
 	callIDs := make([]string, 0)
 	seen := make(map[string]bool)
 	for _, e := range events {
@@ -348,6 +406,10 @@ func danglingCallIDs(events []Event) []string {
 			if payload.CallID != "" && !seen[payload.CallID] {
 				seen[payload.CallID] = true
 				callIDs = append(callIDs, payload.CallID)
+			}
+		case EventToolDispatched, EventToolRunning:
+			if e.CallID != "" {
+				dispatched[e.CallID] = true
 			}
 		case EventAssistantMessage:
 			var payload struct {
@@ -376,12 +438,13 @@ func danglingCallIDs(events []Event) []string {
 			var payload ApprovalResolvedPayload
 			if decodeJSON(e.Data, &payload) == nil && payload.CallID != "" {
 				pendingApproval[payload.CallID] = false
+				resolvedApproval[payload.CallID] = true
 			}
 		}
 	}
 	var dangling []string
 	for _, id := range callIDs {
-		if !resultIDs[id] && !pendingApproval[id] {
+		if !resultIDs[id] && !pendingApproval[id] && (!resolvedApproval[id] || dispatched[id]) {
 			dangling = append(dangling, id)
 		}
 	}

@@ -29,22 +29,18 @@ func appendDurable(ctx context.Context, store Store, hub *EventHub, sessionID st
 		}
 		return committed, nil
 	}
-	if _, err := store.Append(ctx, sessionID, []session.Event{event}); err != nil {
-		return session.Event{}, err
-	}
-	events, err := store.Load(ctx, sessionID, 0, 0)
+	last, err := store.Append(ctx, sessionID, []session.Event{event})
 	if err != nil {
 		return session.Event{}, err
 	}
-	for _, committed := range events {
-		if committed.ID == event.ID {
-			if hub != nil {
-				hub.Publish(committed)
-			}
-			return committed.Clone(), nil
-		}
+	committed := event.Clone()
+	committed.SessionID = sessionID
+	committed.Seq = last
+	committed.Normalize()
+	if hub != nil {
+		hub.Publish(committed)
 	}
-	return session.Event{}, fmt.Errorf("agent: committed event %s not found", event.ID)
+	return committed, nil
 }
 
 // ErrSubscriberLagged means a live subscriber did not consume its bounded

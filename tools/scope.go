@@ -21,6 +21,8 @@ type Runtime interface {
 type Catalog interface {
 	Runtime
 	Register(*Definition) error
+	RegisterTool(*Definition) (*Registration, error)
+	Unregister(string) error
 	Restrict([]string) error
 	Deny(...string)
 	SetApprovalService(ApprovalService)
@@ -29,7 +31,6 @@ type Catalog interface {
 // Scope is an agent-local catalog. Local definitions shadow root definitions;
 // visibility restrictions affect both model schemas and execution resolution.
 type Scope struct {
-	root *Registry
 	// rootSnapshot freezes the root catalog and its execution middleware at
 	// scope creation. An agent therefore cannot observe a later global
 	// registration or policy mutation from another agent.
@@ -57,16 +58,52 @@ func (r *Registry) NewScope() *Scope {
 	rootSnapshot.postPolicies = append([]PostPolicy(nil), r.postPolicies...)
 	rootSnapshot.observers = append([]Observer(nil), r.observers...)
 	local := New(opts)
+	local.preExecute = append([]Hook(nil), r.preExecute...)
+	local.postExecute = append([]Hook(nil), r.postExecute...)
 	local.policies = append([]Policy(nil), r.policies...)
 	local.guards = append([]Guard(nil), r.guards...)
 	local.postPolicies = append([]PostPolicy(nil), r.postPolicies...)
 	local.observers = append([]Observer(nil), r.observers...)
 	parallel := r.maxParallel
 	r.mu.RUnlock()
-	return &Scope{root: r, rootSnapshot: rootSnapshot, local: local, approval: opts.Approval, parallel: parallel}
+	return &Scope{rootSnapshot: rootSnapshot, local: local, approval: opts.Approval, parallel: parallel}
 }
 
-func (s *Scope) Register(def *Definition) error { return s.local.Register(def) }
+func (s *Scope) Register(def *Definition) error {
+	if err := s.local.Register(def); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	delete(s.deny, def.Name)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Scope) RegisterTool(def *Definition) (*Registration, error) {
+	name := ""
+	if def != nil {
+		name = def.Name
+	}
+	if err := s.Register(def); err != nil {
+		return nil, err
+	}
+	return newRegistration(func() error { return s.unregisterLocal(name) }), nil
+}
+
+func (s *Scope) unregisterLocal(name string) error {
+	if err := s.local.Unregister(name); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	if s.deny == nil {
+		s.deny = make(map[string]struct{})
+	}
+	s.deny[name] = struct{}{}
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *Scope) Unregister(name string) error { return s.unregisterLocal(name) }
 
 func (s *Scope) SetApprovalService(service ApprovalService) {
 	s.mu.Lock()

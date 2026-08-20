@@ -358,6 +358,12 @@ func TestE2E_ScenarioG_DanglingCallUnknown(t *testing.T) {
 	}, {
 		ID: "g-call", SessionID: "e2e-G", CallID: "g1", Type: session.EventToolCall,
 		Data: session.ToolCallPayload("g1", "read", json.RawMessage(`{"file_path":"missing.txt"}`)),
+	}, {
+		ID: "g-dispatched", SessionID: "e2e-G", CallID: "g1", Type: session.EventToolDispatched,
+		Data: json.RawMessage(`{"text":"dispatched"}`),
+	}, {
+		ID: "g-running", SessionID: "e2e-G", CallID: "g1", Type: session.EventToolRunning,
+		Data: json.RawMessage(`{"text":"running"}`),
 	}}); err != nil {
 		t.Fatal(err)
 	}

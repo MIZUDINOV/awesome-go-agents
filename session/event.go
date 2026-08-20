@@ -325,6 +325,12 @@ func AssistantContentWithMedia(text, reasoning string, calls []ToolCall, media [
 // the durable assistant/message event. It is the preferred finalizer when a
 // provider returned a complete message alongside streamed chunks.
 func AssistantContentFromParts(parts []llm.Part, interrupted bool) json.RawMessage {
+	return AssistantContentFromPartsWithMetadata(parts, nil, interrupted)
+}
+
+// AssistantContentFromPartsWithMetadata preserves provider metadata needed by
+// a later continuation, such as reasoning details or annotations.
+func AssistantContentFromPartsWithMetadata(parts []llm.Part, metadata map[string]any, interrupted bool) json.RawMessage {
 	blocks := make([]ContentBlock, 0, len(parts))
 	var text, reasoning string
 	var calls []ToolCall
@@ -360,6 +366,9 @@ func AssistantContentFromParts(parts []llm.Part, interrupted bool) json.RawMessa
 	}
 	if reasoning != "" {
 		data["reasoning"] = reasoning
+	}
+	if metadata != nil {
+		data["metadata"] = metadata
 	}
 	if interrupted {
 		data["interrupted"] = true
@@ -498,7 +507,13 @@ func ToolResultStructuredPayloadWithBlocksAndContexts(callID, name string, conte
 }
 
 func ToolResultStructuredPayloadWithOptions(callID, name string, content json.RawMessage, meta map[string]any, code string, isError bool, blocks []ContentBlock, contexts []llm.Message, concludesTurn bool) json.RawMessage {
-	payload := map[string]any{"call_id": callID, "name": name, "content": content, "is_error": isError}
+	return ToolResultStructuredPayloadWithOutput(callID, name, content, content, meta, code, isError, blocks, contexts, concludesTurn)
+}
+
+// ToolResultStructuredPayloadWithOutput keeps the canonical result separate
+// from the model-facing content. The two may differ after rendering.
+func ToolResultStructuredPayloadWithOutput(callID, name string, output, content json.RawMessage, meta map[string]any, code string, isError bool, blocks []ContentBlock, contexts []llm.Message, concludesTurn bool) json.RawMessage {
+	payload := map[string]any{"call_id": callID, "name": name, "output": output, "content": content, "is_error": isError}
 	if meta != nil {
 		payload["meta"] = meta
 	}

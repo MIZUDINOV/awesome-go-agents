@@ -263,7 +263,7 @@ func (s *Store) AppendFencedCommitted(ctx context.Context, lease session.Lease, 
 	if _, err := s.AppendFenced(ctx, lease, prepared); err != nil {
 		return session.CommittedBatch{}, err
 	}
-	all, err := s.Load(ctx, lease.SessionID, 0, 0)
+	all, err := s.loadByIDs(ctx, lease.SessionID, eventIDs(prepared))
 	if err != nil {
 		return session.CommittedBatch{}, err
 	}
@@ -305,7 +305,7 @@ func (s *Store) AppendCommitted(ctx context.Context, sessionID string, events []
 	if _, err := s.Append(ctx, sessionID, prepared); err != nil {
 		return session.CommittedBatch{}, err
 	}
-	all, err := s.Load(ctx, sessionID, 0, 0)
+	all, err := s.loadByIDs(ctx, sessionID, eventIDs(prepared))
 	if err != nil {
 		return session.CommittedBatch{}, err
 	}
@@ -391,7 +391,8 @@ WHERE session_id=$1 AND tenant_id=$2 AND lease_token=$3`, s.sessions),
 	return nil
 }
 
-// Recover reconciles an interrupted session under the lease.
+// Recover reconciles an interrupted session under the lease, distinguishing
+// calls that reached dispatch from calls that were still only admitted.
 func (s *Store) Recover(ctx context.Context, lease session.Lease) (*session.RecoveryReport, error) {
 	if err := s.requireNativeAndTenant(); err != nil {
 		return nil, err
@@ -403,14 +404,17 @@ func (s *Store) Recover(ctx context.Context, lease session.Lease) (*session.Reco
 	report := &session.RecoveryReport{}
 	openTurns := 0
 	openTurnID := ""
+	openRunID := ""
 	for _, e := range events {
 		if e.Type == session.EventTurnStart {
 			openTurns++
 			openTurnID = e.TurnID
+			openRunID = e.RunID
 		} else if e.Type == session.EventTurnEnd {
 			openTurns--
 			if openTurns == 0 {
 				openTurnID = ""
+				openRunID = ""
 			}
 		}
 	}
@@ -419,15 +423,18 @@ func (s *Store) Recover(ctx context.Context, lease session.Lease) (*session.Reco
 	if openTurns > 0 {
 		report.TurnClosed = true
 		recovery = append(recovery, session.Event{
-			ID: "recover:turn-end:" + openTurnID, TurnID: openTurnID,
+			ID: "recover:turn-end:" + openTurnID, RunID: openRunID, TurnID: openTurnID,
 			Type: session.EventTurnEnd, SessionID: lease.SessionID,
 			Data: mustJSON(map[string]any{"reason": "interrupted"}),
 		})
 	}
 	callIDs := make([]string, 0)
+	callEvents := make(map[string]session.Event)
 	seen := map[string]bool{}
 	resultIDs := map[string]bool{}
 	pendingApproval := map[string]bool{}
+	resolvedApproval := map[string]bool{}
+	dispatched := map[string]bool{}
 	for _, e := range events {
 		switch e.Type {
 		case session.EventToolCall:
@@ -438,6 +445,31 @@ func (s *Store) Recover(ctx context.Context, lease session.Lease) (*session.Reco
 			if p.CallID != "" && !seen[p.CallID] {
 				seen[p.CallID] = true
 				callIDs = append(callIDs, p.CallID)
+			}
+			if p.CallID != "" {
+				callEvents[p.CallID] = e
+			}
+		case session.EventToolDispatched, session.EventToolRunning:
+			if e.CallID != "" {
+				dispatched[e.CallID] = true
+			}
+		case session.EventAssistantMessage:
+			var p struct {
+				ToolCalls []session.ToolCall `json:"tool_calls"`
+			}
+			if json.Unmarshal(e.Data, &p) == nil {
+				for _, call := range p.ToolCalls {
+					if call.CallID == "" {
+						continue
+					}
+					if !seen[call.CallID] {
+						seen[call.CallID] = true
+						callIDs = append(callIDs, call.CallID)
+					}
+					if _, exists := callEvents[call.CallID]; !exists {
+						callEvents[call.CallID] = session.Event{RunID: e.RunID, TurnID: e.TurnID, StepID: e.StepID, Data: session.ToolCallPayload(call.CallID, call.Name, call.Arguments)}
+					}
+				}
 			}
 		case session.EventToolResult:
 			var p struct {
@@ -455,17 +487,26 @@ func (s *Store) Recover(ctx context.Context, lease session.Lease) (*session.Reco
 			var p session.ApprovalResolvedPayload
 			if json.Unmarshal(e.Data, &p) == nil && p.CallID != "" {
 				pendingApproval[p.CallID] = false
+				resolvedApproval[p.CallID] = true
 			}
 		}
 	}
 	for _, callID := range callIDs {
-		if !resultIDs[callID] && !pendingApproval[callID] {
+		if !resultIDs[callID] && !pendingApproval[callID] && (!resolvedApproval[callID] || dispatched[callID]) {
 			report.DanglingCalls = append(report.DanglingCalls, callID)
+			callEvent := callEvents[callID]
+			var callPayload session.ToolCall
+			_ = json.Unmarshal(callEvent.Data, &callPayload)
+			code := "TOOL_OUTCOME_UNKNOWN"
+			if !dispatched[callID] {
+				code = "ABORTED_BEFORE_DISPATCH"
+			}
 			recovery = append(recovery, session.Event{
-				Type: session.EventToolResult, SessionID: lease.SessionID, CallID: callID,
+				Type: session.EventToolResult, SessionID: lease.SessionID, RunID: callEvent.RunID,
+				TurnID: callEvent.TurnID, StepID: callEvent.StepID, CallID: callID,
 				ID: "recover:" + callID,
 				Data: mustJSON(map[string]any{
-					"call_id": callID, "name": "", "is_error": true, "code": "TOOL_OUTCOME_UNKNOWN",
+					"call_id": callID, "name": callPayload.Name, "is_error": true, "code": code,
 					"output": map[string]any{},
 				}),
 			})
@@ -593,6 +634,32 @@ func (s *Store) Load(ctx context.Context, sessionID string, afterSeq uint64, lim
 	return scanEvents(rows, s.native, sessionID)
 }
 
+func (s *Store) loadByIDs(ctx context.Context, sessionID string, ids []string) ([]session.Event, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	args := []any{sessionID, ids}
+	predicate := ""
+	if s.native && s.tenant != "" {
+		predicate = ` AND tenant_id=$3`
+		args = append(args, s.tenant)
+	}
+	suffix := s.nativeSelectSuffix()
+	if !s.native {
+		suffix = ",event_id"
+	}
+	query := fmt.Sprintf(`SELECT seq,type,timestamp,data,source_seqs%s FROM %s WHERE session_id=$1 AND event_id = ANY($2)%s ORDER BY seq`, suffix, s.events, predicate)
+	rows, err := s.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("pgstore: load events by id: %w", err)
+	}
+	defer rows.Close()
+	if s.native {
+		return scanEvents(rows, true, sessionID)
+	}
+	return scanEventsWithIDs(rows, sessionID)
+}
+
 func (s *Store) Tail(ctx context.Context, sessionID string, limit int) ([]session.Event, error) {
 	if limit <= 0 {
 		return s.Load(ctx, sessionID, 0, 0)
@@ -673,6 +740,36 @@ func scanEvents(rows pgx.Rows, native bool, sessionID string) ([]session.Event, 
 		e.Data = json.RawMessage(data)
 		e.SourceSeqs = sourceSeqs
 		e.Surface = e.Type.Surface()
+		events = append(events, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("pgstore: iterate events: %w", err)
+	}
+	return events, nil
+}
+
+func scanEventsWithIDs(rows pgx.Rows, sessionID string) ([]session.Event, error) {
+	var events []session.Event
+	for rows.Next() {
+		var e session.Event
+		var eventID *string
+		var eventType string
+		var ts time.Time
+		var data []byte
+		var sourceSeqs []uint64
+		if err := rows.Scan(&e.Seq, &eventType, &ts, &data, &sourceSeqs, &eventID); err != nil {
+			return nil, fmt.Errorf("pgstore: scan event: %w", err)
+		}
+		if eventID != nil {
+			e.ID = *eventID
+		}
+		e.Type = session.EventType(eventType)
+		e.SessionID = sessionID
+		e.Timestamp = ts
+		e.Data = json.RawMessage(data)
+		e.SourceSeqs = sourceSeqs
+		e.Surface = e.Type.Surface()
+		e.Normalize()
 		events = append(events, e)
 	}
 	if err := rows.Err(); err != nil {

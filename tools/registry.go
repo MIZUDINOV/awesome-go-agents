@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"sort"
@@ -165,6 +166,26 @@ type Outcome struct {
 	Err    error
 }
 
+// Registration is a reversible tool registration. Unregister is idempotent
+// on the handle, while new executions observe the removal immediately.
+type Registration struct {
+	once       sync.Once
+	unregister func() error
+	err        error
+}
+
+func newRegistration(unregister func() error) *Registration {
+	return &Registration{unregister: unregister}
+}
+
+func (r *Registration) Unregister() error {
+	if r == nil {
+		return ErrInvalidArguments
+	}
+	r.once.Do(func() { r.err = r.unregister() })
+	return r.err
+}
+
 // ExecutionMode reports whether a validated call explicitly opts in to
 // parallel dispatch. Unknown, invalid, or classifier-failing calls are always
 // exclusive.
@@ -246,8 +267,14 @@ func (r *Registry) Register(def *Definition) error {
 	if !toolNamePattern.MatchString(def.Name) {
 		return fmt.Errorf("%w: tool name %q invalid (must match %s)", ErrInvalidArguments, def.Name, toolNamePattern.String())
 	}
+	if schemaAbsent(def.InputSchema) {
+		return fmt.Errorf("%w: tool %q input schema is required", ErrInvalidArguments, def.Name)
+	}
 	if err := ValidateSchema(def.InputSchema); err != nil {
 		return fmt.Errorf("%w: tool %q input schema: %v", ErrInvalidArguments, def.Name, err)
+	}
+	if schemaAbsent(def.OutputSchema) {
+		return fmt.Errorf("%w: tool %q output schema is required", ErrInvalidArguments, def.Name)
 	}
 	if err := ValidateSchema(def.OutputSchema); err != nil {
 		return fmt.Errorf("%w: tool %q output schema: %v", ErrInvalidArguments, def.Name, err)
@@ -258,6 +285,30 @@ func (r *Registry) Register(def *Definition) error {
 		return ErrToolAlreadyExists
 	}
 	r.definitions[def.Name] = cloneDefinition(def)
+	return nil
+}
+
+func (r *Registry) RegisterTool(def *Definition) (*Registration, error) {
+	name := ""
+	if def != nil {
+		name = def.Name
+	}
+	if err := r.Register(def); err != nil {
+		return nil, err
+	}
+	return newRegistration(func() error { return r.Unregister(name) }), nil
+}
+
+func (r *Registry) Unregister(name string) error {
+	if name == "" {
+		return ErrInvalidArguments
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.definitions[name]; !ok {
+		return ErrToolNotFound
+	}
+	delete(r.definitions, name)
 	return nil
 }
 
@@ -359,7 +410,8 @@ func (r *Registry) runCodeDefinition() (*Definition, bool) {
 	}
 	return &Definition{
 		Name: "run_code", Description: "Execute generated code through the scoped tool SDK.",
-		InputSchema: runCodeToolDefinition().InputSchema,
+		InputSchema:  runCodeToolDefinition().InputSchema,
+		OutputSchema: AnyOutputSchema,
 		Execute: func(ctx context.Context, ec ExecContext, input json.RawMessage) (any, error) {
 			var args struct {
 				Code     string `json:"code"`
@@ -441,6 +493,14 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 	if ec.Runtime == nil {
 		ec.Runtime = r
 	}
+	parentCtx := ctx
+	timeout := def.Timeout
+	if timeout <= 0 {
+		timeout = r.defaultTimeout
+	}
+	pipelineCtx, pipelineCancel := context.WithTimeout(parentCtx, timeout)
+	ctx = pipelineCtx
+	defer pipelineCancel()
 	observers := r.snapshotObservers()
 	defer func() {
 		if retErr != nil && result != nil && result.Kind != OutcomeFailure {
@@ -493,6 +553,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			code := toolErrorCode(retErr)
 			result = &Result{Name: name, CallID: callID, Kind: OutcomeFailure, Code: code, Failure: &Failure{Code: code, Message: failureMessage(retErr)}}
 		}
+		beforeFinalize := result.Freeze()
 		var finalizeErr error
 		func() {
 			defer func() {
@@ -502,20 +563,24 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			}()
 			finalizeErr = def.FinalizeContent(result)
 		}()
+		restoreFinalizerState(result, beforeFinalize)
+		if parentCtx.Err() == nil && errors.Is(pipelineCtx.Err(), context.DeadlineExceeded) {
+			retErr = ErrToolTimeout
+		}
 		if finalizeErr != nil {
 			if retErr == nil {
 				retErr = fmt.Errorf("finalize tool content: %w", finalizeErr)
+				result.Kind = OutcomeFailure
+				result.Canonical = nil
+				result.ModelFacing = nil
+				result.UI = nil
+				result.Meta = nil
+				result.Content = nil
+				result.AdditionalContexts = nil
+				result.ConcludesTurn = false
+				result.Code = "FINALIZE_FAILED"
+				result.Failure = &Failure{Code: result.Code, Message: failureMessage(finalizeErr)}
 			}
-			result.Kind = OutcomeFailure
-			result.Canonical = nil
-			result.ModelFacing = nil
-			result.UI = nil
-			result.Meta = nil
-			result.Content = nil
-			result.AdditionalContexts = nil
-			result.ConcludesTurn = false
-			result.Code = "FINALIZE_FAILED"
-			result.Failure = &Failure{Code: result.Code, Message: failureMessage(finalizeErr)}
 		}
 		if retErr != nil && result.Kind != OutcomeFailure {
 			code := toolErrorCode(retErr)
@@ -531,6 +596,11 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			result.Failure = &Failure{Code: code, Message: failureMessage(retErr)}
 		}
 		result = result.Freeze()
+	}()
+	defer func() {
+		if parentCtx.Err() == nil && errors.Is(pipelineCtx.Err(), context.DeadlineExceeded) {
+			retErr = ErrToolTimeout
+		}
 	}()
 	defer func() {
 		if recovered := recover(); recovered != nil {
@@ -568,16 +638,11 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 		}
 	}
 
-	timeout := def.Timeout
-	if timeout <= 0 {
-		timeout = r.defaultTimeout
-	}
-
 	// Input validation before any hook or side effect (H-RUNTIME-001).
 	if err := ValidateInput(def.InputSchema, args); err != nil {
 		return nil, err
 	}
-	execution := Execution{SessionID: ec.SessionID, RunID: ec.RunID, CallID: callID, Name: name, Arguments: append(json.RawMessage(nil), args...), Mutates: def.MutatesWorkspace}
+	execution := Execution{SessionID: ec.SessionID, RunID: ec.RunID, TurnID: ec.TurnID, StepID: ec.StepID, CallID: callID, Name: name, Arguments: append(json.RawMessage(nil), args...), Mutates: def.MutatesWorkspace}
 	for _, policy := range policies {
 		decision, reason, err := policy(ctx, execution)
 		if err != nil {
@@ -596,7 +661,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 				return nil, fmt.Errorf("%w: approval service unavailable", ErrPolicyDenied)
 			}
 			bindApprovalLease(approval, ec)
-			approved, err := approval.Approve(ctx, ApprovalRequest{SessionID: ec.SessionID, RunID: ec.RunID, CallID: callID, ToolName: name, Arguments: append(json.RawMessage(nil), args...), Reason: reason})
+			approved, err := approval.Approve(ctx, ApprovalRequest{SessionID: ec.SessionID, RunID: ec.RunID, TurnID: ec.TurnID, StepID: ec.StepID, CallID: callID, ToolName: name, Arguments: append(json.RawMessage(nil), args...), Reason: reason})
 			if err != nil {
 				return nil, fmt.Errorf("tool approval: %w", err)
 			}
@@ -631,22 +696,20 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			return nil, err
 		}
 	}
-
-	execCtx := ctx
-	cancel := func() {}
-	if timeout > 0 {
-		execCtx, cancel = context.WithTimeout(ctx, timeout)
+	if ec.OnDispatch != nil {
+		if err := ec.OnDispatch(ctx, name, callID); err != nil {
+			return nil, err
+		}
 	}
-	defer cancel()
 
-	canonical, err := def.Execute(execCtx, ec, args)
+	canonical, err := def.Execute(ctx, ec, args)
 	if err != nil {
-		if execCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+		if pipelineCtx.Err() == context.DeadlineExceeded && parentCtx.Err() == nil {
 			return nil, ErrToolTimeout
 		}
 		return nil, err
 	}
-	if execCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil {
+	if pipelineCtx.Err() == context.DeadlineExceeded && parentCtx.Err() == nil {
 		return nil, ErrToolTimeout
 	}
 
@@ -696,7 +759,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 				return nil, fmt.Errorf("%w: post-policy approval unavailable", ErrPolicyDenied)
 			}
 			bindApprovalLease(approval, ec)
-			approved, approveErr := approval.Approve(ctx, ApprovalRequest{SessionID: ec.SessionID, RunID: ec.RunID, CallID: callID, ToolName: name, Arguments: append(json.RawMessage(nil), args...), Reason: reason})
+			approved, approveErr := approval.Approve(ctx, ApprovalRequest{SessionID: ec.SessionID, RunID: ec.RunID, TurnID: ec.TurnID, StepID: ec.StepID, CallID: callID, ToolName: name, Arguments: append(json.RawMessage(nil), args...), Reason: reason})
 			if approveErr != nil {
 				return nil, fmt.Errorf("tool post-policy approval: %w", approveErr)
 			}
@@ -732,6 +795,9 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			result.Content = renderedContent(result.ModelFacing)
 		}
 	}
+	if pipelineCtx.Err() == context.DeadlineExceeded && parentCtx.Err() == nil {
+		return nil, ErrToolTimeout
+	}
 	return result, nil
 }
 
@@ -741,6 +807,16 @@ func renderedContent(modelFacing any) []session.ContentBlock {
 		return nil
 	}
 	return []session.ContentBlock{session.TextBlock(text)}
+}
+
+func restoreFinalizerState(result, before *Result) {
+	if result == nil || before == nil {
+		return
+	}
+	modelFacing, content := result.ModelFacing, result.Content
+	*result = *before
+	result.ModelFacing = modelFacing
+	result.Content = content
 }
 
 func bindApprovalLease(approval ApprovalService, ec ExecContext) {
@@ -753,7 +829,7 @@ func bindApprovalLease(approval ApprovalService, ec ExecContext) {
 }
 
 func validateCanonicalOutput(def *Definition, canonical any) error {
-	if len(def.OutputSchema) == 0 || string(def.OutputSchema) == "null" {
+	if schemaAbsent(def.OutputSchema) {
 		return nil
 	}
 	encoded, err := json.Marshal(canonical)
@@ -783,7 +859,7 @@ func cloneDefinition(def *Definition) *Definition {
 }
 
 func canonicalSchema(raw json.RawMessage) json.RawMessage {
-	if len(raw) == 0 || string(raw) == "null" {
+	if schemaAbsent(raw) {
 		return append(json.RawMessage(nil), raw...)
 	}
 	var value any

@@ -20,6 +20,8 @@ type ExecContext struct {
 	// SessionID / RunID are durable correlation identifiers.
 	SessionID string
 	RunID     string
+	TurnID    string
+	StepID    string
 	// Vars carries arbitrary host-provided bindings (tool-agnostic).
 	Vars map[string]any
 	// Sandbox is the runtime authority boundary. Registry admission happens
@@ -35,6 +37,9 @@ type ExecContext struct {
 	// Runtime is the owning scoped registry. Code Mode runtimes must use this
 	// seam for generated SDK calls instead of dispatching directly to a backend.
 	Runtime Runtime
+	// OnDispatch is invoked after policy/approval/guards and immediately before
+	// the executor can cause an external side effect.
+	OnDispatch func(context.Context, string, string) error
 }
 
 // Executor runs a tool and returns the canonical structured result.
@@ -71,8 +76,8 @@ type CodeRuntime interface {
 // JSON Schema object already encoded.
 type StaticInputSchema struct{ Schema json.RawMessage }
 
-// Definition describes one tool. InputSchema must be a JSON Schema object for
-// the arguments; OutputSchema, when set, validates the canonical result.
+// Definition describes one tool. InputSchema and OutputSchema must be JSON
+// Schema objects for arguments and canonical results respectively.
 type Definition struct {
 	Name        string
 	Description string
@@ -80,7 +85,7 @@ type Definition struct {
 
 	// InputSchema is the JSON Schema object the model sees for arguments.
 	InputSchema json.RawMessage
-	// OutputSchema optionally validates the canonical result.
+	// OutputSchema validates the canonical result and is mandatory at register.
 	OutputSchema json.RawMessage
 
 	// Execute implements the tool. Required.
@@ -145,7 +150,7 @@ func DefineTool[I any, O any](opts DefineToolOptions[I, O]) *Definition {
 	}
 	outputSchema := append(json.RawMessage(nil), opts.OutputSchema...)
 	if len(outputSchema) == 0 {
-		outputSchema = json.RawMessage(`{}`)
+		outputSchema = append(json.RawMessage(nil), AnyOutputSchema...)
 	}
 	return &Definition{
 		Name: opts.Name, Description: opts.Description, Version: opts.Version,

@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MIZUDINOV/awesome-go-agents/llm"
 	"github.com/MIZUDINOV/awesome-go-agents/session"
 	"github.com/MIZUDINOV/awesome-go-agents/tools"
 )
@@ -36,21 +37,71 @@ type CancelOptions struct{ KeepInbox bool }
 // than reaching into the concrete loop.
 type Agent interface {
 	ID() string
-	Session() *session.Session
+	Session() SessionView
 	ToolScope() tools.Runtime
 	ToolCatalog() tools.Catalog
 	ScopedContext() tools.ExecContext
 	Status() AgentStatus
 	FollowUp(ctx context.Context, text string) error
+	Send(ctx context.Context, text string) error
 	Steer(ctx context.Context, text string) error
 	Inject(ctx context.Context, text string) error
 	Cancel(ctx context.Context, opts CancelOptions) error
 	WhenIdle(ctx context.Context) error
 	DecideApproval(ctx context.Context, callID string, approved bool) error
+	Approve(ctx context.Context, callID string) error
+	Reject(ctx context.Context, callID string) error
 	Subscribe(ctx context.Context, after uint64, filter EventFilter) (*Subscription, error)
 	SubscribeNotifications(ctx context.Context) *NotificationSubscription
 	Run(ctx context.Context, input string) (*Result, error)
 	Dispose(ctx context.Context) error
+	Close(ctx context.Context) error
+}
+
+// SessionView exposes the durable session projection without exposing the
+// lease-less append methods owned by Loop.
+type SessionView struct{ session *session.Session }
+
+func (v SessionView) ID() string {
+	if v.session == nil {
+		return ""
+	}
+	return v.session.ID
+}
+
+func (v SessionView) Events(ctx context.Context) ([]session.Event, error) {
+	if v.session == nil {
+		return nil, ErrAgentDisposed
+	}
+	return v.session.Events(ctx)
+}
+
+func (v SessionView) Load(ctx context.Context, afterSeq uint64) ([]session.Event, error) {
+	if v.session == nil {
+		return nil, ErrAgentDisposed
+	}
+	return v.session.Load(ctx, afterSeq)
+}
+
+func (v SessionView) Sequence(ctx context.Context) (uint64, error) {
+	if v.session == nil {
+		return 0, ErrAgentDisposed
+	}
+	return v.session.Sequence(ctx)
+}
+
+func (v SessionView) DeriveMessages(ctx context.Context) ([]*llm.Message, error) {
+	if v.session == nil {
+		return nil, ErrAgentDisposed
+	}
+	return v.session.DeriveMessages(ctx)
+}
+
+func (v SessionView) Project(ctx context.Context) ([]*llm.Message, *session.Projection, error) {
+	if v.session == nil {
+		return nil, nil, ErrAgentDisposed
+	}
+	return v.session.Project(ctx)
 }
 
 type inboxKind uint8
@@ -114,6 +165,7 @@ func NewAgent(loop *Loop) (*Handle, error) {
 	if err := h.approval.restore(context.Background()); err != nil {
 		return nil, fmt.Errorf("agent: restore approvals: %w", err)
 	}
+	h.approval.setResume(h.resumeApprovedTool)
 	if setter, ok := loop.Tools.(interface{ SetApprovalService(tools.ApprovalService) }); ok {
 		setter.SetApprovalService(h.approval)
 	}
@@ -187,10 +239,13 @@ func (h *Handle) requeueStepInputs(inputs []StepInput) {
 // library; NewAgent remains explicit for callers migrating from Loop.
 func New(loop *Loop) (*Handle, error) { return NewAgent(loop) }
 
+// RegisterAgent is the lifecycle-oriented constructor name used by hosts.
+func RegisterAgent(loop *Loop) (*Handle, error) { return NewAgent(loop) }
+
 func (h *Handle) ID() string { return h.loop.SessionID }
 
-func (h *Handle) Session() *session.Session { return h.session }
-func (h *Handle) ToolScope() tools.Runtime  { return h.loop.Tools }
+func (h *Handle) Session() SessionView     { return SessionView{session: h.session} }
+func (h *Handle) ToolScope() tools.Runtime { return h.loop.Tools }
 func (h *Handle) ToolCatalog() tools.Catalog {
 	if catalog, ok := h.loop.Tools.(tools.Catalog); ok {
 		return catalog
@@ -221,6 +276,8 @@ func (h *Handle) Status() AgentStatus {
 func (h *Handle) FollowUp(ctx context.Context, text string) error {
 	return h.enqueue(ctx, inboxFollowUp, text, true)
 }
+
+func (h *Handle) Send(ctx context.Context, text string) error { return h.FollowUp(ctx, text) }
 
 func (h *Handle) Steer(ctx context.Context, text string) error {
 	// Steering belongs to the next model step; it is consumed by an already
@@ -329,6 +386,51 @@ func (h *Handle) DecideApproval(ctx context.Context, callID string, approved boo
 	return h.approval.Decide(ctx, callID, approved)
 }
 
+func (h *Handle) Approve(ctx context.Context, callID string) error {
+	return h.DecideApproval(ctx, callID, true)
+}
+
+func (h *Handle) Reject(ctx context.Context, callID string) error {
+	return h.DecideApproval(ctx, callID, false)
+}
+
+func (h *Handle) resumeApprovedTool(ctx context.Context, request tools.ApprovalRequest, approved bool) error {
+	h.mu.Lock()
+	if h.status == StatusDisposed {
+		h.mu.Unlock()
+		return ErrAgentDisposed
+	}
+	if h.status == StatusRunning {
+		h.mu.Unlock()
+		return ErrAgentBusy
+	}
+	h.status = StatusRunning
+	h.signalChanged()
+	h.mu.Unlock()
+	h.emitStatus(StatusRunning)
+	defer func() {
+		h.mu.Lock()
+		disposed := h.status == StatusDisposed
+		if !disposed {
+			h.status = StatusIdle
+		}
+		h.signalChanged()
+		h.mu.Unlock()
+		if disposed {
+			return
+		}
+		h.emitStatus(StatusIdle)
+		pending := h.hasWakeableInbox()
+		if pending {
+			select {
+			case h.wake <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	return h.loop.ResumeApprovedTool(ctx, request, approved)
+}
+
 func (h *Handle) Subscribe(ctx context.Context, after uint64, filter EventFilter) (*Subscription, error) {
 	return h.loop.Subscribe(ctx, after, filter)
 }
@@ -360,10 +462,16 @@ func (h *Handle) Run(ctx context.Context, input string) (*Result, error) {
 		cancel()
 		h.mu.Lock()
 		h.runCancel = nil
-		h.status = StatusIdle
+		disposed := h.status == StatusDisposed
+		if !disposed {
+			h.status = StatusIdle
+		}
 		h.signalChanged()
 		pending := h.hasWakeableInbox()
 		h.mu.Unlock()
+		if disposed {
+			return
+		}
 		h.emitStatus(StatusIdle)
 		if pending {
 			select {
@@ -503,6 +611,8 @@ func (h *Handle) restoreInbox(ctx context.Context) error {
 	queuedSeq := map[string]uint64{}
 	terminal := map[string]bool{}
 	inputSeen := map[string]bool{}
+	inputRun := map[string]string{}
+	runEnded := map[string]bool{}
 	for _, event := range events {
 		if event.Type == session.EventUserMessage || event.Type == session.EventSteeringMessage || event.Type == session.EventInjectedContext {
 			var payload struct {
@@ -510,7 +620,11 @@ func (h *Handle) restoreInbox(ctx context.Context) error {
 			}
 			if json.Unmarshal(event.Data, &payload) == nil && payload.InboxID != "" {
 				inputSeen[payload.InboxID] = true
+				inputRun[payload.InboxID] = event.RunID
 			}
+		}
+		if event.Type == session.EventTurnEnd && event.RunID != "" {
+			runEnded[event.RunID] = true
 		}
 		switch event.Type {
 		case session.EventInboxQueued:
@@ -541,18 +655,18 @@ func (h *Handle) restoreInbox(ctx context.Context) error {
 		if terminal[id] {
 			continue
 		}
-		if inputSeen[id] {
-			// The model-visible input was committed before a crash, so the
-			// inbox item is not replayed. Seal the durable queue lifecycle now
-			// instead of leaving a permanently claimed record behind.
+		if inputSeen[id] && runEnded[inputRun[id]] {
+			// A completed turn already consumed this input. Seal the queue
+			// lifecycle without replaying the user message.
 			if err := h.appendInbox(ctx, session.EventInboxCompleted, item); err != nil {
 				return err
 			}
 			continue
 		}
-		if !terminal[id] {
-			h.inbox = append(h.inbox, item)
-		}
+		// A queued item whose input was written but whose turn has no end is
+		// an interrupted run. Requeue it; the next RunInputWithID is fenced
+		// and idempotent for the existing input event.
+		h.inbox = append(h.inbox, item)
 	}
 	return nil
 }
@@ -588,6 +702,8 @@ func (h *Handle) Dispose(ctx context.Context) error {
 	}
 }
 
+func (h *Handle) Close(ctx context.Context) error { return h.Dispose(ctx) }
+
 func (h *Handle) signalChanged() {
 	select {
 	case h.changed <- struct{}{}:
@@ -604,14 +720,22 @@ type approvalBroker struct {
 	pending   map[string]chan bool
 	requested map[string]bool
 	decisions map[string]bool
+	requests  map[string]tools.ApprovalRequest
 	lease     *session.Lease
 	hub       *EventHub
 	store     Store
 	sessionID string
+	resume    func(context.Context, tools.ApprovalRequest, bool) error
 }
 
 func newApprovalBroker(hub *EventHub, store Store, sessionID string) *approvalBroker {
-	return &approvalBroker{pending: make(map[string]chan bool), requested: make(map[string]bool), decisions: make(map[string]bool), hub: hub, store: store, sessionID: sessionID}
+	return &approvalBroker{pending: make(map[string]chan bool), requested: make(map[string]bool), decisions: make(map[string]bool), requests: make(map[string]tools.ApprovalRequest), hub: hub, store: store, sessionID: sessionID}
+}
+
+func (b *approvalBroker) setResume(resume func(context.Context, tools.ApprovalRequest, bool) error) {
+	b.mu.Lock()
+	b.resume = resume
+	b.mu.Unlock()
 }
 
 func (b *approvalBroker) SetLease(lease session.Lease) {
@@ -634,11 +758,13 @@ func (b *approvalBroker) Approve(ctx context.Context, request tools.ApprovalRequ
 	}
 	b.pending[request.CallID] = decision
 	b.requested[request.CallID] = true
+	b.requests[request.CallID] = request
 	b.mu.Unlock()
-	if err := b.append(ctx, session.EventApprovalRequested, request.CallID, mustJSON(request)); err != nil {
+	if err := b.append(ctx, session.EventApprovalRequested, request.RunID, request.TurnID, request.StepID, request.CallID, mustJSON(request)); err != nil {
 		b.mu.Lock()
 		delete(b.pending, request.CallID)
 		delete(b.requested, request.CallID)
+		delete(b.requests, request.CallID)
 		b.mu.Unlock()
 		return false, err
 	}
@@ -661,14 +787,19 @@ func (b *approvalBroker) Decide(ctx context.Context, callID string, approved boo
 	decision, ok := b.pending[callID]
 	requested := b.requested[callID]
 	_, alreadyDecided := b.decisions[callID]
+	request := b.requests[callID]
+	resume := b.resume
 	b.mu.Unlock()
 	if alreadyDecided {
+		if decision == nil && requested && resume != nil && request.CallID != "" {
+			return resume(ctx, request, approved)
+		}
 		return nil
 	}
 	if !ok && !requested {
 		return fmt.Errorf("agent: no approval pending for %s", callID)
 	}
-	if err := b.append(ctx, session.EventApprovalResolved, callID, session.ApprovalResolvedJSON(callID, approved)); err != nil {
+	if err := b.append(ctx, session.EventApprovalResolved, request.RunID, request.TurnID, request.StepID, callID, session.ApprovalResolvedJSON(callID, approved)); err != nil {
 		return err
 	}
 	b.mu.Lock()
@@ -676,6 +807,10 @@ func (b *approvalBroker) Decide(ctx context.Context, callID string, approved boo
 	b.mu.Unlock()
 	if decision != nil {
 		decision <- approved
+		return nil
+	}
+	if resume != nil && requested {
+		return resume(ctx, request, approved)
 	}
 	return nil
 }
@@ -692,6 +827,10 @@ func (b *approvalBroker) restore(ctx context.Context) error {
 		case session.EventApprovalRequested:
 			if event.CallID != "" {
 				b.requested[event.CallID] = true
+				var request tools.ApprovalRequest
+				if json.Unmarshal(event.Data, &request) == nil {
+					b.requests[event.CallID] = request
+				}
 			}
 		case session.EventApprovalResolved:
 			var payload session.ApprovalResolvedPayload
@@ -704,7 +843,7 @@ func (b *approvalBroker) restore(ctx context.Context) error {
 	return nil
 }
 
-func (b *approvalBroker) append(ctx context.Context, typ session.EventType, callID string, data json.RawMessage) error {
+func (b *approvalBroker) append(ctx context.Context, typ session.EventType, runID, turnID, stepID, callID string, data json.RawMessage) error {
 	id := fmt.Sprintf("approval-%s-%s", callID, typ)
 	b.mu.Lock()
 	lease := b.lease
@@ -715,7 +854,7 @@ func (b *approvalBroker) append(ctx context.Context, typ session.EventType, call
 	b.mu.Unlock()
 	if lease != nil {
 		if batchStore, ok := b.store.(session.FencedBatchStore); ok {
-			batch, err := batchStore.AppendFencedCommitted(ctx, *lease, []session.Event{{ID: id, SessionID: b.sessionID, CallID: callID, Type: typ, Data: data}})
+			batch, err := batchStore.AppendFencedCommitted(ctx, *lease, []session.Event{{ID: id, SessionID: b.sessionID, RunID: runID, TurnID: turnID, StepID: stepID, CallID: callID, Type: typ, Data: data}})
 			if err == nil {
 				for _, event := range batch.Events {
 					b.hub.Publish(event)
@@ -724,7 +863,7 @@ func (b *approvalBroker) append(ctx context.Context, typ session.EventType, call
 			return err
 		}
 		if fenced, ok := b.store.(session.FencedStore); ok {
-			if _, err := fenced.AppendFenced(ctx, *lease, []session.Event{{ID: id, SessionID: b.sessionID, CallID: callID, Type: typ, Data: data}}); err != nil {
+			if _, err := fenced.AppendFenced(ctx, *lease, []session.Event{{ID: id, SessionID: b.sessionID, RunID: runID, TurnID: turnID, StepID: stepID, CallID: callID, Type: typ, Data: data}}); err != nil {
 				return err
 			}
 			committed, err := b.store.Load(ctx, b.sessionID, 0, 0)
@@ -740,7 +879,7 @@ func (b *approvalBroker) append(ctx context.Context, typ session.EventType, call
 			return fmt.Errorf("agent: committed approval event %s not found", id)
 		}
 	}
-	_, err := appendDurable(ctx, b.store, b.hub, b.sessionID, session.Event{ID: id, SessionID: b.sessionID, CallID: callID, Type: typ, Data: data})
+	_, err := appendDurable(ctx, b.store, b.hub, b.sessionID, session.Event{ID: id, SessionID: b.sessionID, RunID: runID, TurnID: turnID, StepID: stepID, CallID: callID, Type: typ, Data: data})
 	return err
 }
 

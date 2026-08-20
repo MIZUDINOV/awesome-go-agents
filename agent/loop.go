@@ -10,8 +10,8 @@
 //     Registry — never editing a mutable history in place.
 //   - Single-writer: every mutation is a fenced append under a session lease;
 //     a lost/expired lease aborts the run (ErrLeaseLost) instead of writing
-//     blindly. Recovery closes orphaned turns and marks dangling tool calls
-//     TOOL_OUTCOME_UNKNOWN (never a blind retry of side-effecting work).
+//     blindly. Recovery closes orphaned turns and settles calls from their
+//     durable dispatch barrier (never a blind retry of side-effecting work).
 //   - Cancellation has priority over recovery/compaction.
 //   - Context overflow handling order: prune -> max-safe compaction -> bounded
 //     retry, and only after the surface advances.
@@ -84,9 +84,6 @@ type Config struct {
 	Owner        string
 	SystemPrompt string
 
-	// MaxTurns is retained for source compatibility; one RunInput is exactly
-	// one durable turn. MaxStepsPerTurn bounds provider calls within it.
-	MaxTurns          int
 	MaxStepsPerTurn   int
 	MaxToolCalls      int
 	MaxTokens         int64
@@ -150,7 +147,7 @@ type StepInput struct {
 // DefaultConfig returns the review-checklist reference defaults.
 func DefaultConfig() Config {
 	return Config{
-		MaxTurns: 10, MaxStepsPerTurn: 6, MaxTokens: 4096,
+		MaxStepsPerTurn: 6, MaxTokens: 4096,
 		MaxToolCalls: 64, MaxTotalTokens: 1000000, MaxContextRetries: 1, MaxWallTime: 30 * time.Minute,
 		LeaseTTL:      30 * time.Second,
 		ContextWindow: 128000, MaxOutput: 4096,
@@ -174,9 +171,6 @@ type Loop struct {
 // NewLoop builds a Loop. cfg is normalized with reference defaults.
 func NewLoop(sessionID string, store Store, registry tools.Runtime, chat Chat, cfg Config) *Loop {
 	def := DefaultConfig()
-	if cfg.MaxTurns <= 0 {
-		cfg.MaxTurns = def.MaxTurns
-	}
 	if cfg.MaxStepsPerTurn <= 0 {
 		cfg.MaxStepsPerTurn = def.MaxStepsPerTurn
 	}
@@ -263,6 +257,87 @@ func (l *Loop) RunInput(ctx context.Context, inputType session.EventType, input 
 	return l.RunInputWithID(ctx, inputType, "", input)
 }
 
+// ResumeApprovedTool completes a durable approval that survived a worker
+// restart. It is deliberately limited to calls without a dispatch barrier;
+// once dispatch was durable, recovery must classify the outcome as unknown
+// instead of risking a duplicate side effect.
+func (l *Loop) ResumeApprovedTool(ctx context.Context, request tools.ApprovalRequest, approved bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if request.CallID == "" || request.ToolName == "" {
+		return fmt.Errorf("agent: approval request is incomplete")
+	}
+	var lease session.Lease
+	externalLease := l.Config.ClaimedLease != nil
+	if externalLease {
+		lease = *l.Config.ClaimedLease
+		if lease.SessionID != l.SessionID || lease.Token == "" || lease.Fence == 0 {
+			return ErrLeaseLost
+		}
+	} else {
+		claimed, err := l.Store.ClaimLease(ctx, l.SessionID, l.Config.Owner, l.Config.LeaseTTL, "")
+		if err != nil {
+			return err
+		}
+		lease = claimed
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		defer func() { _ = l.Store.ReleaseLease(cleanupCtx, lease) }()
+	}
+	if err := l.refresh(ctx); err != nil {
+		return err
+	}
+	var callEvent session.Event
+	resultExists, dispatched := false, false
+	for _, event := range l.snapshotEvents() {
+		if event.Type == session.EventToolCall && event.CallID == request.CallID {
+			callEvent = event
+		}
+		if event.Type == session.EventToolResult && event.CallID == request.CallID {
+			resultExists = true
+		}
+		if (event.Type == session.EventToolDispatched || event.Type == session.EventToolRunning) && event.CallID == request.CallID {
+			dispatched = true
+		}
+	}
+	if resultExists {
+		return nil
+	}
+	if dispatched {
+		return fmt.Errorf("agent: approved tool %s was already dispatched", request.CallID)
+	}
+	runID, turnID, stepID := callEvent.RunID, callEvent.TurnID, callEvent.StepID
+	if runID == "" {
+		runID = request.RunID
+	}
+	if turnID == "" {
+		turnID = "turn-resume-" + request.CallID
+	}
+	if stepID == "" {
+		stepID = turnID + "-step-00"
+	}
+	em := &emitter{sessionID: l.SessionID, runID: runID}
+	persistCtx := durableContext(ctx)
+	if !approved {
+		return l.appendToolResultErr(persistCtx, lease, em, request.CallID, request.ToolName, tools.ErrApprovalDenied, turnID, stepID)
+	}
+	onDispatch := func(dispatchCtx context.Context, name, callID string) error {
+		if err := l.append(dispatchCtx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: runID, TurnID: turnID, StepID: stepID, CallID: callID, Type: session.EventToolDispatched, Data: strJSON("dispatched")}); err != nil {
+			return err
+		}
+		return l.append(dispatchCtx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: runID, TurnID: turnID, StepID: stepID, CallID: callID, Type: session.EventToolRunning, Data: strJSON("running")})
+	}
+	outcomes := l.Tools.RunBatch(ctx, tools.ExecContext{SessionID: l.SessionID, RunID: runID, TurnID: turnID, StepID: stepID, Vars: mergeVars(l.Config.Vars), Sandbox: l.Config.Sandbox, Artifacts: l.Config.Artifacts, Lease: &lease, OnDispatch: onDispatch}, []tools.Call{{Name: request.ToolName, CallID: request.CallID, Input: append(json.RawMessage(nil), request.Arguments...)}})
+	if len(outcomes) != 1 {
+		return fmt.Errorf("agent: approval resume returned %d outcomes", len(outcomes))
+	}
+	if _, err := l.appendToolOutcome(persistCtx, lease, em, outcomes[0], turnID, stepID); err != nil {
+		return err
+	}
+	return nil
+}
+
 // RunInputWithID is the durable inbox-aware variant. inputID is used only as
 // a correlation key in the user payload; the event envelope still receives a
 // distinct id so fenced idempotency cannot confuse an inbox record with the
@@ -299,13 +374,17 @@ func (l *Loop) RunInputWithID(ctx context.Context, inputType session.EventType, 
 			}
 			return nil, err
 		}
-		defer func() { _ = l.Store.ReleaseLease(ctx, lease) }()
 	}
 	loopCtx := ctx
 	stopHeartbeat := func() error { return nil }
 	if !externalLease {
 		loopCtx, stopHeartbeat = l.leaseHeartbeat(ctx, lease)
-		defer stopHeartbeat()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		defer func() {
+			_ = stopHeartbeat()
+			_ = l.Store.ReleaseLease(cleanupCtx, lease)
+		}()
 	}
 
 	// Recovery runs BEFORE any new work: close an orphaned turn from a crash
@@ -328,11 +407,14 @@ func (l *Loop) RunInputWithID(ctx context.Context, inputType session.EventType, 
 
 	runID := newRunID()
 	em := &emitter{sessionID: l.SessionID, runID: runID}
+	turnID := fmt.Sprintf("turn-%04d", l.nextTurnNumber())
 
 	// Durable request preamble (diagnostics, non-surface).
-	if err := l.append(loopCtx, lease, em.next(session.EventRequestContext, map[string]any{
+	requestContext := em.next(session.EventRequestContext, map[string]any{
 		"model": cfg.Model, "context_window": cfg.ContextWindow, "max_output": cfg.MaxOutput,
-	})); err != nil {
+	})
+	requestContext.TurnID = turnID
+	if err := l.append(loopCtx, lease, requestContext); err != nil {
 		return nil, err
 	}
 	userEventID := em.id()
@@ -340,7 +422,7 @@ func (l *Loop) RunInputWithID(ctx context.Context, inputType session.EventType, 
 		userEventID = inputID + ":input"
 	}
 	userEv := session.Event{
-		ID: userEventID, SessionID: l.SessionID, RunID: runID, Type: inputType,
+		ID: userEventID, SessionID: l.SessionID, RunID: runID, TurnID: turnID, Type: inputType,
 		Data: session.UserTextWithInbox(input, inputID),
 	}
 	if err := l.append(loopCtx, lease, userEv); err != nil {
@@ -353,7 +435,6 @@ func (l *Loop) RunInputWithID(ctx context.Context, inputType session.EventType, 
 	toolCallCount := 0
 	totalTokens := int64(0)
 
-	turnID := fmt.Sprintf("turn-%04d", l.nextTurnNumber())
 	if err := l.append(loopCtx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: runID, TurnID: turnID, Type: session.EventTurnStart, Data: strJSON("start")}); err != nil {
 		return nil, err
 	}
@@ -362,13 +443,13 @@ func (l *Loop) RunInputWithID(ctx context.Context, inputType session.EventType, 
 			if heartbeatErr := stopHeartbeat(); heartbeatErr != nil {
 				return nil, ErrLeaseLost
 			}
-			_ = l.appendTurnEnd(context.Background(), lease, em, "cancelled")
+			_ = l.appendTurnEnd(context.Background(), lease, em, turnID, "cancelled")
 			l.finish(result, "interrupted")
 			return result, ErrStopped
 		}
 		if cfg.NextStep != nil {
 			inputs := cfg.NextStep()
-			if err := l.appendStepInputs(loopCtx, lease, em, inputs); err != nil {
+			if err := l.appendStepInputs(loopCtx, lease, em, turnID, step, inputs); err != nil {
 				if cfg.RequeueStep != nil && len(inputs) > 0 {
 					cfg.RequeueStep(inputs)
 				}
@@ -382,7 +463,7 @@ func (l *Loop) RunInputWithID(ctx context.Context, inputType session.EventType, 
 			return nil, err
 		}
 		if over {
-			_ = l.appendTurnEnd(durableContext(ctx), lease, em, "context_overflow")
+			_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "context_overflow")
 			return nil, ErrContextOverflow
 		}
 
@@ -398,7 +479,7 @@ func (l *Loop) RunInputWithID(ctx context.Context, inputType session.EventType, 
 				// compaction, then retry once. Cancellation wins over recovery.
 				if overflowRetries >= cfg.MaxContextRetries {
 					_ = l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: fmt.Sprintf("%s-step-%02d", turnID, step), Type: session.EventStepEnd, Data: strJSON("context_overflow")})
-					_ = l.appendTurnEnd(durableContext(ctx), lease, em, "context_overflow")
+					_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "context_overflow")
 					return nil, ErrContextOverflow
 				}
 				overflowRetries++
@@ -419,23 +500,23 @@ func (l *Loop) RunInputWithID(ctx context.Context, inputType session.EventType, 
 					if err != nil {
 						if isOverflow(err) {
 							_ = l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: fmt.Sprintf("%s-step-%02d", turnID, step), Type: session.EventStepEnd, Data: strJSON("context_overflow")})
-							_ = l.appendTurnEnd(durableContext(ctx), lease, em, "context_overflow")
+							_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "context_overflow")
 							return nil, ErrContextOverflow
 						}
-						_ = l.appendTurnEnd(context.Background(), lease, em, "error")
+						_ = l.appendTurnEnd(context.Background(), lease, em, turnID, "error")
 						return nil, err
 					}
 				} else {
 					_ = l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: fmt.Sprintf("%s-step-%02d", turnID, step), Type: session.EventStepEnd, Data: strJSON("context_overflow")})
-					_ = l.appendTurnEnd(durableContext(ctx), lease, em, "context_overflow")
+					_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "context_overflow")
 					return nil, ErrContextOverflow
 				}
 			} else if errors.Is(err, ErrStopped) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				_ = l.appendTurnEnd(context.Background(), lease, em, "cancelled")
+				_ = l.appendTurnEnd(context.Background(), lease, em, turnID, "cancelled")
 				l.finish(result, "interrupted")
 				return result, ErrStopped
 			} else {
-				if endErr := l.appendTurnEnd(context.Background(), lease, em, "error"); endErr != nil {
+				if endErr := l.appendTurnEnd(context.Background(), lease, em, turnID, "error"); endErr != nil {
 					return nil, endErr
 				}
 				return nil, err
@@ -444,21 +525,22 @@ func (l *Loop) RunInputWithID(ctx context.Context, inputType session.EventType, 
 		result.Turns = 1
 		result.CompactCount = compacted
 		if done {
-			if endErr := l.appendTurnEnd(loopCtx, lease, em, reason); endErr != nil {
+			if endErr := l.appendTurnEnd(loopCtx, lease, em, turnID, reason); endErr != nil {
 				return nil, endErr
 			}
 			l.finish(result, reason)
 			return result, nil
 		}
 	}
-	if endErr := l.appendTurnEnd(loopCtx, lease, em, "turn_limit"); endErr != nil {
+	if endErr := l.appendTurnEnd(loopCtx, lease, em, turnID, "turn_limit"); endErr != nil {
 		return nil, endErr
 	}
 	l.finish(result, "turn_limit")
 	return result, nil
 }
 
-func (l *Loop) appendStepInputs(ctx context.Context, lease session.Lease, em *emitter, inputs []StepInput) error {
+func (l *Loop) appendStepInputs(ctx context.Context, lease session.Lease, em *emitter, turnID string, step int, inputs []StepInput) error {
+	stepID := fmt.Sprintf("%s-step-%02d", turnID, step)
 	for _, input := range inputs {
 		if input.ID == "" || input.Text == "" {
 			continue
@@ -468,13 +550,13 @@ func (l *Loop) appendStepInputs(ctx context.Context, lease session.Lease, em *em
 			typ = session.EventInjectedContext
 		}
 		payload := session.InboxPayloadJSON(input.ID, map[session.EventType]string{session.EventSteeringMessage: "steer", session.EventInjectedContext: "inject"}[typ], input.Text)
-		if err := l.append(ctx, lease, session.Event{ID: input.ID + ":claimed", SessionID: l.SessionID, RunID: em.runID, Type: session.EventInboxClaimed, Data: payload}); err != nil {
+		if err := l.append(ctx, lease, session.Event{ID: input.ID + ":claimed", SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventInboxClaimed, Data: payload}); err != nil {
 			return err
 		}
-		if err := l.append(ctx, lease, session.Event{ID: input.ID + ":input", SessionID: l.SessionID, RunID: em.runID, Type: typ, Data: session.UserTextWithInbox(input.Text, input.ID)}); err != nil {
+		if err := l.append(ctx, lease, session.Event{ID: input.ID + ":input", SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: typ, Data: session.UserTextWithInbox(input.Text, input.ID)}); err != nil {
 			return err
 		}
-		if err := l.append(ctx, lease, session.Event{ID: input.ID + ":completed", SessionID: l.SessionID, RunID: em.runID, Type: session.EventInboxCompleted, Data: payload}); err != nil {
+		if err := l.append(ctx, lease, session.Event{ID: input.ID + ":completed", SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventInboxCompleted, Data: payload}); err != nil {
 			return err
 		}
 	}
@@ -722,7 +804,7 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 		// Final assistant reply; no further tools -> turn completes.
 		finalParts := chooseStreamParts(resp.Message.Parts, streamedParts)
 		ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID,
-			Type: session.EventAssistantMessage, Data: session.AssistantContentFromParts(finalParts, false)}
+			Type: session.EventAssistantMessage, Data: session.AssistantContentFromPartsWithMetadata(finalParts, resp.Message.Metadata, false)}
 		end := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, Type: session.EventStepEnd, Data: strJSON("end")}
 		if err := l.appendBatch(ctx, lease, []session.Event{ev, end}); err != nil {
 			return false, "", err
@@ -736,7 +818,7 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 	// re-execute).
 	finalParts := chooseStreamParts(resp.Message.Parts, streamedParts)
 	asst := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID,
-		Type: session.EventAssistantMessage, Data: session.AssistantContentFromParts(finalParts, false)}
+		Type: session.EventAssistantMessage, Data: session.AssistantContentFromPartsWithMetadata(finalParts, resp.Message.Metadata, false)}
 	if err := l.append(ctx, lease, asst); err != nil {
 		return false, "", err
 	}
@@ -760,9 +842,6 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 		}
 		batch = append(batch, tools.Call{Name: call.Name, CallID: callID, Input: append(json.RawMessage(nil), call.Arguments...)})
 	}
-	if err := ctx.Err(); err != nil {
-		return false, "", ErrStopped
-	}
 	ecVars := mergeVars(cfg.Vars)
 	// No execution-world call has started before RunBatch. If cancellation won
 	// here, settle every queued call in model order with a durable, explicit
@@ -779,15 +858,13 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 		}
 		return false, "", ErrStopped
 	}
-	for _, call := range batch {
-		if err := l.append(ctx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: call.CallID, Type: session.EventToolDispatched, Data: strJSON("dispatched")}); err != nil {
-			return false, "", err
+	onDispatch := func(dispatchCtx context.Context, name, callID string) error {
+		if err := l.append(dispatchCtx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: callID, Type: session.EventToolDispatched, Data: strJSON("dispatched")}); err != nil {
+			return err
 		}
-		if err := l.append(ctx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: call.CallID, Type: session.EventToolRunning, Data: strJSON("running")}); err != nil {
-			return false, "", err
-		}
+		return l.append(dispatchCtx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: callID, Type: session.EventToolRunning, Data: strJSON("running")})
 	}
-	outcomes := l.Tools.RunBatch(ctx, tools.ExecContext{SessionID: l.SessionID, RunID: em.runID, Vars: ecVars, Sandbox: cfg.Sandbox, Artifacts: cfg.Artifacts, Lease: &lease}, batch)
+	outcomes := l.Tools.RunBatch(ctx, tools.ExecContext{SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Vars: ecVars, Sandbox: cfg.Sandbox, Artifacts: cfg.Artifacts, Lease: &lease, OnDispatch: onDispatch}, batch)
 	// Tool bodies may have started before the caller cancelled the run. Their
 	// terminal outcomes are part of the durable recovery boundary and therefore
 	// must be committed with a context that is no longer cancelled; otherwise a
@@ -795,31 +872,11 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 	persistCtx := durableContext(ctx)
 	concludesTurn := false
 	for _, outcome := range outcomes {
-		if outcome.Err != nil {
-			// A tool pipeline failure (validation, sandbox denial, timeout) is
-			// still a durable tool/result outcome; the call is never left dangling.
-			if err := l.appendToolResultErr(persistCtx, lease, em, outcome.Call.CallID, outcome.Call.Name, outcome.Err, turnID, stepID); err != nil {
-				return false, "", err
-			}
-		} else {
-			concludesTurn = concludesTurn || outcome.Result.ConcludesTurn
-			// Persist the model-facing result (the durable output the surface
-			// re-renders on the next step), falling back to the canonical value.
-			output := any(outcome.Result.Canonical)
-			if outcome.Result.ModelFacing != nil {
-				output = outcome.Result.ModelFacing
-			}
-			encoded, encodeErr := json.Marshal(output)
-			if encodeErr != nil {
-				if err := l.appendToolResultErr(persistCtx, lease, em, outcome.Call.CallID, outcome.Call.Name, fmt.Errorf("encode tool content: %w", encodeErr), turnID, stepID); err != nil {
-					return false, "", err
-				}
-				continue
-			}
-			if err := l.appendToolResult(persistCtx, lease, em, outcome.Call.CallID, outcome.Call.Name, encoded, outcome.Result.UI, outcome.Result.Code, outcome.Result.Content, outcome.Result.AdditionalContexts, outcome.Result.ConcludesTurn, turnID, stepID); err != nil {
-				return false, "", err
-			}
+		concludes, appendErr := l.appendToolOutcome(persistCtx, lease, em, outcome, turnID, stepID)
+		if appendErr != nil {
+			return false, "", appendErr
 		}
+		concludesTurn = concludesTurn || concludes
 	}
 	if err := l.append(persistCtx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventStepEnd, Data: strJSON("tools_done")}); err != nil {
 		return false, "", err
@@ -835,6 +892,44 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 	return false, "tool_calls", nil
 }
 
+func (l *Loop) appendToolOutcome(ctx context.Context, lease session.Lease, em *emitter, outcome tools.Outcome, turnID, stepID string) (bool, error) {
+	if outcome.Err != nil {
+		if err := l.appendToolResultErr(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, outcome.Err, turnID, stepID); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if outcome.Result == nil {
+		err := fmt.Errorf("tool %s returned no result", outcome.Call.Name)
+		if appendErr := l.appendToolResultErr(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, err, turnID, stepID); appendErr != nil {
+			return false, appendErr
+		}
+		return false, nil
+	}
+	canonicalEncoded, err := json.Marshal(outcome.Result.Canonical)
+	if err != nil {
+		if appendErr := l.appendToolResultErr(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, fmt.Errorf("encode tool content: %w", err), turnID, stepID); appendErr != nil {
+			return false, appendErr
+		}
+		return false, nil
+	}
+	modelFacing := any(outcome.Result.Canonical)
+	if outcome.Result.ModelFacing != nil {
+		modelFacing = outcome.Result.ModelFacing
+	}
+	contentEncoded, err := json.Marshal(modelFacing)
+	if err != nil {
+		if appendErr := l.appendToolResultErr(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, fmt.Errorf("encode tool content: %w", err), turnID, stepID); appendErr != nil {
+			return false, appendErr
+		}
+		return false, nil
+	}
+	if err := l.appendToolResult(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, canonicalEncoded, contentEncoded, outcome.Result.UI, outcome.Result.Code, outcome.Result.Content, outcome.Result.AdditionalContexts, outcome.Result.ConcludesTurn, turnID, stepID); err != nil {
+		return false, err
+	}
+	return outcome.Result.ConcludesTurn, nil
+}
+
 func toDurableCalls(calls []llm.ToolCallRequest) []session.ToolCall {
 	out := make([]session.ToolCall, 0, len(calls))
 	for _, c := range calls {
@@ -843,8 +938,8 @@ func toDurableCalls(calls []llm.ToolCallRequest) []session.ToolCall {
 	return out
 }
 
-func (l *Loop) appendToolResult(ctx context.Context, lease session.Lease, em *emitter, callID, name string, output json.RawMessage, meta map[string]any, code string, blocks []session.ContentBlock, contexts []llm.Message, concludesTurn bool, turnID, stepID string) error {
-	data := session.ToolResultStructuredPayloadWithOptions(callID, name, output, meta, code, false, blocks, contexts, concludesTurn)
+func (l *Loop) appendToolResult(ctx context.Context, lease session.Lease, em *emitter, callID, name string, output, content json.RawMessage, meta map[string]any, code string, blocks []session.ContentBlock, contexts []llm.Message, concludesTurn bool, turnID, stepID string) error {
+	data := session.ToolResultStructuredPayloadWithOutput(callID, name, output, content, meta, code, false, blocks, contexts, concludesTurn)
 	ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: callID,
 		Type: session.EventToolResult, Data: data, SourceSeqs: l.assistantSourceSeqs(callID, turnID, stepID)}
 	return l.append(ctx, lease, ev)
@@ -1043,8 +1138,8 @@ func (l *Loop) appendUsage(ctx context.Context, lease session.Lease, em *emitter
 	return l.append(ctx, lease, ev)
 }
 
-func (l *Loop) appendTurnEnd(ctx context.Context, lease session.Lease, em *emitter, reason string) error {
-	ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, Type: session.EventTurnEnd, Data: mustMarshal(map[string]any{"reason": reason})}
+func (l *Loop) appendTurnEnd(ctx context.Context, lease session.Lease, em *emitter, turnID, reason string) error {
+	ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, Type: session.EventTurnEnd, Data: mustMarshal(map[string]any{"reason": reason})}
 	return l.append(ctx, lease, ev)
 }
 
@@ -1110,7 +1205,14 @@ func (l *Loop) compactFallback(ctx context.Context, lease session.Lease, msgs []
 			pruned = append(pruned, message.Clone())
 		}
 	}
-	memctx.DefaultPruneCaps().PruneMessages(pruned)
+	caps := memctx.DefaultPruneCaps()
+	if l.Config.PruneHead > 0 {
+		caps.HeadChars = l.Config.PruneHead
+	}
+	if l.Config.PruneTail > 0 {
+		caps.TailChars = l.Config.PruneTail
+	}
+	caps.PruneMessages(pruned)
 	var summaryBuilder strings.Builder
 	for _, message := range pruned {
 		encoded, _ := json.Marshal(message)
@@ -1480,7 +1582,7 @@ type emitter struct {
 
 func (e *emitter) next(typ session.EventType, payload map[string]any) session.Event {
 	data, _ := json.Marshal(payload)
-	return session.Event{ID: e.id(), Type: typ, Data: data}
+	return session.Event{ID: e.id(), SessionID: e.sessionID, RunID: e.runID, Type: typ, Data: data}
 }
 
 func (e *emitter) id() string {

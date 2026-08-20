@@ -40,7 +40,7 @@ var ErrSchemaInvalid = fmt.Errorf("invalid JSON Schema")
 // outside the subset (ErrUnsupportedSchema). Callers run this once at
 // registration time.
 func ValidateSchema(schema []byte) error {
-	if len(schema) == 0 || string(schema) == "null" {
+	if schemaAbsent(schema) {
 		return nil
 	}
 	var node any
@@ -123,7 +123,7 @@ func validateSchemaNode(node any) error {
 // ValidateInput validates JSON arguments against a supported JSON Schema
 // object, returning ErrInvalidArguments on any structural violation.
 func ValidateInput(schema json.RawMessage, input []byte) error {
-	if len(schema) == 0 || string(schema) == "null" {
+	if schemaAbsent(schema) {
 		return nil
 	}
 	if err := ValidateSchema(schema); err != nil {

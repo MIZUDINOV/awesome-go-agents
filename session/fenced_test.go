@@ -103,6 +103,8 @@ func TestRecoverClosesTurnAndMarksUnknown(t *testing.T) {
 	if _, err := store.AppendFenced(ctx, lease, []Event{
 		{Type: EventTurnStart, Data: json.RawMessage(`{}`)},
 		{Type: EventToolCall, ID: "t:call1", CallID: "call1", Data: ToolCallPayload("call1", "write", json.RawMessage(`{"path":"a.ts"}`))},
+		{Type: EventToolDispatched, CallID: "call1", Data: json.RawMessage(`{"text":"dispatched"}`)},
+		{Type: EventToolRunning, CallID: "call1", Data: json.RawMessage(`{"text":"running"}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
