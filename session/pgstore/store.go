@@ -107,6 +107,11 @@ func (s *Store) Append(ctx context.Context, sessionID string, events []session.E
 		seq, err := s.Sequence(ctx, sessionID)
 		return seq, err
 	}
+	for i := range events {
+		if err := events[i].Validate(); err != nil {
+			return 0, err
+		}
+	}
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return 0, fmt.Errorf("pgstore: begin append: %w", err)
@@ -121,7 +126,7 @@ func (s *Store) Append(ctx context.Context, sessionID string, events []session.E
 			sessionID, s.tenant); err != nil {
 			return 0, fmt.Errorf("pgstore: ensure session: %w", err)
 		}
-		err = tx.QueryRow(ctx, fmt.Sprintf(`UPDATE %s SET next_seq=next_seq+$2, updated_at=now() WHERE session_id=$1 RETURNING next_seq`, s.sessions),
+		err = tx.QueryRow(ctx, fmt.Sprintf(`UPDATE %s SET next_seq=next_seq+$2, updated_at=now() WHERE session_id=$1 RETURNING next_seq-$2`, s.sessions),
 			sessionID, len(events)).Scan(&base)
 		if err != nil {
 			return 0, fmt.Errorf("pgstore: reserve sequence block: %w", err)
@@ -148,6 +153,11 @@ func (s *Store) Append(ctx context.Context, sessionID string, events []session.E
 
 // AppendFenced appends under a valid lease, idempotent per event ID.
 func (s *Store) AppendFenced(ctx context.Context, lease session.Lease, events []session.Event) (uint64, error) {
+	for i := range events {
+		if err := events[i].Validate(); err != nil {
+			return 0, err
+		}
+	}
 	if err := s.requireNativeAndTenant(); err != nil {
 		return 0, err
 	}
@@ -200,9 +210,14 @@ func (s *Store) AppendFenced(ctx context.Context, lease session.Lease, events []
 			}
 		}
 		newEvents = append(newEvents, events[i])
+		if events[i].ID != "" {
+			// De-duplicate repeated IDs within the same input batch as well as
+			// IDs already committed in the database.
+			existing[events[i].ID] = 0
+		}
 	}
 	if len(newEvents) > 0 {
-		if err := tx.QueryRow(ctx, fmt.Sprintf(`UPDATE %s SET next_seq=next_seq+$2, updated_at=now() WHERE session_id=$1 RETURNING next_seq`, s.sessions),
+		if err := tx.QueryRow(ctx, fmt.Sprintf(`UPDATE %s SET next_seq=next_seq+$2, updated_at=now() WHERE session_id=$1 RETURNING next_seq-$2`, s.sessions),
 			lease.SessionID, len(newEvents)).Scan(&base); err != nil {
 			return 0, fmt.Errorf("pgstore: reserve fenced sequence block: %w", err)
 		}
@@ -222,6 +237,91 @@ func (s *Store) AppendFenced(ctx context.Context, lease session.Lease, events []
 		return s.Sequence(ctx, lease.SessionID)
 	}
 	return lastSeq, nil
+}
+
+// AppendFencedCommitted is the canonical-batch variant used by new AgentKit
+// loops. The legacy method remains available for host adapters. The lease
+// makes the post-commit lookup safe from another writer for this session.
+func (s *Store) AppendFencedCommitted(ctx context.Context, lease session.Lease, events []session.Event) (session.CommittedBatch, error) {
+	if len(events) == 0 {
+		return session.CommittedBatch{}, nil
+	}
+	prepared := make([]session.Event, len(events))
+	for i := range events {
+		prepared[i] = events[i].Clone()
+		if err := prepared[i].Validate(); err != nil {
+			return session.CommittedBatch{}, err
+		}
+		if prepared[i].SessionID != "" && prepared[i].SessionID != lease.SessionID {
+			return session.CommittedBatch{}, fmt.Errorf("pgstore: event %s belongs to %q, not %q", prepared[i].ID, prepared[i].SessionID, lease.SessionID)
+		}
+		prepared[i].Normalize()
+		if prepared[i].ID == "" {
+			prepared[i].ID = randomToken()
+		}
+	}
+	if _, err := s.AppendFenced(ctx, lease, prepared); err != nil {
+		return session.CommittedBatch{}, err
+	}
+	all, err := s.Load(ctx, lease.SessionID, 0, 0)
+	if err != nil {
+		return session.CommittedBatch{}, err
+	}
+	byID := make(map[string]session.Event, len(all))
+	for _, event := range all {
+		if event.ID != "" {
+			byID[event.ID] = event
+		}
+	}
+	committed := make([]session.Event, 0, len(prepared))
+	for _, event := range prepared {
+		if canonical, ok := byID[event.ID]; ok {
+			committed = append(committed, canonical.Clone())
+		}
+	}
+	return session.CommittedBatch{Events: committed}, nil
+}
+
+// AppendCommitted is the lease-less compatibility form. New durable loops
+// should use AppendFencedCommitted so a host-owned fence protects the append.
+func (s *Store) AppendCommitted(ctx context.Context, sessionID string, events []session.Event) (session.CommittedBatch, error) {
+	if len(events) == 0 {
+		return session.CommittedBatch{}, nil
+	}
+	prepared := make([]session.Event, len(events))
+	for i := range events {
+		prepared[i] = events[i].Clone()
+		if err := prepared[i].Validate(); err != nil {
+			return session.CommittedBatch{}, err
+		}
+		if prepared[i].SessionID != "" && prepared[i].SessionID != sessionID {
+			return session.CommittedBatch{}, fmt.Errorf("pgstore: event %s belongs to %q, not %q", prepared[i].ID, prepared[i].SessionID, sessionID)
+		}
+		prepared[i].Normalize()
+		if prepared[i].ID == "" {
+			prepared[i].ID = randomToken()
+		}
+	}
+	if _, err := s.Append(ctx, sessionID, prepared); err != nil {
+		return session.CommittedBatch{}, err
+	}
+	all, err := s.Load(ctx, sessionID, 0, 0)
+	if err != nil {
+		return session.CommittedBatch{}, err
+	}
+	byID := make(map[string]session.Event, len(all))
+	for _, event := range all {
+		if event.ID != "" {
+			byID[event.ID] = event
+		}
+	}
+	committed := make([]session.Event, 0, len(prepared))
+	for _, event := range prepared {
+		if canonical, ok := byID[event.ID]; ok {
+			committed = append(committed, canonical.Clone())
+		}
+	}
+	return session.CommittedBatch{Events: committed}, nil
 }
 
 // ClaimLease acquires the session lease, bumping the execution fence.
@@ -302,17 +402,24 @@ func (s *Store) Recover(ctx context.Context, lease session.Lease) (*session.Reco
 	}
 	report := &session.RecoveryReport{}
 	openTurns := 0
+	openTurnID := ""
 	for _, e := range events {
 		if e.Type == session.EventTurnStart {
 			openTurns++
+			openTurnID = e.TurnID
 		} else if e.Type == session.EventTurnEnd {
 			openTurns--
+			if openTurns == 0 {
+				openTurnID = ""
+			}
 		}
 	}
 	var recovery []session.Event
+	recovery = append(recovery, session.InterruptedDraftEvents(events, lease.SessionID)...)
 	if openTurns > 0 {
 		report.TurnClosed = true
 		recovery = append(recovery, session.Event{
+			ID: "recover:turn-end:" + openTurnID, TurnID: openTurnID,
 			Type: session.EventTurnEnd, SessionID: lease.SessionID,
 			Data: mustJSON(map[string]any{"reason": "interrupted"}),
 		})
@@ -320,6 +427,7 @@ func (s *Store) Recover(ctx context.Context, lease session.Lease) (*session.Reco
 	callIDs := make([]string, 0)
 	seen := map[string]bool{}
 	resultIDs := map[string]bool{}
+	pendingApproval := map[string]bool{}
 	for _, e := range events {
 		switch e.Type {
 		case session.EventToolCall:
@@ -339,10 +447,19 @@ func (s *Store) Recover(ctx context.Context, lease session.Lease) (*session.Reco
 			if p.CallID != "" {
 				resultIDs[p.CallID] = true
 			}
+		case session.EventApprovalRequested:
+			if e.CallID != "" {
+				pendingApproval[e.CallID] = true
+			}
+		case session.EventApprovalResolved:
+			var p session.ApprovalResolvedPayload
+			if json.Unmarshal(e.Data, &p) == nil && p.CallID != "" {
+				pendingApproval[p.CallID] = false
+			}
 		}
 	}
 	for _, callID := range callIDs {
-		if !resultIDs[callID] {
+		if !resultIDs[callID] && !pendingApproval[callID] {
 			report.DanglingCalls = append(report.DanglingCalls, callID)
 			recovery = append(recovery, session.Event{
 				Type: session.EventToolResult, SessionID: lease.SessionID, CallID: callID,
@@ -419,6 +536,8 @@ WHERE session_id=$1 AND tenant_id=$2 AND lease_token=$3 AND lease_until>now()`, 
 }
 
 func insertEventTx(ctx context.Context, tx pgx.Tx, table, tenant, sessionID string, seq uint64, event session.Event) error {
+	event = event.Clone()
+	event.Normalize()
 	data := event.Data
 	if len(data) == 0 {
 		data = json.RawMessage("{}")
@@ -471,7 +590,7 @@ func (s *Store) Load(ctx context.Context, sessionID string, afterSeq uint64, lim
 		return nil, fmt.Errorf("pgstore: load events: %w", err)
 	}
 	defer rows.Close()
-	return scanEvents(rows, s.native)
+	return scanEvents(rows, s.native, sessionID)
 }
 
 func (s *Store) Tail(ctx context.Context, sessionID string, limit int) ([]session.Event, error) {
@@ -492,7 +611,7 @@ func (s *Store) Tail(ctx context.Context, sessionID string, limit int) ([]sessio
 		return nil, fmt.Errorf("pgstore: load tail: %w", err)
 	}
 	defer rows.Close()
-	return scanEvents(rows, s.native)
+	return scanEvents(rows, s.native, sessionID)
 }
 
 func (s *Store) Sequence(ctx context.Context, sessionID string) (uint64, error) {
@@ -522,7 +641,7 @@ func (s *Store) nativeSelectSuffix() string {
 	return ""
 }
 
-func scanEvents(rows pgx.Rows, native bool) ([]session.Event, error) {
+func scanEvents(rows pgx.Rows, native bool, sessionID string) ([]session.Event, error) {
 	var events []session.Event
 	for rows.Next() {
 		var e session.Event
@@ -549,6 +668,7 @@ func scanEvents(rows pgx.Rows, native bool) ([]session.Event, error) {
 			}
 		}
 		e.Type = session.EventType(eventType)
+		e.SessionID = sessionID
 		e.Timestamp = ts
 		e.Data = json.RawMessage(data)
 		e.SourceSeqs = sourceSeqs

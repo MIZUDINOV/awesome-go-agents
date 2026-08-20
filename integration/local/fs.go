@@ -171,6 +171,10 @@ func (f *LocalFileSystem) ReadText(ctx context.Context, target integration.Targe
 	return string(data), nil
 }
 
+func (f *LocalFileSystem) ReadBytes(_ context.Context, target integration.Target) ([]byte, error) {
+	return os.ReadFile(target.Path)
+}
+
 func (f *LocalFileSystem) WriteText(_ context.Context, target integration.Target, content string, intent integration.WriteIntent) (integration.WriteResult, error) {
 	f.lock.Lock()
 	defer f.lock.Unlock()

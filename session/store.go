@@ -2,8 +2,25 @@ package session
 
 import (
 	"context"
+	"fmt"
 	"sync"
+	"time"
 )
+
+// CommittedBatch is the canonical result of one atomic append. Every event in
+// the batch has its assigned sequence, stable ID and commit timestamp filled
+// by the store. Consumers must publish this copy, never a pre-commit input.
+type CommittedBatch struct {
+	Events []Event
+}
+
+// BatchStore is an optional additive capability for stores that can return
+// committed events directly. Store remains source-compatible with older
+// adapters while new loops prefer this stronger contract.
+type BatchStore interface {
+	Store
+	AppendCommitted(ctx context.Context, sessionID string, events []Event) (CommittedBatch, error)
+}
 
 // Store persists the append-only event log. The real deployment uses
 // PGSessionStore (PostgreSQL); MemoryStore is used in tests and embedded runs.
@@ -49,6 +66,17 @@ func NewMemoryStore() *MemoryStore {
 }
 
 func (s *MemoryStore) Append(_ context.Context, sessionID string, events []Event) (uint64, error) {
+	if len(events) == 0 {
+		return s.Sequence(context.Background(), sessionID)
+	}
+	for i := range events {
+		if err := events[i].Validate(); err != nil {
+			return 0, err
+		}
+		if events[i].SessionID != "" && events[i].SessionID != sessionID {
+			return 0, fmt.Errorf("session: event %s belongs to %q, not %q", events[i].ID, events[i].SessionID, sessionID)
+		}
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.events == nil {
@@ -59,14 +87,66 @@ func (s *MemoryStore) Append(_ context.Context, sessionID string, events []Event
 	stored := make([]Event, 0, len(events))
 	for i := range events {
 		e := events[i].Clone()
+		if e.SessionID == "" {
+			e.SessionID = sessionID
+		}
 		e.Seq = next
-		e.FormatVersion = e.NormalizedFormatVersion()
+		e.Normalize()
 		stored = append(stored, e)
 		next++
 	}
 	s.next[sessionID] = next - 1
 	s.events[sessionID] = append(s.events[sessionID], stored...)
 	return next - 1, nil
+}
+
+func (s *MemoryStore) AppendCommitted(_ context.Context, sessionID string, events []Event) (CommittedBatch, error) {
+	for i := range events {
+		if err := events[i].Validate(); err != nil {
+			return CommittedBatch{}, err
+		}
+		if events[i].SessionID != "" && events[i].SessionID != sessionID {
+			return CommittedBatch{}, fmt.Errorf("session: event %s belongs to %q, not %q", events[i].ID, events[i].SessionID, sessionID)
+		}
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.events == nil {
+		s.next = make(map[string]uint64)
+		s.events = make(map[string][]Event)
+	}
+	committed := make([]Event, 0, len(events))
+	existing := make(map[string]Event)
+	for _, prior := range s.events[sessionID] {
+		if prior.ID != "" {
+			existing[prior.ID] = prior
+		}
+	}
+	next := s.next[sessionID] + 1
+	for i := range events {
+		e := events[i].Clone()
+		if e.SessionID == "" {
+			e.SessionID = sessionID
+		}
+		if e.ID == "" {
+			e.ID = randomToken()
+		}
+		if prior, found := existing[e.ID]; found {
+			committed = append(committed, prior.Clone())
+			continue
+		}
+		e.Seq = next
+		e.Normalize()
+		if e.Timestamp.IsZero() {
+			e.Timestamp = time.Now().UTC()
+		}
+		committed = append(committed, e.Clone())
+		s.events[sessionID] = append(s.events[sessionID], e)
+		existing[e.ID] = e
+		s.next[sessionID] = next
+		next++
+	}
+	return CommittedBatch{Events: committed}, nil
 }
 
 func (s *MemoryStore) Load(_ context.Context, sessionID string, afterSeq uint64, limit int) ([]Event, error) {

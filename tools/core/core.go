@@ -7,14 +7,21 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"mime"
+	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/MIZUDINOV/awesome-go-agents/integration"
 	"github.com/MIZUDINOV/awesome-go-agents/job"
+	"github.com/MIZUDINOV/awesome-go-agents/session"
 	"github.com/MIZUDINOV/awesome-go-agents/tools"
 )
 
@@ -24,6 +31,10 @@ type Deps struct {
 	FS         integration.FileSystem
 	Subprocess integration.Subprocess
 	Jobs       job.ScopedManager
+	Artifacts  integration.ArtifactStore
+	Web        integration.Web
+	LSP        integration.LSP
+	Terminal   integration.Terminal
 }
 
 // ReadDefaults bound the read tool (mirrors the review checklist §11.3).
@@ -36,7 +47,10 @@ type ReadDefaults struct {
 
 // DefaultReadDefaults returns the reference bounds.
 func DefaultReadDefaults() ReadDefaults {
-	return ReadDefaults{MaxLines: 2000, MaxLineChars: 2000, MaxSelectedBytes: 51200, MaxFileBytes: 10 << 20}
+	// Reserve headroom for JSON string escaping in the durable tool/result
+	// envelope; the model still receives a useful bounded window while the
+	// serialized event remains comfortably below common event limits.
+	return ReadDefaults{MaxLines: 2000, MaxLineChars: 2000, MaxSelectedBytes: 24 << 10, MaxFileBytes: 10 << 20}
 }
 
 // Register registers the core catalog into registry against deps. Every
@@ -45,14 +59,20 @@ func DefaultReadDefaults() ReadDefaults {
 func Register(registry *tools.Registry, deps Deps) error {
 	defs := []*tools.Definition{
 		readTool(deps),
+		readImageTool(deps),
 		writeTool(deps),
 		editTool(deps),
 		globTool(deps),
 		grepTool(deps),
 		bashTool(deps),
 		jobStartTool(deps),
+		jobListTool(deps),
 		jobOutputTool(deps),
 		jobKillTool(deps),
+		webSearchTool(deps),
+		webFetchTool(deps),
+		lspDiagnosticsTool(deps),
+		terminalTool(deps),
 	}
 	for _, def := range defs {
 		if err := registry.Register(def); err != nil {
@@ -70,6 +90,13 @@ func cwdOf(ec tools.ExecContext) string {
 }
 
 func ownerOf(ec tools.ExecContext) string { return ec.SessionID }
+
+func requireSandbox(deps Deps) (integration.Sandbox, error) {
+	if deps.Sandbox == nil {
+		return nil, fmt.Errorf("core: sandbox admission port is required")
+	}
+	return deps.Sandbox, nil
+}
 
 // requireObservation returns the observation recorder or fails closed
 // (read-before-edit cannot be enforced without one).
@@ -115,7 +142,11 @@ func readTool(deps Deps) *tools.Definition {
 			if args.Limit <= 0 {
 				args.Limit = defaults.MaxLines
 			}
-			target, err := deps.Sandbox.ResolvePath(ctx, ownerOf(ec), args.FilePath, cwdOf(ec), integration.AccessRead)
+			sandbox, sandboxErr := requireSandbox(deps)
+			if sandboxErr != nil {
+				return nil, sandboxErr
+			}
+			target, err := sandbox.ResolvePath(ctx, ownerOf(ec), args.FilePath, cwdOf(ec), integration.AccessRead)
 			if err != nil {
 				return nil, err
 			}
@@ -142,6 +173,10 @@ func readTool(deps Deps) *tools.Definition {
 			if rec, ok := deps.FS.(integration.ObservationRecorder); ok {
 				_ = rec.Observe(ctx, target, ownerOf(ec), integration.ObservationPresent, info.Version)
 			}
+			artifact, artifactErr := spillOutput(ctx, ec, deps.Artifacts, args.FilePath, []byte(text), "text/plain")
+			if artifactErr != nil {
+				return nil, artifactErr
+			}
 			lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 			start := args.Offset - 1
 			if start > len(lines) {
@@ -152,12 +187,18 @@ func readTool(deps Deps) *tools.Definition {
 				end = len(lines)
 			}
 			var rendered strings.Builder
+			returned := 0
+			capReached := false
 			for i := start; i < end; i++ {
-				line := truncateRunes(lines[i], defaults.MaxLineChars)
-				fmt.Fprintf(&rendered, "%6d|%s\n", i+1, line)
+				line := fmt.Sprintf("%6d|%s\n", i+1, truncateRunes(lines[i], defaults.MaxLineChars))
+				if rendered.Len()+len(line) > defaults.MaxSelectedBytes {
+					capReached = true
+					break
+				}
+				rendered.WriteString(line)
+				returned++
 			}
-			eof := end >= len(lines)
-			capReached := rendered.Len() >= defaults.MaxSelectedBytes
+			eof := !capReached && end >= len(lines)
 			footer := " (end of file)"
 			switch {
 			case eof:
@@ -167,16 +208,15 @@ func readTool(deps Deps) *tools.Definition {
 			default:
 				footer = fmt.Sprintf(" (paged; continue with offset=%d)", end+1)
 			}
-			out := rendered.String()
-			if len(out) > defaults.MaxSelectedBytes {
-				out = out[:defaults.MaxSelectedBytes] + "\n" + footer
-			} else if !strings.HasSuffix(out, footer) {
-				out = strings.TrimSuffix(out, "\n") + "\n" + footer
-			}
+			out := strings.TrimSuffix(rendered.String(), "\n") + "\n" + footer
 			canonical := map[string]any{
 				"path": args.FilePath, "version": info.Version,
-				"offset": args.Offset, "lines_returned": end - start,
-				"eof": eof, "footer": footer,
+				"offset": args.Offset, "lines_returned": returned, "total": len(lines),
+				"truncated": !eof || capReached, "eof": eof, "footer": footer,
+			}
+			if artifact != nil {
+				canonical["artifact"] = artifact
+				canonical["full_size"] = len(text)
 			}
 			return &readResult{Canonical: canonical, Model: out, UI: canonical}, nil
 		},
@@ -206,6 +246,77 @@ type readResult struct {
 // ---------------------------------------------------------------------------
 // write
 
+func readImageTool(deps Deps) *tools.Definition {
+	return &tools.Definition{
+		Name: "read_image", Description: "Read a sandbox-contained image and return typed media content.", Version: "1",
+		InputSchema:     json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"],"additionalProperties":false}`),
+		ConcurrencySafe: true,
+		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
+			var args struct {
+				FilePath string `json:"file_path"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil || args.FilePath == "" {
+				return nil, fmt.Errorf("%w: file_path is required", tools.ErrInvalidArguments)
+			}
+			binaryFS, ok := deps.FS.(integration.BinaryFileSystem)
+			if !ok {
+				return nil, fmt.Errorf("read_image: execution environment does not support binary reads")
+			}
+			sandbox, sandboxErr := requireSandbox(deps)
+			if sandboxErr != nil {
+				return nil, sandboxErr
+			}
+			target, err := sandbox.ResolvePath(ctx, ownerOf(ec), args.FilePath, cwdOf(ec), integration.AccessRead)
+			if err != nil {
+				return nil, err
+			}
+			info, err := deps.FS.Stat(ctx, target)
+			if err != nil {
+				return nil, err
+			}
+			if !info.Exists || info.IsDir {
+				return nil, fmt.Errorf("read_image: target is not a file")
+			}
+			if info.Size > 10<<20 {
+				return nil, fmt.Errorf("read_image: image exceeds 10 MiB")
+			}
+			data, err := binaryFS.ReadBytes(ctx, target)
+			if err != nil {
+				return nil, err
+			}
+			mediaType := mime.TypeByExtension(filepath.Ext(args.FilePath))
+			if mediaType == "" {
+				mediaType = "application/octet-stream"
+			}
+			encoded := base64.StdEncoding.EncodeToString(data)
+			return map[string]any{"path": args.FilePath, "media_type": mediaType, "data_base64": encoded, "size": len(data), "version": info.Version}, nil
+		},
+		RenderModel: func(canonical any) (any, error) { return canonical, nil },
+		PresentUI: func(canonical any) (map[string]any, error) {
+			if value, ok := canonical.(map[string]any); ok {
+				return value, nil
+			}
+			return nil, tools.ErrInvalidOutput
+		},
+		FinalizeContent: func(result *tools.Result) error {
+			value, ok := result.Canonical.(map[string]any)
+			if !ok {
+				return tools.ErrInvalidOutput
+			}
+			mediaType, _ := value["media_type"].(string)
+			encoded, _ := value["data_base64"].(string)
+			if mediaType == "" || encoded == "" {
+				return tools.ErrInvalidOutput
+			}
+			if _, err := base64.StdEncoding.DecodeString(encoded); err != nil {
+				return tools.ErrInvalidOutput
+			}
+			result.Content = []session.ContentBlock{session.MediaContentBlock(session.MediaBlock{MediaType: mediaType, Data: encoded})}
+			return nil
+		},
+	}
+}
+
 func writeTool(deps Deps) *tools.Definition {
 	return &tools.Definition{
 		Name: "write", Description: "Create a new UTF-8 file or fully replace an existing one. Overwriting a file you have not read is refused; use read first.",
@@ -230,7 +341,11 @@ func writeTool(deps Deps) *tools.Definition {
 			if err := json.Unmarshal(input, &args); err != nil {
 				return nil, fmt.Errorf("%w: %v", tools.ErrInvalidArguments, err)
 			}
-			target, err := deps.Sandbox.ResolvePath(ctx, ownerOf(ec), args.FilePath, cwdOf(ec), integration.AccessWrite)
+			sandbox, sandboxErr := requireSandbox(deps)
+			if sandboxErr != nil {
+				return nil, sandboxErr
+			}
+			target, err := sandbox.ResolvePath(ctx, ownerOf(ec), args.FilePath, cwdOf(ec), integration.AccessWrite)
 			if err != nil {
 				return nil, err
 			}
@@ -323,7 +438,11 @@ func editTool(deps Deps) *tools.Definition {
 			if args.OldString == args.NewString {
 				return nil, fmt.Errorf("%w: old_string equals new_string (no-op edit)", tools.ErrInvalidArguments)
 			}
-			target, err := deps.Sandbox.ResolvePath(ctx, ownerOf(ec), args.FilePath, cwdOf(ec), integration.AccessWrite)
+			sandbox, sandboxErr := requireSandbox(deps)
+			if sandboxErr != nil {
+				return nil, sandboxErr
+			}
+			target, err := sandbox.ResolvePath(ctx, ownerOf(ec), args.FilePath, cwdOf(ec), integration.AccessWrite)
 			if err != nil {
 				return nil, err
 			}
@@ -399,7 +518,11 @@ func globTool(deps Deps) *tools.Definition {
 			if dir == "" {
 				dir = "."
 			}
-			searchDir, err := deps.Sandbox.ResolvePath(ctx, ownerOf(ec), dir, cwdOf(ec), integration.AccessRead)
+			sandbox, sandboxErr := requireSandbox(deps)
+			if sandboxErr != nil {
+				return nil, sandboxErr
+			}
+			searchDir, err := sandbox.ResolvePath(ctx, ownerOf(ec), dir, cwdOf(ec), integration.AccessRead)
 			if err != nil {
 				return nil, err
 			}
@@ -407,7 +530,11 @@ func globTool(deps Deps) *tools.Definition {
 			if !ok {
 				return nil, fmt.Errorf("glob: execution environment does not support directory listing")
 			}
-			matches, err := searcher.Glob(ctx, searchDir.Path, args.Pattern, args.MaxResults)
+			maxResults := args.MaxResults
+			if maxResults <= 0 {
+				maxResults = 100
+			}
+			matches, err := searcher.Glob(ctx, searchDir.Path, args.Pattern, maxResults)
 			if err != nil {
 				return nil, err
 			}
@@ -415,7 +542,8 @@ func globTool(deps Deps) *tools.Definition {
 			if len(matches) > 0 {
 				model = strings.Join(matches, "\n")
 			}
-			return map[string]any{"pattern": args.Pattern, "matches": matches, "model": model, "ui": map[string]any{"matches": matches}}, nil
+			truncated := len(matches) >= maxResults
+			return map[string]any{"pattern": args.Pattern, "matches": matches, "total": len(matches), "truncated": truncated, "total_complete": !truncated, "model": model, "ui": map[string]any{"matches": matches, "total": len(matches), "truncated": truncated}}, nil
 		},
 		RenderModel: func(canonical any) (any, error) {
 			m, ok := canonical.(map[string]any)
@@ -465,7 +593,11 @@ func grepTool(deps Deps) *tools.Definition {
 			if dir == "" {
 				dir = "."
 			}
-			searchDir, err := deps.Sandbox.ResolvePath(ctx, ownerOf(ec), dir, cwdOf(ec), integration.AccessRead)
+			sandbox, sandboxErr := requireSandbox(deps)
+			if sandboxErr != nil {
+				return nil, sandboxErr
+			}
+			searchDir, err := sandbox.ResolvePath(ctx, ownerOf(ec), dir, cwdOf(ec), integration.AccessRead)
 			if err != nil {
 				return nil, err
 			}
@@ -473,7 +605,11 @@ func grepTool(deps Deps) *tools.Definition {
 			if !ok {
 				return nil, fmt.Errorf("grep: execution environment does not support content search")
 			}
-			matches, err := searcher.Grep(ctx, searchDir.Path, args.Pattern, args.MaxMatches, 4<<20)
+			maxMatches := args.MaxMatches
+			if maxMatches <= 0 {
+				maxMatches = 200
+			}
+			matches, err := searcher.Grep(ctx, searchDir.Path, args.Pattern, maxMatches, 4<<20)
 			if err != nil {
 				return nil, err
 			}
@@ -495,7 +631,8 @@ func grepTool(deps Deps) *tools.Definition {
 			for _, m := range matches {
 				list = append(list, match{Path: m.Path, Line: m.Line, Text: truncateRunes(m.Text, 300)})
 			}
-			return map[string]any{"matches": list, "model": model.String(), "ui": map[string]any{"matches": list}}, nil
+			truncated := len(matches) >= maxMatches
+			return map[string]any{"matches": list, "total": len(list), "truncated": truncated, "total_complete": !truncated, "model": model.String(), "ui": map[string]any{"matches": list, "total": len(list), "truncated": truncated}}, nil
 		},
 		RenderModel: func(canonical any) (any, error) {
 			m, ok := canonical.(map[string]any)
@@ -552,32 +689,49 @@ func bashTool(deps Deps) *tools.Definition {
 			if args.TimeoutSeconds > 0 {
 				cmd.Timeout = time.Duration(args.TimeoutSeconds) * time.Second
 			}
-			if err := deps.Sandbox.CheckCommand(ctx, ownerOf(ec), cmd, integration.AccessWrite); err != nil {
+			sandbox, sandboxErr := requireSandbox(deps)
+			if sandboxErr != nil {
+				return nil, sandboxErr
+			}
+			if err := sandbox.CheckCommand(ctx, ownerOf(ec), cmd, integration.AccessWrite); err != nil {
 				return nil, err
 			}
 			if deps.Subprocess == nil {
 				return nil, fmt.Errorf("bash: execution environment does not support subprocesses")
 			}
 			result, err := deps.Subprocess.Run(ctx, cmd)
+			boundedOutput, outputTruncated := boundOutput(result.Output)
+			artifact, artifactErr := spillOutput(ctx, ec, deps.Artifacts, "bash-output", []byte(result.Output), "text/plain")
+			if artifactErr != nil {
+				return nil, artifactErr
+			}
 			if err != nil {
 				// Cancellation/timeout carries a typed result; surface it.
 				var denial *integration.Denial
 				if errors.As(err, &denial) {
 					return nil, err
 				}
-				return map[string]any{
-					"exit_code": -1, "output": result.Output, "timed_out": result.TimedOut,
+				value := map[string]any{
+					"exit_code": -1, "output": boundedOutput, "total": len(result.Output), "truncated": outputTruncated, "timed_out": result.TimedOut,
 					"job_id": result.JobID, "error": err.Error(),
-					"model": "Command failed: " + err.Error() + "\n" + result.Output,
+					"model": "Command failed: " + err.Error() + "\n" + boundedOutput,
 					"ui":    map[string]any{"exit_code": -1, "timed_out": result.TimedOut},
-				}, nil
+				}
+				if artifact != nil {
+					value["artifact"] = artifact
+				}
+				return value, nil
 			}
-			model := fmt.Sprintf("exit code: %d\n%s", result.ExitCode, result.Output)
-			return map[string]any{
-				"exit_code": result.ExitCode, "output": result.Output,
+			model := fmt.Sprintf("exit code: %d\n%s", result.ExitCode, boundedOutput)
+			value := map[string]any{
+				"exit_code": result.ExitCode, "output": boundedOutput, "total": len(result.Output), "truncated": outputTruncated,
 				"timed_out": result.TimedOut, "job_id": result.JobID,
 				"model": model, "ui": map[string]any{"exit_code": result.ExitCode, "timed_out": result.TimedOut},
-			}, nil
+			}
+			if artifact != nil {
+				value["artifact"] = artifact
+			}
+			return value, nil
 		},
 		RenderModel: func(canonical any) (any, error) {
 			m, ok := canonical.(map[string]any)
@@ -628,6 +782,15 @@ func jobStartTool(deps Deps) *tools.Definition {
 			if deps.Jobs == nil {
 				return nil, fmt.Errorf("job_start: execution environment does not support background jobs")
 			}
+			sandbox, sandboxErr := requireSandbox(deps)
+			if sandboxErr != nil {
+				return nil, sandboxErr
+			}
+			if err := sandbox.CheckCommand(ctx, ownerOf(ec), integration.Command{
+				Command: args.Command, Workdir: workdir, Description: "job_start: " + truncateRunes(args.Command, 120),
+			}, integration.AccessWrite); err != nil {
+				return nil, err
+			}
 			id, err := deps.Jobs.Start(ctx, job.Spec{Kind: "shell", Command: args.Command, Workdir: workdir}, ownerOf(ec))
 			if err != nil {
 				return nil, err
@@ -647,6 +810,24 @@ func jobStartTool(deps Deps) *tools.Definition {
 				return nil, fmt.Errorf("job_start: bad canonical")
 			}
 			return m["ui"].(map[string]any), nil
+		},
+	}
+}
+
+func jobListTool(deps Deps) *tools.Definition {
+	return &tools.Definition{
+		Name: "job_list", Description: "List background jobs owned by this session.", Version: "1",
+		InputSchema:     json.RawMessage(`{"type":"object","additionalProperties":false}`),
+		ConcurrencySafe: true,
+		Execute: func(ctx context.Context, ec tools.ExecContext, _ json.RawMessage) (any, error) {
+			if deps.Jobs == nil {
+				return nil, fmt.Errorf("job_list: execution environment does not support background jobs")
+			}
+			jobs, err := deps.Jobs.List(ctx, ownerOf(ec))
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"jobs": jobs, "total": len(jobs)}, nil
 		},
 	}
 }
@@ -681,7 +862,16 @@ func jobOutputTool(deps Deps) *tools.Definition {
 			if err != nil {
 				return nil, err
 			}
-			return map[string]any{"job_id": args.JobID, "status": string(out.Status), "output": out.Text, "model": "status: " + string(out.Status) + "\n" + out.Text, "ui": map[string]any{"status": string(out.Status)}}, nil
+			boundedOutput, outputTruncated := boundOutput(out.Text)
+			artifact, artifactErr := spillOutput(ctx, ec, deps.Artifacts, string(args.JobID), []byte(out.Text), "text/plain")
+			if artifactErr != nil {
+				return nil, artifactErr
+			}
+			value := map[string]any{"job_id": args.JobID, "status": string(out.Status), "output": boundedOutput, "total": len(out.Text), "truncated": outputTruncated, "model": "status: " + string(out.Status) + "\n" + boundedOutput, "ui": map[string]any{"status": string(out.Status), "truncated": outputTruncated}}
+			if artifact != nil {
+				value["artifact"] = artifact
+			}
+			return value, nil
 		},
 		RenderModel: func(canonical any) (any, error) {
 			m, ok := canonical.(map[string]any)
@@ -744,10 +934,217 @@ func jobKillTool(deps Deps) *tools.Definition {
 	}
 }
 
+func webSearchTool(deps Deps) *tools.Definition {
+	return &tools.Definition{
+		Name: "web_search", Description: "Search the web through the host-provided bounded web port.", Version: "1",
+		InputSchema:     json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer"}},"required":["query"],"additionalProperties":false}`),
+		ConcurrencySafe: true,
+		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
+			if deps.Web == nil {
+				return nil, fmt.Errorf("web_search: web port is not configured")
+			}
+			var args struct {
+				Query      string `json:"query"`
+				MaxResults int    `json:"max_results"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil || strings.TrimSpace(args.Query) == "" {
+				return nil, fmt.Errorf("%w: query is required", tools.ErrInvalidArguments)
+			}
+			max := args.MaxResults
+			if max <= 0 {
+				max = 8
+			}
+			results, err := deps.Web.Search(ctx, args.Query, integration.SearchOptions{MaxResults: max})
+			if err != nil {
+				return nil, err
+			}
+			truncated := len(results) >= max
+			return map[string]any{"query": args.Query, "results": results, "total": len(results), "truncated": truncated, "total_complete": !truncated}, nil
+		},
+		RenderModel: func(canonical any) (any, error) { return canonical, nil },
+		PresentUI: func(canonical any) (map[string]any, error) {
+			if value, ok := canonical.(map[string]any); ok {
+				return value, nil
+			}
+			return nil, tools.ErrInvalidOutput
+		},
+	}
+}
+
+func webFetchTool(deps Deps) *tools.Definition {
+	return &tools.Definition{
+		Name: "web_fetch", Description: "Fetch a bounded web document through the host-provided web port.", Version: "1",
+		InputSchema:     json.RawMessage(`{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["url"],"additionalProperties":false}`),
+		ConcurrencySafe: true,
+		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
+			if deps.Web == nil {
+				return nil, fmt.Errorf("web_fetch: web port is not configured")
+			}
+			var args struct {
+				URL      string `json:"url"`
+				MaxBytes int    `json:"max_bytes"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil || strings.TrimSpace(args.URL) == "" {
+				return nil, fmt.Errorf("%w: url is required", tools.ErrInvalidArguments)
+			}
+			max := args.MaxBytes
+			if max <= 0 {
+				max = 200000
+			}
+			doc, err := deps.Web.Fetch(ctx, args.URL, integration.FetchOptions{MaxBytes: max})
+			if err != nil {
+				return nil, err
+			}
+			if doc == nil {
+				return nil, fmt.Errorf("web_fetch: empty document")
+			}
+			content := doc.Content
+			totalBytes := len([]byte(content))
+			completeTotal := true
+			if content == "" && doc.Reader != nil {
+				body, readErr := io.ReadAll(io.LimitReader(doc.Reader, int64(max)+1))
+				if readErr != nil {
+					return nil, readErr
+				}
+				content = string(body)
+				totalBytes = len(body)
+				completeTotal = len(body) <= max
+			}
+			truncated := totalBytes > max
+			if truncated {
+				content = strings.ToValidUTF8(string([]byte(content)[:max]), "�")
+			}
+			return map[string]any{"url": doc.URL, "title": doc.Title, "content": content, "total": totalBytes, "truncated": truncated, "total_complete": completeTotal && !truncated}, nil
+		},
+		RenderModel: func(canonical any) (any, error) { return canonical, nil },
+		PresentUI: func(canonical any) (map[string]any, error) {
+			if value, ok := canonical.(map[string]any); ok {
+				return value, nil
+			}
+			return nil, tools.ErrInvalidOutput
+		},
+	}
+}
+
+func lspDiagnosticsTool(deps Deps) *tools.Definition {
+	return &tools.Definition{
+		Name: "lsp_diagnostics", Description: "Read bounded diagnostics from the host-provided language server.", Version: "1",
+		InputSchema:     json.RawMessage(`{"type":"object","properties":{"file_path":{"type":"string"}},"required":["file_path"],"additionalProperties":false}`),
+		ConcurrencySafe: true,
+		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
+			if deps.LSP == nil {
+				return nil, fmt.Errorf("lsp_diagnostics: LSP port is not configured")
+			}
+			var args struct {
+				FilePath string `json:"file_path"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil || args.FilePath == "" {
+				return nil, fmt.Errorf("%w: file_path is required", tools.ErrInvalidArguments)
+			}
+			sandbox, sandboxErr := requireSandbox(deps)
+			if sandboxErr != nil {
+				return nil, sandboxErr
+			}
+			target, err := sandbox.ResolvePath(ctx, ownerOf(ec), args.FilePath, cwdOf(ec), integration.AccessRead)
+			if err != nil {
+				return nil, err
+			}
+			diagnostics, err := deps.LSP.Diagnostics(ctx, target.Path)
+			if err != nil {
+				return nil, err
+			}
+			return map[string]any{"file_path": args.FilePath, "diagnostics": diagnostics, "total": len(diagnostics), "truncated": false}, nil
+		},
+		RenderModel: func(canonical any) (any, error) { return canonical, nil },
+		PresentUI: func(canonical any) (map[string]any, error) {
+			if value, ok := canonical.(map[string]any); ok {
+				return value, nil
+			}
+			return nil, tools.ErrInvalidOutput
+		},
+	}
+}
+
+func terminalTool(deps Deps) *tools.Definition {
+	return &tools.Definition{
+		Name: "terminal", Description: "Execute a command in the host-owned persistent terminal session.", Version: "1", MutatesWorkspace: true,
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"},"workdir":{"type":"string"}},"required":["command"],"additionalProperties":false}`),
+		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
+			if deps.Terminal == nil {
+				return nil, fmt.Errorf("terminal: terminal port is not configured")
+			}
+			var args struct {
+				Command string `json:"command"`
+				Workdir string `json:"workdir"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil || strings.TrimSpace(args.Command) == "" {
+				return nil, fmt.Errorf("%w: command is required", tools.ErrInvalidArguments)
+			}
+			if args.Workdir == "" {
+				args.Workdir = cwdOf(ec)
+			}
+			sandbox, sandboxErr := requireSandbox(deps)
+			if sandboxErr != nil {
+				return nil, sandboxErr
+			}
+			if err := sandbox.CheckCommand(ctx, ownerOf(ec), integration.Command{Command: args.Command, Workdir: args.Workdir, Description: "terminal: " + truncateRunes(args.Command, 120)}, integration.AccessWrite); err != nil {
+				return nil, err
+			}
+			result, err := deps.Terminal.Execute(ctx, ownerOf(ec), args.Command, args.Workdir)
+			if err != nil {
+				return nil, err
+			}
+			boundedOutput, outputTruncated := boundOutput(result.Output)
+			artifact, artifactErr := spillOutput(ctx, ec, deps.Artifacts, args.Command, []byte(result.Output), "text/plain")
+			if artifactErr != nil {
+				return nil, artifactErr
+			}
+			value := map[string]any{"command": args.Command, "workdir": args.Workdir, "output": boundedOutput, "total": len(result.Output), "exit_code": result.ExitCode, "session": result.Session, "truncated": result.Truncated || outputTruncated}
+			if artifact != nil {
+				value["artifact"] = artifact
+			}
+			return value, nil
+		},
+		RenderModel: func(canonical any) (any, error) { return canonical, nil },
+		PresentUI: func(canonical any) (map[string]any, error) {
+			if value, ok := canonical.(map[string]any); ok {
+				return value, nil
+			}
+			return nil, tools.ErrInvalidOutput
+		},
+	}
+}
+
 func truncateRunes(s string, max int) string {
 	runes := []rune(s)
 	if len(runes) <= max {
 		return s
 	}
 	return string(runes[:max]) + "…"
+}
+
+const maxToolOutputBytes = 24 << 10
+
+func boundOutput(text string) (string, bool) {
+	if len(text) <= maxToolOutputBytes {
+		return text, false
+	}
+	return strings.ToValidUTF8(text[:maxToolOutputBytes], "�"), true
+}
+
+func spillOutput(ctx context.Context, ec tools.ExecContext, store integration.ArtifactStore, name string, data []byte, contentType string) (any, error) {
+	if store == nil || len(data) <= maxToolOutputBytes {
+		return nil, nil
+	}
+	ref, err := store.Put(ctx, ownerOf(ec), name, append([]byte(nil), data...), contentType)
+	if err != nil {
+		return nil, fmt.Errorf("core: spill output: %w", err)
+	}
+	if ref.ID == "" {
+		return nil, fmt.Errorf("core: spill output: artifact store returned an empty reference")
+	}
+	ref.Size = int64(len(data))
+	digest := sha256.Sum256(data)
+	ref.SHA256 = hex.EncodeToString(digest[:])
+	return ref, nil
 }

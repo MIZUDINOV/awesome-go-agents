@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestRegistryExecutePipeline(t *testing.T) {
@@ -43,6 +44,36 @@ func TestRegistryExecutePipeline(t *testing.T) {
 	}
 	if result.UI["path"] != "a.ts" {
 		t.Errorf("ui = %v", result.UI)
+	}
+}
+
+func TestRunBatchCommitsModelOrderAcrossParallelCalls(t *testing.T) {
+	registry := New(Options{MaxParallel: 2})
+	started := make(chan string, 2)
+	release := make(chan struct{})
+	if err := registry.Register(&Definition{Name: "read", Description: "read", InputSchema: OrObjectSchema, ConcurrencySafe: true,
+		Execute: func(_ context.Context, _ ExecContext, input json.RawMessage) (any, error) {
+			started <- string(input)
+			<-release
+			return string(input), nil
+		}}); err != nil {
+		t.Fatal(err)
+	}
+	completed := make(chan []Outcome, 1)
+	go func() {
+		completed <- registry.RunBatch(context.Background(), ExecContext{}, []Call{{Name: "read", CallID: "first", Input: []byte(`{"n":1}`)}, {Name: "read", CallID: "second", Input: []byte(`{"n":2}`)}})
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("parallel calls did not both start")
+		}
+	}
+	close(release)
+	results := <-completed
+	if results[0].Call.CallID != "first" || results[1].Call.CallID != "second" || results[0].Err != nil || results[1].Err != nil {
+		t.Fatalf("outcomes = %#v", results)
 	}
 }
 
@@ -194,13 +225,19 @@ func TestModelToolsDeterministicOrder(t *testing.T) {
 	}
 }
 
-func TestRegistryRejectsUnsupportedSchema(t *testing.T) {
+func TestRegistryValidatesOneOfSchema(t *testing.T) {
 	registry := New(Options{})
 	def := &Definition{Name: "bad", Description: "bad",
-		InputSchema: json.RawMessage(`{"type":"object","oneOf":[{"type":"string"}]}`),
+		InputSchema: json.RawMessage(`{"oneOf":[{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false},{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}]}`),
 		Execute:     func(ctx context.Context, ec ExecContext, input json.RawMessage) (any, error) { return nil, nil }}
-	if err := registry.Register(def); err == nil {
-		t.Error("expected unsupported schema to be rejected at registration")
+	if err := registry.Register(def); err != nil {
+		t.Fatalf("register oneOf: %v", err)
+	}
+	if _, err := registry.Run(context.Background(), ExecContext{}, "bad", "one", []byte(`{"path":"a"}`)); err != nil {
+		t.Fatalf("valid oneOf: %v", err)
+	}
+	if _, err := registry.Run(context.Background(), ExecContext{}, "bad", "two", []byte(`{"path":"a","id":1}`)); !errors.Is(err, ErrInvalidArguments) {
+		t.Fatalf("ambiguous oneOf error = %v", err)
 	}
 }
 
@@ -210,5 +247,74 @@ func TestRegistryRejectsInvalidName(t *testing.T) {
 		Execute: func(ctx context.Context, ec ExecContext, input json.RawMessage) (any, error) { return nil, nil }}
 	if err := registry.Register(def); err == nil {
 		t.Error("expected invalid tool name to be rejected")
+	}
+}
+
+type testApproval struct{ approved bool }
+
+func (a testApproval) Approve(context.Context, ApprovalRequest) (bool, error) { return a.approved, nil }
+
+func TestRegistryPolicyGuardApprovalAndFinalizer(t *testing.T) {
+	registry := New(Options{Approval: testApproval{approved: true}})
+	executed := false
+	if err := registry.Register(&Definition{
+		Name: "protected", Description: "protected", InputSchema: OrObjectSchema,
+		Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) {
+			executed = true
+			return map[string]any{"ok": true}, nil
+		},
+		FinalizeContent: func(result *Result) error {
+			result.Code = "OK"
+			return nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registry.AddPolicy(func(context.Context, Execution) (PolicyDecision, string, error) {
+		return PolicyAsk, "needs approval", nil
+	})
+	registry.AddGuard(func(Execution) (string, error) { return "", nil })
+	result, err := registry.Run(context.Background(), ExecContext{}, "protected", "c1", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !executed || result.Code != "OK" {
+		t.Fatalf("executed=%v result=%+v", executed, result)
+	}
+
+	denied := New(Options{})
+	if err := denied.Register(&Definition{Name: "protected", InputSchema: OrObjectSchema, Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) { return nil, nil }}); err != nil {
+		t.Fatal(err)
+	}
+	denied.AddPolicy(func(context.Context, Execution) (PolicyDecision, string, error) {
+		return PolicyAsk, "approval unavailable", nil
+	})
+	if _, err := denied.Run(context.Background(), ExecContext{}, "protected", "c2", []byte(`{}`)); !errors.Is(err, ErrPolicyDenied) {
+		t.Fatalf("fail-closed approval error=%v", err)
+	}
+}
+
+func TestScopedRegistryShadowsAndRestricts(t *testing.T) {
+	root := New(Options{})
+	if err := root.Register(&Definition{Name: "read", Description: "root", InputSchema: OrObjectSchema, Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) { return "root", nil }}); err != nil {
+		t.Fatal(err)
+	}
+	scope := root.NewScope()
+	if err := scope.Register(&Definition{Name: "read", Description: "local", InputSchema: OrObjectSchema, Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) { return "local", nil }}); err != nil {
+		t.Fatal(err)
+	}
+	if err := scope.Restrict([]string{"read"}); err != nil {
+		t.Fatal(err)
+	}
+	tools := scope.ModelTools()
+	if len(tools) != 1 || tools[0].Description != "local" {
+		t.Fatalf("scoped tools=%+v", tools)
+	}
+	result, err := scope.Run(context.Background(), ExecContext{}, "read", "c1", []byte(`{}`))
+	if err != nil || result.Canonical != "local" {
+		t.Fatalf("scoped result=%+v err=%v", result, err)
+	}
+	if _, err := scope.Run(context.Background(), ExecContext{}, "write", "c2", []byte(`{}`)); !errors.Is(err, ErrToolNotFound) {
+		t.Fatalf("restricted tool error=%v", err)
 	}
 }

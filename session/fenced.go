@@ -84,6 +84,14 @@ type FencedStore interface {
 	SaveCompactionCheckpoint(ctx context.Context, lease Lease, record CompactionCheckpoint) error
 }
 
+// FencedBatchStore is the stronger additive form of AppendFenced. It returns
+// canonical committed copies so an execution loop can publish exactly what
+// was durably assigned without a racy tail re-read.
+type FencedBatchStore interface {
+	FencedStore
+	AppendFencedCommitted(ctx context.Context, lease Lease, events []Event) (CommittedBatch, error)
+}
+
 // CompactionCheckpoint is the durable compaction ledger entry.
 type CompactionCheckpoint struct {
 	SessionID         string
@@ -129,7 +137,7 @@ func (s *MemoryStore) RenewLease(_ context.Context, lease Lease) (Lease, error) 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	current, ok := s.leases[lease.SessionID]
-	if !ok || current.Token != lease.Token || current.Fence != lease.Fence {
+	if !ok || current.Token != lease.Token || current.Fence != lease.Fence || !time.Now().Before(current.ExpiresAt) {
 		return Lease{}, fmt.Errorf("%w: session %s", ErrLeaseLost, lease.SessionID)
 	}
 	current.ExpiresAt = time.Now().Add(30 * time.Second)
@@ -140,12 +148,21 @@ func (s *MemoryStore) RenewLease(_ context.Context, lease Lease) (Lease, error) 
 // AppendFenced appends under the in-memory lease, idempotent per event ID:
 // retried events return the canonical tail seq without duplication.
 func (s *MemoryStore) AppendFenced(ctx context.Context, lease Lease, events []Event) (uint64, error) {
+	for i := range events {
+		if err := events[i].Validate(); err != nil {
+			return 0, err
+		}
+		if events[i].SessionID != "" && events[i].SessionID != lease.SessionID {
+			return 0, fmt.Errorf("session: event %s belongs to %q, not %q", events[i].ID, events[i].SessionID, lease.SessionID)
+		}
+	}
 	if err := s.checkFence(lease); err != nil {
 		return 0, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.leases[lease.SessionID].Token != lease.Token {
+	current := s.leases[lease.SessionID]
+	if current.Token != lease.Token || current.Fence != lease.Fence || !time.Now().Before(current.ExpiresAt) {
 		return 0, fmt.Errorf("%w: session %s", ErrLeaseLost, lease.SessionID)
 	}
 	existing := map[string]bool{}
@@ -159,11 +176,14 @@ func (s *MemoryStore) AppendFenced(ctx context.Context, lease Lease, events []Ev
 	last := s.next[lease.SessionID]
 	for i := range events {
 		e := events[i].Clone()
+		if e.SessionID == "" {
+			e.SessionID = lease.SessionID
+		}
 		if e.ID != "" && existing[e.ID] {
 			continue
 		}
 		e.Seq = next
-		e.FormatVersion = e.NormalizedFormatVersion()
+		e.Normalize()
 		stored = append(stored, e)
 		next++
 		last = e.Seq
@@ -173,6 +193,58 @@ func (s *MemoryStore) AppendFenced(ctx context.Context, lease Lease, events []Ev
 		s.events[lease.SessionID] = append(s.events[lease.SessionID], stored...)
 	}
 	return last, nil
+}
+
+func (s *MemoryStore) AppendFencedCommitted(ctx context.Context, lease Lease, events []Event) (CommittedBatch, error) {
+	for i := range events {
+		if err := events[i].Validate(); err != nil {
+			return CommittedBatch{}, err
+		}
+		if events[i].SessionID != "" && events[i].SessionID != lease.SessionID {
+			return CommittedBatch{}, fmt.Errorf("session: event %s belongs to %q, not %q", events[i].ID, events[i].SessionID, lease.SessionID)
+		}
+	}
+	if err := s.checkFence(lease); err != nil {
+		return CommittedBatch{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current, ok := s.leases[lease.SessionID]
+	if !ok || current.Token != lease.Token || current.Fence != lease.Fence || !time.Now().Before(current.ExpiresAt) {
+		return CommittedBatch{}, fmt.Errorf("%w: session %s", ErrLeaseLost, lease.SessionID)
+	}
+	existing := map[string]Event{}
+	for _, event := range s.events[lease.SessionID] {
+		if event.ID != "" {
+			existing[event.ID] = event
+		}
+	}
+	committed := make([]Event, 0, len(events))
+	next := s.next[lease.SessionID] + 1
+	for i := range events {
+		e := events[i].Clone()
+		if e.SessionID == "" {
+			e.SessionID = lease.SessionID
+		}
+		if e.ID != "" {
+			if prior, found := existing[e.ID]; found {
+				committed = append(committed, prior.Clone())
+				continue
+			}
+		} else {
+			e.ID = randomToken()
+		}
+		e.Seq = next
+		e.Normalize()
+		committed = append(committed, e.Clone())
+		s.events[lease.SessionID] = append(s.events[lease.SessionID], e)
+		existing[e.ID] = e
+		next++
+	}
+	if len(committed) > 0 {
+		s.next[lease.SessionID] = next - 1
+	}
+	return CommittedBatch{Events: committed}, nil
 }
 
 // ReleaseLease releases the in-memory lease if it belongs to the caller.
@@ -194,17 +266,24 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 	s.mu.RUnlock()
 
 	openTurns := 0
+	openTurnID := ""
 	for _, e := range all {
 		if e.Type == EventTurnStart {
 			openTurns++
+			openTurnID = e.TurnID
 		} else if e.Type == EventTurnEnd {
 			openTurns--
+			if openTurns == 0 {
+				openTurnID = ""
+			}
 		}
 	}
 	var recovery []Event
+	recovery = append(recovery, InterruptedDraftEvents(all, lease.SessionID)...)
 	if openTurns > 0 {
 		report.TurnClosed = true
 		recovery = append(recovery, Event{
+			ID: "recover:turn-end:" + openTurnID, TurnID: openTurnID,
 			Type: EventTurnEnd, SessionID: lease.SessionID,
 			Data: mustJSON(map[string]any{"reason": "interrupted"}),
 		})
@@ -213,6 +292,7 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 	for _, callID := range dangling {
 		report.DanglingCalls = append(report.DanglingCalls, callID)
 		recovery = append(recovery, Event{
+			ID:   "recover:unknown:" + callID,
 			Type: EventToolResult, SessionID: lease.SessionID, CallID: callID,
 			Data: mustJSON(map[string]any{
 				"call_id": callID, "is_error": true, "code": "TOOL_OUTCOME_UNKNOWN",
@@ -246,7 +326,8 @@ func (s *MemoryStore) SaveCompactionCheckpoint(_ context.Context, lease Lease, r
 func (s *MemoryStore) checkFence(lease Lease) error {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.fences[lease.SessionID] != lease.Fence {
+	current, ok := s.leases[lease.SessionID]
+	if !ok || s.fences[lease.SessionID] != lease.Fence || current.Token != lease.Token || current.Fence != lease.Fence || !time.Now().Before(current.ExpiresAt) {
 		return fmt.Errorf("%w: session %s (stale fence)", ErrLeaseLost, lease.SessionID)
 	}
 	return nil
@@ -254,6 +335,7 @@ func (s *MemoryStore) checkFence(lease Lease) error {
 
 func danglingCallIDs(events []Event) []string {
 	resultIDs := make(map[string]bool)
+	pendingApproval := make(map[string]bool)
 	callIDs := make([]string, 0)
 	seen := make(map[string]bool)
 	for _, e := range events {
@@ -286,11 +368,20 @@ func danglingCallIDs(events []Event) []string {
 			if payload.CallID != "" {
 				resultIDs[payload.CallID] = true
 			}
+		case EventApprovalRequested:
+			if e.CallID != "" {
+				pendingApproval[e.CallID] = true
+			}
+		case EventApprovalResolved:
+			var payload ApprovalResolvedPayload
+			if decodeJSON(e.Data, &payload) == nil && payload.CallID != "" {
+				pendingApproval[payload.CallID] = false
+			}
 		}
 	}
 	var dangling []string
 	for _, id := range callIDs {
-		if !resultIDs[id] {
+		if !resultIDs[id] && !pendingApproval[id] {
 			dangling = append(dangling, id)
 		}
 	}

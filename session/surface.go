@@ -1,6 +1,7 @@
 package session
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -139,11 +140,11 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		if !event.Type.Surface() {
 			continue
 		}
-		msg, err := projectSurfaceEvent(event)
+		extra, err := projectSurfaceEvents(event)
 		if err != nil {
 			return nil, nil, err
 		}
-		messages = append(messages, msg)
+		messages = append(messages, extra...)
 	}
 
 	if s.spec.SystemSnapshot != "" {
@@ -161,7 +162,7 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 
 func projectSurfaceEvent(event Event) (*llm.Message, error) {
 	switch event.Type {
-	case EventUserMessage:
+	case EventUserMessage, EventSteeringMessage, EventInjectedContext:
 		var payload struct {
 			Text string `json:"text"`
 		}
@@ -172,12 +173,41 @@ func projectSurfaceEvent(event Event) (*llm.Message, error) {
 
 	case EventAssistantMessage:
 		var payload struct {
-			Text      string     `json:"text"`
-			Reasoning string     `json:"reasoning"`
-			ToolCalls []ToolCall `json:"tool_calls"`
+			Text      string         `json:"text"`
+			Reasoning string         `json:"reasoning"`
+			ToolCalls []ToolCall     `json:"tool_calls"`
+			Blocks    []ContentBlock `json:"blocks"`
 		}
 		if err := json.Unmarshal(event.Data, &payload); err != nil {
 			return nil, fmt.Errorf("session: decode assistant message: %w", err)
+		}
+		if len(payload.Blocks) > 0 {
+			parts := make([]llm.Part, 0, len(payload.Blocks))
+			for _, block := range payload.Blocks {
+				switch block.Kind {
+				case BlockText:
+					parts = append(parts, llm.Part{Type: llm.PartText, Text: block.Text})
+				case BlockReasoning:
+					parts = append(parts, llm.Part{Type: llm.PartReasoning, Reasoning: block.Text})
+				case BlockMedia:
+					if block.Media != nil {
+						data, _ := base64.StdEncoding.DecodeString(block.Media.Data)
+						parts = append(parts, llm.Part{Type: llm.PartMedia, Media: &llm.MediaContent{MediaType: block.Media.MediaType, URL: block.Media.URL, Data: data}})
+					}
+				case BlockToolCall:
+					if block.ToolCall != nil {
+						parts = append(parts, llm.Part{Type: llm.PartToolCall, ToolCall: &llm.ToolCallRequest{CallID: block.ToolCall.CallID, Name: block.ToolCall.Name, Arguments: append(json.RawMessage(nil), block.ToolCall.Arguments...)}})
+					}
+				case BlockToolResult:
+					if block.ToolResult != nil {
+						parts = append(parts, llm.Part{Type: llm.PartToolResult, ToolResult: &llm.ToolCallResult{CallID: block.ToolResult.CallID, Name: block.ToolResult.Name, Output: append(json.RawMessage(nil), block.ToolResult.Content...), IsError: block.ToolResult.Error != ""}})
+					}
+				case BlockExtension:
+					custom, _ := json.Marshal(block)
+					parts = append(parts, llm.Part{Type: llm.PartText, Custom: custom})
+				}
+			}
+			return &llm.Message{Role: llm.RoleAssistant, Parts: parts}, nil
 		}
 		calls := make([]llm.ToolCallRequest, 0, len(payload.ToolCalls))
 		for _, call := range payload.ToolCalls {
@@ -194,10 +224,37 @@ func projectSurfaceEvent(event Event) (*llm.Message, error) {
 			CallID  string          `json:"call_id"`
 			Name    string          `json:"name"`
 			Output  json.RawMessage `json:"output"`
+			Content json.RawMessage `json:"content"`
 			IsError bool            `json:"is_error"`
+			Blocks  []ContentBlock  `json:"blocks"`
 		}
 		if err := json.Unmarshal(event.Data, &payload); err != nil {
 			return nil, fmt.Errorf("session: decode tool result: %w", err)
+		}
+		if len(payload.Output) == 0 {
+			payload.Output = payload.Content
+		}
+		if len(payload.Blocks) > 0 {
+			parts := make([]llm.Part, 0, len(payload.Blocks))
+			for _, block := range payload.Blocks {
+				switch block.Kind {
+				case BlockText, BlockReasoning:
+					parts = append(parts, llm.Part{Type: llm.PartText, Text: block.Text})
+				case BlockMedia:
+					if block.Media != nil {
+						data, _ := base64.StdEncoding.DecodeString(block.Media.Data)
+						parts = append(parts, llm.Part{Type: llm.PartMedia, Media: &llm.MediaContent{MediaType: block.Media.MediaType, URL: block.Media.URL, Data: data}})
+					}
+				case BlockToolResult:
+					if block.ToolResult != nil {
+						parts = append(parts, llm.Part{Type: llm.PartToolResult, ToolResult: &llm.ToolCallResult{CallID: block.ToolResult.CallID, Name: block.ToolResult.Name, Output: append(json.RawMessage(nil), block.ToolResult.Content...), IsError: block.ToolResult.Error != ""}})
+					}
+				case BlockExtension:
+					custom, _ := json.Marshal(block)
+					parts = append(parts, llm.Part{Type: llm.PartText, Custom: custom})
+				}
+			}
+			return &llm.Message{Role: llm.RoleTool, Parts: parts}, nil
 		}
 		return llm.NewToolResultMessage(llm.ToolCallResult{
 			CallID:  payload.CallID,
@@ -216,6 +273,32 @@ func projectSurfaceEvent(event Event) (*llm.Message, error) {
 		return llm.NewTextMessage(llm.RoleSystem, payload.Snapshot), nil
 	}
 	return nil, nil
+}
+
+func projectSurfaceEvents(event Event) ([]*llm.Message, error) {
+	message, err := projectSurfaceEvent(event)
+	if err != nil {
+		return nil, err
+	}
+	if message == nil {
+		return nil, nil
+	}
+	out := []*llm.Message{message}
+	if event.Type == EventToolResult {
+		var payload struct {
+			AdditionalContexts []llm.Message `json:"additional_contexts"`
+		}
+		if err := json.Unmarshal(event.Data, &payload); err != nil {
+			return nil, fmt.Errorf("session: decode tool additional contexts: %w", err)
+		}
+		for i := range payload.AdditionalContexts {
+			clone := payload.AdditionalContexts[i].Clone()
+			if clone != nil {
+				out = append(out, clone)
+			}
+		}
+	}
+	return out, nil
 }
 
 type compactionSummaryPayload struct {
@@ -240,11 +323,43 @@ func decodeCompactionSummary(data json.RawMessage) (compactionSummaryPayload, er
 // record) was shadowed, the pairing is broken and the log/projection is
 // inconsistent (H-SURFACE-008).
 func validatePairing(events []Event, shadowed map[uint64]bool) error {
+	assistantByCall := make(map[string]uint64)
+	resultByCall := make(map[string]uint64)
+	for _, event := range events {
+		if event.Type == EventToolResult && event.CallID != "" {
+			resultByCall[event.CallID] = event.Seq
+		}
+	}
+	for _, event := range events {
+		if event.Type != EventAssistantMessage {
+			continue
+		}
+		var payload struct {
+			ToolCalls []ToolCall `json:"tool_calls"`
+		}
+		if json.Unmarshal(event.Data, &payload) != nil {
+			continue
+		}
+		for _, call := range payload.ToolCalls {
+			if call.CallID != "" {
+				assistantByCall[call.CallID] = event.Seq
+				if result, ok := resultByCall[call.CallID]; ok && !shadowed[event.Seq] && shadowed[result] {
+					return fmt.Errorf("session: compaction shadowed seq %d while assistant tool-call seq %d remains visible: call/result pairing would break", result, event.Seq)
+				}
+			}
+		}
+	}
 	for _, event := range events {
 		if event.Type != EventToolResult || shadowed[event.Seq] {
 			continue
 		}
-		for _, source := range event.SourceSeqs {
+		sources := event.SourceSeqs
+		if len(sources) == 0 && event.CallID != "" {
+			if source, ok := assistantByCall[event.CallID]; ok {
+				sources = []uint64{source}
+			}
+		}
+		for _, source := range sources {
 			if shadowed[source] {
 				return fmt.Errorf("session: compaction shadowed seq %d while its tool/result seq %d remains visible: call/result pairing would break", source, event.Seq)
 			}

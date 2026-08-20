@@ -10,7 +10,8 @@ import (
 // struct tags. The returned bytes are a JSON Schema object suitable for
 // ToolDefinition.InputSchema.
 func FromStruct[T any]() (json.RawMessage, error) {
-	schema := jsonschema.Reflect(new(T))
+	reflector := &jsonschema.Reflector{DoNotReference: true}
+	schema := reflector.Reflect(new(T))
 	return json.Marshal(schema)
 }
 

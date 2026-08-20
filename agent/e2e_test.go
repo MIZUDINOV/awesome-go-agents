@@ -9,6 +9,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/MIZUDINOV/awesome-go-agents/integration"
 	"github.com/MIZUDINOV/awesome-go-agents/integration/local"
@@ -302,6 +303,17 @@ func TestE2E_ScenarioF_ProviderOverflow(t *testing.T) {
 	h.chat.failN = 1
 	h.chat.failErr = &llm.Error{Kind: llm.ErrorKindContextOverflow, Message: "prompt is too long"}
 	h.chat.mu.Unlock()
+	lease, err := h.store.ClaimLease(context.Background(), "e2e-F", "seed", time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = h.store.AppendFenced(context.Background(), lease, []session.Event{{SessionID: "e2e-F", Type: session.EventUserMessage, Data: session.UserText(strings.Repeat("old ", 40))}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := h.store.ReleaseLease(context.Background(), lease); err != nil {
+		t.Fatal(err)
+	}
 
 	result, err := h.loop.Run(context.Background(), strings.Repeat("payload ", 40))
 	if err != nil {

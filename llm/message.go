@@ -193,15 +193,56 @@ func (m *Message) Clone() *Message {
 	clone := &Message{Role: m.Role}
 	if m.Parts != nil {
 		clone.Parts = make([]Part, len(m.Parts))
-		copy(clone.Parts, m.Parts)
+		for i, part := range m.Parts {
+			clone.Parts[i] = part
+			clone.Parts[i].Custom = append(json.RawMessage(nil), part.Custom...)
+			if part.Media != nil {
+				media := *part.Media
+				media.Data = append([]byte(nil), part.Media.Data...)
+				clone.Parts[i].Media = &media
+			}
+			if part.ToolCall != nil {
+				call := *part.ToolCall
+				call.Arguments = append(json.RawMessage(nil), part.ToolCall.Arguments...)
+				clone.Parts[i].ToolCall = &call
+			}
+			if part.ToolResult != nil {
+				result := *part.ToolResult
+				result.Output = append(json.RawMessage(nil), part.ToolResult.Output...)
+				clone.Parts[i].ToolResult = &result
+			}
+		}
 	}
 	if m.Metadata != nil {
 		clone.Metadata = make(map[string]any, len(m.Metadata))
 		for key, value := range m.Metadata {
-			clone.Metadata[key] = value
+			clone.Metadata[key] = cloneMetadataValue(value)
 		}
 	}
 	return clone
+}
+
+func cloneMetadataValue(value any) any {
+	switch typed := value.(type) {
+	case json.RawMessage:
+		return append(json.RawMessage(nil), typed...)
+	case []byte:
+		return append([]byte(nil), typed...)
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			out[key] = cloneMetadataValue(item)
+		}
+		return out
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = cloneMetadataValue(item)
+		}
+		return out
+	default:
+		return value
+	}
 }
 
 // ToolCallByID returns the matching tool call or nil.

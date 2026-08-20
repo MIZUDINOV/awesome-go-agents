@@ -19,31 +19,34 @@ const (
 // provider-specific options (temperature, reasoning, routing, ...) as opaque
 // JSON; each provider decodes only what it recognises.
 type Request struct {
-	Model string
+	Model string `json:"model"`
 	// System holds system-level instructions, usually one RoleSystem message.
-	System []Message
+	System []Message `json:"system,omitempty"`
 	// Messages is the conversation history in display order.
-	Messages []Message
+	Messages []Message `json:"messages,omitempty"`
 	// Tools are the model-facing tool definitions.
-	Tools []*ToolDefinition
+	Tools []*ToolDefinition `json:"tools,omitempty"`
 	// ToolChoice forces tool usage. Empty means "auto" when Tools exist.
-	ToolChoice ToolChoice
+	ToolChoice ToolChoice `json:"tool_choice,omitempty"`
 	// ParallelToolCalls, when set, requests parallel tool calls. The durable
-	// scheduler keeps this false so tool ordering and fencing are
-	// deterministic (H-SCHED-001); nil defers to the provider/config default.
-	ParallelToolCalls *bool
+	// scheduler still commits every result in model order and only overlaps
+	// definitions explicitly classified concurrency-safe.
+	ParallelToolCalls *bool `json:"parallel_tool_calls,omitempty"`
 	// MaxTokens bounds the completion. Zero means provider default.
-	MaxTokens int64
+	MaxTokens int64 `json:"max_tokens,omitempty"`
 	// Config is provider-specific configuration (e.g. GenerateConfig for
 	// OpenRouter) encoded as JSON.
-	Config json.RawMessage
+	Config json.RawMessage `json:"config,omitempty"`
 	// Stream requests streaming transport when true.
-	Stream bool
+	Stream bool `json:"stream,omitempty"`
 	// StructuredOutputSchema, when set, requests JSON output constrained to the
 	// given JSON Schema. Supported by providers that implement it.
-	StructuredOutputSchema json.RawMessage
+	StructuredOutputSchema json.RawMessage `json:"structured_output_schema,omitempty"`
 	// StructuredStrict requests provider-side strict schema adherence.
-	StructuredStrict bool
+	StructuredStrict bool `json:"structured_strict,omitempty"`
+	// Capabilities is the resolved provider/model snapshot used by the loop;
+	// providers may ignore it on the wire.
+	Capabilities *Capabilities `json:"capabilities,omitempty"`
 }
 
 // FinishReason is the provider-neutral completion classification.

@@ -16,12 +16,15 @@ import (
 //	enum          []value
 //	additionalProperties bool           (false = closed object)
 //
-// Metadata keys ($schema/$id/$comment) are accepted and ignored; referencing
-// constructs ($ref/$defs/oneOf/anyOf/allOf/not/if/then/else) are rejected.
+// Metadata keys ($schema/$id/$comment) are accepted and ignored. The explicit
+// DeepSeek-compatible subset supports exact-one oneOf.
 var supportedSchemaKeywords = map[string]bool{
 	"type": true, "properties": true, "required": true,
 	"items": true, "enum": true, "additionalProperties": true,
+	"oneOf":   true,
 	"$schema": true, "$id": true, "$comment": true,
+	"title": true, "description": true, "default": true, "examples": true,
+	"format": true,
 }
 
 // ErrUnsupportedSchema identifies a schema construct outside the validated
@@ -61,8 +64,14 @@ func validateSchemaNode(node any) error {
 		}
 	}
 	if raw, ok := obj["type"]; ok {
-		if _, isStr := raw.(string); !isStr {
+		typeName, isStr := raw.(string)
+		if !isStr {
 			return fmt.Errorf("%w: type must be a string", ErrSchemaInvalid)
+		}
+		switch typeName {
+		case "object", "array", "string", "number", "integer", "boolean", "null":
+		default:
+			return fmt.Errorf("%w: unsupported type %q", ErrUnsupportedSchema, typeName)
 		}
 	}
 	if raw, ok := obj["additionalProperties"]; ok {
@@ -97,6 +106,17 @@ func validateSchemaNode(node any) error {
 			return err
 		}
 	}
+	if raw, ok := obj["oneOf"]; ok {
+		branches, ok := raw.([]any)
+		if !ok || len(branches) == 0 {
+			return fmt.Errorf("%w: oneOf must be a non-empty array", ErrSchemaInvalid)
+		}
+		for _, branch := range branches {
+			if err := validateSchemaNode(branch); err != nil {
+				return err
+			}
+		}
+	}
 	return nil
 }
 
@@ -129,6 +149,17 @@ func ValidateInput(schema json.RawMessage, input []byte) error {
 }
 
 func validateNode(schema map[string]any, value any, path string) error {
+	if raw, ok := schema["oneOf"].([]any); ok {
+		matches := 0
+		for _, branch := range raw {
+			if candidate, ok := branch.(map[string]any); ok && validateNode(candidate, value, path) == nil {
+				matches++
+			}
+		}
+		if matches != 1 {
+			return fmt.Errorf("%s: value must match exactly one oneOf branch (matched %d)", path, matches)
+		}
+	}
 	if types, ok := schema["type"].(string); ok {
 		if !typeMatches(types, value) {
 			return fmt.Errorf("%s: expected type %q, got %q", path, types, jsonTypeOf(value))
@@ -149,7 +180,8 @@ func validateNode(schema map[string]any, value any, path string) error {
 				}
 			}
 		}
-		if props, ok := schema["properties"].(map[string]any); ok {
+		props, hasProperties := schema["properties"].(map[string]any)
+		if hasProperties {
 			for name, propSchema := range props {
 				if v, present := obj[name]; present {
 					if sub, ok := propSchema.(map[string]any); ok {
@@ -166,6 +198,8 @@ func validateNode(schema map[string]any, value any, path string) error {
 					}
 				}
 			}
+		} else if closed, ok := schema["additionalProperties"].(bool); ok && closed && len(obj) > 0 {
+			return fmt.Errorf("%s: unexpected property in closed object", path)
 		}
 	}
 	if arr, ok := value.([]any); ok {

@@ -78,6 +78,12 @@ type FileSystem interface {
 	EditText(ctx context.Context, target Target, edit EditRequest, intent EditIntent) (EditResult, error)
 }
 
+// BinaryFileSystem is the optional media extension used by read_image. Text
+// adapters may omit it and fail closed rather than decoding arbitrary bytes.
+type BinaryFileSystem interface {
+	ReadBytes(ctx context.Context, target Target) ([]byte, error)
+}
+
 // Observation is the per-owner visibility state of a target
 // (H-FS-OBS-001..006): unseen, absent, or present with a content version.
 type Observation int

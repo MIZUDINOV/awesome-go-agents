@@ -1,6 +1,10 @@
 package context
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strconv"
+
 	"github.com/MIZUDINOV/awesome-go-agents/llm"
 )
 
@@ -71,6 +75,8 @@ func (c PruneCaps) PruneMessages(messages []*llm.Message) int {
 type SpillRef struct {
 	Artifact string
 	Preview  string
+	Size     int64
+	SHA256   string
 }
 
 // Spill caps inline output and returns a SpillRef when the result exceeds the
@@ -85,7 +91,14 @@ func Spill(maxInlineBytes int, previewTail int, full string, artifact string) (s
 	if previewTail > 0 && len(runes) > previewTail {
 		preview = string(runes[len(runes)-previewTail:])
 	}
-	return preview, &SpillRef{Artifact: artifact, Preview: preview}
+	digest := sha256.Sum256([]byte(full))
+	return preview, &SpillRef{Artifact: artifact, Preview: preview, Size: int64(len([]byte(full))), SHA256: hex.EncodeToString(digest[:])}
+}
+
+// String is a compact deterministic representation suitable for a model
+// hint or durable metadata field.
+func (r SpillRef) String() string {
+	return r.Artifact + " (" + strconv.FormatInt(r.Size, 10) + " bytes, sha256=" + r.SHA256 + ")"
 }
 
 func clamp(v, lo, hi int) int {

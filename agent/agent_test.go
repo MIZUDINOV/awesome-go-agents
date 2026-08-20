@@ -75,10 +75,89 @@ func registerProbe(t *testing.T, registry *tools.Registry, name string, failAfte
 
 func newMemoryStore() *session.MemoryStore { return session.NewMemoryStore() }
 
+type hostClaimStore struct {
+	*session.MemoryStore
+	claims, renewals, releases int
+}
+
+func (s *hostClaimStore) ClaimLease(ctx context.Context, sessionID, owner string, ttl time.Duration, tenantID string) (session.Lease, error) {
+	s.claims++
+	return s.MemoryStore.ClaimLease(ctx, sessionID, owner, ttl, tenantID)
+}
+
+func (s *hostClaimStore) RenewLease(ctx context.Context, lease session.Lease) (session.Lease, error) {
+	s.renewals++
+	return s.MemoryStore.RenewLease(ctx, lease)
+}
+
+func (s *hostClaimStore) ReleaseLease(ctx context.Context, lease session.Lease) error {
+	s.releases++
+	return s.MemoryStore.ReleaseLease(ctx, lease)
+}
+
 func check(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestEventHubReplayLiveHandoffAndLag(t *testing.T) {
+	store := session.NewMemoryStore()
+	ctx := context.Background()
+	_, err := store.Append(ctx, "events", []session.Event{{ID: "old", SessionID: "events", Type: session.EventUserMessage, Data: session.UserText("old")}})
+	check(t, err)
+	hub := NewEventHub(1)
+	loop := NewLoop("events", store, tools.New(tools.Options{}), &scriptedProvider{steps: []scriptedStep{{text: "ok"}}}, Config{EventHub: hub})
+	sub, err := loop.Subscribe(ctx, 0, nil)
+	check(t, err)
+	event, err := sub.Next(ctx)
+	check(t, err)
+	if event.ID != "old" || event.Seq != 1 {
+		t.Fatalf("replay event=%+v", event)
+	}
+	hub.Publish(session.Event{ID: "new", SessionID: "events", Seq: 2, Type: session.EventUserMessage, Data: session.UserText("new")})
+	event, err = sub.Next(ctx)
+	check(t, err)
+	if event.ID != "new" || event.Seq != 2 {
+		t.Fatalf("live event=%+v", event)
+	}
+	hub.Publish(session.Event{ID: "lag-1", SessionID: "events", Seq: 3, Type: session.EventUserMessage, Data: session.UserText("1")})
+	hub.Publish(session.Event{ID: "lag-2", SessionID: "events", Seq: 4, Type: session.EventUserMessage, Data: session.UserText("2")})
+	_, _ = sub.Next(ctx)
+	if _, err := sub.Next(ctx); !errors.Is(err, ErrSubscriberLagged) {
+		t.Fatalf("lag error=%v", err)
+	}
+}
+
+func TestStatefulAgentFollowUpAndDispose(t *testing.T) {
+	store := session.NewMemoryStore()
+	chat := &scriptedProvider{steps: []scriptedStep{{text: "done"}, {text: "done again"}}}
+	loop := NewLoop("stateful", store, tools.New(tools.Options{}), chat, Config{Model: "m", Owner: "test", SystemPrompt: "sys", EventHub: NewEventHub(16)})
+	handle, err := NewAgent(loop)
+	check(t, err)
+	if err := handle.FollowUp(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+	if err := handle.WhenIdle(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Load(context.Background(), "stateful", 0, 0)
+	check(t, err)
+	found := false
+	for _, event := range events {
+		if event.Type == session.EventUserMessage && strings.Contains(string(event.Data), "hello") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("follow-up was not persisted: %+v", events)
+	}
+	if err := handle.Dispose(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if handle.Status() != StatusDisposed {
+		t.Fatalf("status=%s", handle.Status())
 	}
 }
 
@@ -117,6 +196,22 @@ func TestDurableAppendAndReplay(t *testing.T) {
 	}
 	if userCount < 2 {
 		t.Fatalf("expected at least 2 durable user messages, got %d (events=%d)", userCount, len(events))
+	}
+}
+
+func TestHostClaimedLeaseDoesNotCompeteWithHostHeartbeat(t *testing.T) {
+	store := &hostClaimStore{MemoryStore: session.NewMemoryStore()}
+	lease, err := store.MemoryStore.ClaimLease(context.Background(), "host-run", "host-worker", time.Minute, "")
+	check(t, err)
+	registry := tools.New(tools.Options{})
+	chat := &scriptedProvider{steps: []scriptedStep{{text: "done", finish: llm.FinishReasonStop}}}
+	loop := NewLoop("host-run", store, registry, chat, Config{
+		Model: "m", Owner: "agentkit", SystemPrompt: "sys", ClaimedLease: &lease,
+	})
+	_, err = loop.Run(context.Background(), "hello")
+	check(t, err)
+	if store.claims != 0 || store.renewals != 0 || store.releases != 0 {
+		t.Fatalf("host-owned run touched lease lifecycle: claims=%d renewals=%d releases=%d", store.claims, store.renewals, store.releases)
 	}
 }
 
@@ -205,8 +300,9 @@ func TestCancellationPriority(t *testing.T) {
 	_ = events
 }
 
-// TestSequentialToolExecutionForced: ParallelToolCalls=false is always sent.
-func TestSequentialToolExecutionForced(t *testing.T) {
+// TestParallelToolCallsEnabled: the provider may emit a parallel batch; the
+// registry still applies explicit per-call safety and model-order commits.
+func TestParallelToolCallsEnabled(t *testing.T) {
 	store := newMemoryStore()
 	registry := tools.New(tools.Options{})
 	registerProbe(t, registry, "probe_seq", nil, nil)
@@ -216,8 +312,8 @@ func TestSequentialToolExecutionForced(t *testing.T) {
 	check(t, err)
 	chat.mu.Lock()
 	defer chat.mu.Unlock()
-	if len(chat.calls) == 0 || chat.calls[0].ParallelToolCalls == nil || *chat.calls[0].ParallelToolCalls {
-		t.Fatalf("expected ParallelToolCalls=false, got %+v", chat.calls)
+	if len(chat.calls) == 0 || chat.calls[0].ParallelToolCalls == nil || !*chat.calls[0].ParallelToolCalls {
+		t.Fatalf("expected ParallelToolCalls=true, got %+v", chat.calls)
 	}
 }
 
@@ -243,8 +339,13 @@ func TestCompactionOnOverflow(t *testing.T) {
 		ContextWindow: 60, MaxOutput: 10, CompactThresholdRatio: 0.80,
 		Compactor: compactor, PruneHead: 4,
 	})
-	// The input alone must exceed the 0.80 threshold so preflight compacts
-	// BEFORE the first step (durable compaction of existing history).
+	// Compaction only replaces old history; seed a prior durable event so the
+	// fresh user request remains in the required verbatim tail.
+	lease, leaseErr := store.ClaimLease(context.Background(), "s6", "seed", time.Minute, "")
+	check(t, leaseErr)
+	_, leaseErr = store.AppendFenced(context.Background(), lease, []session.Event{{SessionID: "s6", Type: session.EventUserMessage, Data: session.UserText(strings.Repeat("old ", 40))}})
+	check(t, leaseErr)
+	check(t, store.ReleaseLease(context.Background(), lease))
 	_, err := loop.Run(context.Background(), strings.Repeat("payload ", 40))
 	check(t, err)
 	compactMu.Lock()

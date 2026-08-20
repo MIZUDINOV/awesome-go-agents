@@ -12,6 +12,7 @@ const (
 	StreamEventReasoning StreamEventType = "reasoning"
 	// StreamEventToolCall carries one accumulated tool call definition.
 	StreamEventToolCall StreamEventType = "tool_call"
+	StreamEventMedia    StreamEventType = "media"
 	// StreamEventDone is the terminal event; it carries the assembled Response.
 	StreamEventDone StreamEventType = "done"
 )
@@ -28,6 +29,7 @@ type StreamEvent struct {
 	Type      StreamEventType
 	Text      string
 	Reasoning string
+	Media     *MediaContent
 	ToolCall  *ToolCallDelta
 	// Response is set only on StreamEventDone.
 	Response *Response

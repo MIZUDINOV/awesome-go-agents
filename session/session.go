@@ -53,32 +53,73 @@ func (s *Session) Append(ctx context.Context, event Event) (uint64, error) {
 // store). Invalid events abort the whole batch before anything is written
 // (H-SESSION-004: payloads are validated and copied before commit).
 func (s *Session) AppendAll(ctx context.Context, events []Event) (uint64, error) {
-	for i := range events {
-		if err := events[i].Validate(); err != nil {
-			return 0, err
-		}
-		events[i].Normalize()
-	}
-	batch := make([]Event, len(events))
-	for i := range events {
-		batch[i] = events[i].Clone()
-	}
-	last, err := s.store.Append(ctx, s.ID, batch)
+	committed, err := s.AppendCommitted(ctx, events)
 	if err != nil {
 		return 0, err
 	}
-	// Assign per-event seqs into our private clones (the store contract is
-	// contiguous batches starting after the previous tail).
-	for i := range batch {
-		batch[i].Seq = last - uint64(len(batch)-1-i)
+	if len(committed.Events) == 0 {
+		return s.Sequence(ctx)
+	}
+	return committed.Events[len(committed.Events)-1].Seq, nil
+}
+
+// AppendCommitted returns the canonical copies assigned by a batch-capable
+// store. Older adapters are supported by the legacy contiguous append/load
+// fallback; new adapters should implement BatchStore atomically.
+func (s *Session) AppendCommitted(ctx context.Context, events []Event) (CommittedBatch, error) {
+	batchInput := make([]Event, len(events))
+	for i := range events {
+		if err := events[i].Validate(); err != nil {
+			return CommittedBatch{}, err
+		}
+		batchInput[i] = events[i].Clone()
+		batchInput[i].Normalize()
+	}
+	if batchStore, ok := s.store.(BatchStore); ok {
+		batch, err := batchStore.AppendCommitted(ctx, s.ID, batchInput)
+		if err != nil {
+			return CommittedBatch{}, err
+		}
+		canonical := make([]Event, len(batch.Events))
+		for i, event := range batch.Events {
+			canonical[i] = event.Clone()
+		}
+		s.mu.Lock()
+		if s.hydrated {
+			for _, event := range canonical {
+				if event.Seq <= s.cachedSeq {
+					continue
+				}
+				s.cached = append(s.cached, event.Clone())
+				s.cachedSeq = event.Seq
+			}
+		}
+		s.mu.Unlock()
+		return CommittedBatch{Events: canonical}, nil
+	}
+	last, err := s.store.Append(ctx, s.ID, batchInput)
+	if err != nil {
+		return CommittedBatch{}, err
+	}
+	after := uint64(0)
+	if last > uint64(len(events)) {
+		after = last - uint64(len(events))
+	}
+	loaded, err := s.store.Load(ctx, s.ID, after, 0)
+	if err != nil {
+		return CommittedBatch{}, err
 	}
 	s.mu.Lock()
 	if s.hydrated {
-		s.cached = append(s.cached, batch...)
-		s.cachedSeq = last
+		for _, event := range loaded {
+			if event.Seq > s.cachedSeq {
+				s.cached = append(s.cached, event.Clone())
+				s.cachedSeq = event.Seq
+			}
+		}
 	}
 	s.mu.Unlock()
-	return last, nil
+	return CommittedBatch{Events: loaded}, nil
 }
 
 // CompactionSummary durably records a compaction transaction
@@ -114,12 +155,23 @@ func (s *Session) CompactionSummary(ctx context.Context, generation uint64, tran
 // This is an explicit fresh read from the store (recovery/resume path); normal
 // DeriveMessages serves from the in-memory tail.
 func (s *Session) Load(ctx context.Context, afterSeq uint64) ([]Event, error) {
-	return s.store.Load(ctx, s.ID, afterSeq, 0)
+	events, err := s.store.Load(ctx, s.ID, afterSeq, 0)
+	if err != nil {
+		return nil, err
+	}
+	cloned := make([]Event, len(events))
+	for i, event := range events {
+		if err := event.Validate(); err != nil {
+			return nil, err
+		}
+		cloned[i] = event.Clone()
+	}
+	return cloned, nil
 }
 
 // Events returns all events from the beginning (fresh from the store).
 func (s *Session) Events(ctx context.Context) ([]Event, error) {
-	return s.store.Load(ctx, s.ID, 0, 0)
+	return s.Load(ctx, 0)
 }
 
 // Sequence returns the highest assigned seq.
@@ -161,6 +213,9 @@ func (s *Session) Refresh(ctx context.Context) error {
 	}
 	cached := make([]Event, len(events))
 	for i, e := range events {
+		if err := e.Validate(); err != nil {
+			return fmt.Errorf("session: refresh event %d: %w", e.Seq, err)
+		}
 		cached[i] = e.Clone()
 	}
 	s.cached = cached

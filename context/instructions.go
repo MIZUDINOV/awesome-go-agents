@@ -29,7 +29,8 @@ func DiscoverInstructions(dir string) []string {
 		}
 		current = parent
 	}
-	// Deepest first (project-specific overrides global).
+	// Root first, then deeper project-specific files; LoadInstructions appends
+	// local instructions last so they can override broader guidance.
 	sort.SliceStable(found, func(i, j int) bool {
 		return strings.Count(filepath.Dir(found[i]), string(filepath.Separator)) <
 			strings.Count(filepath.Dir(found[j]), string(filepath.Separator))
