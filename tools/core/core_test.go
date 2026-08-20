@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +31,37 @@ func newTestEnv(t *testing.T) (*tools.Registry, *local.LocalSandbox, string, map
 }
 
 func ctx() context.Context { return context.Background() }
+
+func TestTypedCoreInputSchemasIncludeArgumentDescriptions(t *testing.T) {
+	schemas := []struct {
+		name   string
+		schema json.RawMessage
+	}{
+		{"read", typedSchema[readInput]()}, {"read_image", typedSchema[readImageInput]()},
+		{"write", typedSchema[writeInput]()}, {"edit", typedSchema[editInput]()},
+		{"glob", typedSchema[globInput]()}, {"grep", typedSchema[grepInput]()},
+		{"bash", typedSchema[bashInput]()}, {"job_start", typedSchema[jobStartInput]()},
+		{"job_list", typedSchema[jobListInput]()}, {"job_output", typedSchema[jobOutputInput]()},
+		{"job_kill", typedSchema[jobKillInput]()}, {"web_search", typedSchema[webSearchInput]()},
+		{"web_fetch", typedSchema[webFetchInput]()}, {"lsp_diagnostics", typedSchema[lspDiagnosticsInput]()},
+		{"terminal", typedSchema[terminalInput]()},
+	}
+	for _, item := range schemas {
+		var schema struct {
+			Properties map[string]struct {
+				Description string `json:"description"`
+			} `json:"properties"`
+		}
+		if err := json.Unmarshal(item.schema, &schema); err != nil {
+			t.Fatalf("%s: %v", item.name, err)
+		}
+		for field, property := range schema.Properties {
+			if property.Description == "" {
+				t.Errorf("%s.%s description is missing from the typed input schema", item.name, field)
+			}
+		}
+	}
+}
 
 // call runs a tool with JSON-encoded args and returns the canonical result.
 func call(t *testing.T, registry *tools.Registry, name string, vars map[string]any, args map[string]any) any {
@@ -69,14 +99,6 @@ func writeFile(t *testing.T, path, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
 	}
-}
-
-func anyLen(v any) int {
-	rv := reflect.ValueOf(v)
-	if rv.Kind() != reflect.Array && rv.Kind() != reflect.Slice {
-		return -1
-	}
-	return rv.Len()
 }
 
 // readThenEdit is the happy path: read registers observation, then edit works.
@@ -125,12 +147,12 @@ func TestCoreSandboxDenialStableCode(t *testing.T) {
 // bash runs with bounded output and structured exit codes.
 func TestCoreBashRuns(t *testing.T) {
 	registry, _, root, vars := newTestEnv(t)
-	m := call(t, registry, "bash", vars, map[string]any{"command": "echo bash-ok", "workdir": root}).(map[string]any)
-	if m["exit_code"] != 0 || !strings.Contains(m["output"].(string), "bash-ok") {
+	m := call(t, registry, "bash", vars, map[string]any{"command": "echo bash-ok", "workdir": root}).(bashOutput)
+	if m.ExitCode != 0 || !strings.Contains(m.Output, "bash-ok") {
 		t.Errorf("bash result = %+v", m)
 	}
-	nc := call(t, registry, "bash", vars, map[string]any{"command": "exit 7", "workdir": root}).(map[string]any)
-	if nc["exit_code"] != 7 {
+	nc := call(t, registry, "bash", vars, map[string]any{"command": "exit 7", "workdir": root}).(bashOutput)
+	if nc.ExitCode != 7 {
 		t.Errorf("expected exit 7, got %+v", nc)
 	}
 }
@@ -144,34 +166,34 @@ func TestCoreGlobGrep(t *testing.T) {
 	writeFile(t, filepath.Join(root, "pkg", "a.go"), "func A(){} // marker\n")
 	writeFile(t, filepath.Join(root, "pkg", "b.go"), "func B(){} // marker\n")
 	writeFile(t, filepath.Join(root, "pkg", "c.txt"), "no match")
-	g := call(t, registry, "glob", vars, map[string]any{"pattern": "*.go", "path": "pkg"}).(map[string]any)
-	if matches, ok := g["matches"].([]string); !ok || len(matches) != 2 {
-		t.Errorf("glob matches = %#v (%T)", g["matches"], g["matches"])
+	g := call(t, registry, "glob", vars, map[string]any{"pattern": "*.go", "path": "pkg"}).(globOutput)
+	if len(g.Matches) != 2 {
+		t.Errorf("glob matches = %#v", g.Matches)
 	}
-	gr := call(t, registry, "grep", vars, map[string]any{"pattern": "marker", "path": "pkg"}).(map[string]any)
-	if n := anyLen(gr["matches"]); n != 2 {
-		t.Errorf("grep matches length = %d (type %T)", n, gr["matches"])
+	gr := call(t, registry, "grep", vars, map[string]any{"pattern": "marker", "path": "pkg"}).(grepOutput)
+	if n := len(gr.Matches); n != 2 {
+		t.Errorf("grep matches length = %d", n)
 	}
 	// Traversal patterns resolve inside the root (empty result, no escape).
-	out := call(t, registry, "glob", vars, map[string]any{"pattern": "../*"}).(map[string]any)
-	if matches, ok := out["matches"].([]string); !ok || len(matches) != 0 {
-		t.Errorf("escaping glob returned matches: %#v", out["matches"])
+	out := call(t, registry, "glob", vars, map[string]any{"pattern": "../*"}).(globOutput)
+	if len(out.Matches) != 0 {
+		t.Errorf("escaping glob returned matches: %#v", out.Matches)
 	}
 }
 
 // job lifecycle, owner scoped.
 func TestCoreJobs(t *testing.T) {
 	registry, _, root, vars := newTestEnv(t)
-	start := call(t, registry, "job_start", vars, map[string]any{"command": "echo j1", "workdir": root}).(map[string]any)
-	id := start["job_id"].(string)
+	start := call(t, registry, "job_start", vars, map[string]any{"command": "echo j1", "workdir": root}).(jobStartOutput)
+	id := start.JobID
 	if id == "" {
 		t.Fatal("no job id")
 	}
 	found := false
 	for i := 0; i < 300; i++ {
-		o := call(t, registry, "job_output", vars, map[string]any{"job_id": id}).(map[string]any)
-		if status := o["status"].(string); status == "completed" || status == "failed" {
-			if !strings.Contains(o["output"].(string), "j1") {
+		o := call(t, registry, "job_output", vars, map[string]any{"job_id": id}).(jobOutputOutput)
+		if status := o.Status; status == "completed" || status == "failed" {
+			if !strings.Contains(o.Output, "j1") {
 				t.Errorf("job output = %v", o)
 			}
 			found = true

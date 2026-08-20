@@ -61,8 +61,9 @@ go test ./internal/agents/... ./internal/ai/...
 - **≥90% P1 core points** — loop, session, surface, fenced store, compaction,
   sandbox, CAS, recovery, pruner, typed definitions, `oneOf`, and ordered
   bounded scheduling implemented with sentinels and deterministic schemas.
-- **core tools have golden schemas and contract tests** — `tools/core` schemas
-  hand-written and exercised by `tools/core/core_test.go` and the parity suite
+- **core tools have typed schemas and contract tests** — `tools/core` input and
+  output schemas are generated from the typed `DefineTool[I,O]` contracts and
+  exercised by `tools/core/core_test.go` and the parity suite
   `integration/e2b/e2b_test.go`.
 - **DB replay rebuilds identical surface** — `session/pgstore/integration_test.go`
   loads the log on a fresh store and rebuilds the projection (scenarios H, G).
