@@ -40,12 +40,11 @@ type harness struct {
 // e2eChat is a scripted provider whose replies are a queue of tool-call sets
 // then a final text. Optionally fails the Nth generation with a provider error.
 type e2eChat struct {
-	mu            sync.Mutex
-	steps         []e2eStep
-	n             int
-	failN         int
-	failErr       error
-	overflowCount int
+	mu        sync.Mutex
+	steps     []e2eStep
+	n         int
+	failCount int
+	failErr   error
 }
 
 type e2eStep struct {
@@ -59,7 +58,7 @@ func (c *e2eChat) Generate(ctx context.Context, req *llm.Request, cb llm.StreamC
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.n++
-	if c.failN == c.n && c.failErr != nil {
+	if c.failErr != nil && c.failCount > 0 && c.n <= c.failCount {
 		return nil, c.failErr
 	}
 	var step e2eStep
@@ -359,20 +358,20 @@ func TestE2E_ScenarioD_LongOutput(t *testing.T) {
 	}
 }
 
-// Scenario F: provider overflow -> compact -> bounded retry once.
+// Scenario F: provider overflow -> compact -> bounded retries.
 func TestE2E_ScenarioF_ProviderOverflow(t *testing.T) {
 	ws := t.TempDir()
 	h := newHarness(t, ws, "F", []e2eStep{{text: "recovered"}, {text: "done"}}, Config{
-		Model: "m", Owner: "F", SystemPrompt: "sys",
+		Model: "m", Owner: "F", SystemPrompt: "sys", MaxContextRetries: 2,
 		ContextWindow: 60, MaxOutput: 10, CompactThresholdRatio: 0.80,
 		Compactor: &countingCompactor{f: func(generation uint64, events []session.Event, through uint64) (string, string, error) {
 			return "[summary]", "fp-F", nil
 		}},
 	})
-	// The first real generation overflows; the loop compacts and retries
-	// (bounded retry) after the surface advances.
+	// The first two real generations overflow; the loop compacts and retries
+	// twice after the surface advances.
 	h.chat.mu.Lock()
-	h.chat.failN = 1
+	h.chat.failCount = 2
 	h.chat.failErr = &llm.Error{Kind: llm.ErrorKindContextOverflow, Message: "prompt is too long"}
 	h.chat.mu.Unlock()
 	lease, err := h.store.ClaimLease(context.Background(), "e2e-F", "seed", time.Minute, "")
@@ -416,13 +415,14 @@ func TestE2E_ScenarioF_ProviderOverflow(t *testing.T) {
 	if compacted < 2 {
 		t.Fatalf("expected compaction/start+summary events, got %d", compacted)
 	}
-	initialStep, retryStep := false, false
+	initialStep, retryStep, secondRetry := false, false, false
 	for stepID := range stepStarts {
 		initialStep = initialStep || strings.HasSuffix(stepID, "-step-00")
 		retryStep = retryStep || strings.HasSuffix(stepID, "-step-00-retry-01")
+		secondRetry = secondRetry || strings.HasSuffix(stepID, "-step-00-retry-02")
 	}
-	if len(stepStarts) != 2 || !initialStep || !retryStep {
-		t.Fatalf("overflow step attempts = %v, want initial + retry", stepStarts)
+	if len(stepStarts) != 3 || !initialStep || !retryStep || !secondRetry {
+		t.Fatalf("overflow step attempts = %v, want initial + two retries", stepStarts)
 	}
 	for stepID := range stepStarts {
 		if !stepEnds[stepID] {

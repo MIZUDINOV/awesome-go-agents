@@ -62,9 +62,11 @@ func New(db *pgxpool.Pool) *Store {
 	return &Store{db: db, events: "agentkit_events", sessions: "agentkit_sessions", native: true}
 }
 
-// WithEventsTable overrides the default events table name (for host-app
-// remapping). Only plain identifiers are accepted. Remapped stores are not
-// native: fenced operations are rejected.
+// WithEventsTable overrides the default events table name for a lease-less
+// host table. The table must provide session_id, seq, event_id, type,
+// timestamp, data and source_seqs columns. Remapped stores intentionally do
+// not implement fenced operations; hosts needing leases should use their
+// canonical-store adapter instead.
 func (s *Store) WithEventsTable(name string) *Store {
 	if !safeIdentifier.MatchString(name) {
 		panic(fmt.Sprintf("pgstore: unsafe events table name %q", name))
@@ -142,6 +144,12 @@ func (s *Store) Append(ctx context.Context, sessionID string, events []session.E
 			return 0, fmt.Errorf("pgstore: reserve sequence block: %w", err)
 		}
 	} else {
+		// Remapped tables do not have AgentKit's per-session sequence counter.
+		// Serialize their lease-less MAX(seq)+1 fallback at the PostgreSQL
+		// transaction level so concurrent appends cannot allocate the same seq.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, sessionID); err != nil {
+			return 0, fmt.Errorf("pgstore: lock remapped sequence: %w", err)
+		}
 		err = tx.QueryRow(ctx, fmt.Sprintf(`SELECT COALESCE(MAX(seq),0) FROM %s WHERE session_id=$1`, s.events), sessionID).Scan(&base)
 		if err != nil {
 			return 0, fmt.Errorf("pgstore: read sequence: %w", err)
@@ -151,7 +159,7 @@ func (s *Store) Append(ctx context.Context, sessionID string, events []session.E
 	for i := range events {
 		next++
 		event := events[i]
-		if err := insertEventTx(ctx, tx, s.events, s.tenant, sessionID, next, event); err != nil {
+		if err := insertEventTx(ctx, tx, s.events, s.tenant, sessionID, next, event, s.native); err != nil {
 			return 0, err
 		}
 	}
@@ -166,6 +174,9 @@ func (s *Store) AppendFenced(ctx context.Context, lease session.Lease, events []
 	for i := range events {
 		if err := events[i].Validate(); err != nil {
 			return 0, err
+		}
+		if events[i].SessionID != "" && events[i].SessionID != lease.SessionID {
+			return 0, fmt.Errorf("pgstore: event %s belongs to %q, not %q", events[i].ID, events[i].SessionID, lease.SessionID)
 		}
 	}
 	if err := s.requireNativeAndTenant(); err != nil {
@@ -234,7 +245,7 @@ func (s *Store) AppendFenced(ctx context.Context, lease session.Lease, events []
 		next := base
 		for i := range newEvents {
 			next++
-			if err := insertEventTx(ctx, tx, s.events, s.tenant, lease.SessionID, next, newEvents[i]); err != nil {
+			if err := insertEventTx(ctx, tx, s.events, s.tenant, lease.SessionID, next, newEvents[i], true); err != nil {
 				return 0, err
 			}
 			lastSeq = next
@@ -599,12 +610,21 @@ WHERE session_id=$1 AND tenant_id=$2 AND lease_token=$3 AND lease_until>now()`, 
 	return nil
 }
 
-func insertEventTx(ctx context.Context, tx pgx.Tx, table, tenant, sessionID string, seq uint64, event session.Event) error {
+func insertEventTx(ctx context.Context, tx pgx.Tx, table, tenant, sessionID string, seq uint64, event session.Event, native bool) error {
 	event = event.Clone()
 	event.Normalize()
 	data := event.Data
 	if len(data) == 0 {
 		data = json.RawMessage("{}")
+	}
+	if !native {
+		_, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s(session_id,seq,event_id,type,timestamp,data,source_seqs)
+VALUES($1,$2,$3,$4,$5,$6,$7)`, table),
+			sessionID, seq, nullableText(event.ID), string(event.Type), event.Timestamp, data, event.SourceSeqs)
+		if err != nil {
+			return fmt.Errorf("pgstore: insert remapped event: %w", err)
+		}
+		return nil
 	}
 	_, err := tx.Exec(ctx, fmt.Sprintf(`INSERT INTO %s(session_id,tenant_id,seq,event_id,type,format_version,timestamp,data,surface,source_seqs,run_id,turn_id,step_id,call_id)
 VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`, table),
@@ -832,8 +852,9 @@ func mustJSON(v any) json.RawMessage {
 // Migration is the SQL to create the self-contained schema. It is additive and
 // idempotent: existing agentkit_events tables gain the new columns via
 // ALTER TABLE ... IF NOT EXISTS, no destructive rewrite (H-DB-013/H-DB-014).
-// Host apps mount it into their migrate chain, or remap Store onto their own
-// table via WithEventsTable (fenced ops then require the native schema).
+// Host apps mount it into their migrate chain. WithEventsTable supports only
+// the documented lease-less host table shape; fenced runs require a canonical
+// host-store adapter or the native schema below.
 const Migration = `
 CREATE TABLE IF NOT EXISTS agentkit_sessions (
     session_id text PRIMARY KEY,

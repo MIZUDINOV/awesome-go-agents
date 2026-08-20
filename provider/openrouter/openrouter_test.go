@@ -107,7 +107,7 @@ func TestDecodeNonStreamingToolCallsPreservesWireOrder(t *testing.T) {
 	if err := decodeNonStreaming(context.Background(), strings.NewReader(body), acc); err != nil {
 		t.Fatalf("decodeNonStreaming: %v", err)
 	}
-	response, err := acc.response(context.Background(), nil, 0, nil)
+	response, err := acc.response(context.Background(), nil, 0)
 	if err != nil {
 		t.Fatalf("response: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestStreamingToolCallsPreserveSparseIndexes(t *testing.T) {
 	if err := acc.addChunk(context.Background(), chunk, nil, false); err != nil {
 		t.Fatalf("addChunk: %v", err)
 	}
-	response, err := acc.response(context.Background(), nil, 0, nil)
+	response, err := acc.response(context.Background(), nil, 0)
 	if err != nil {
 		t.Fatalf("response: %v", err)
 	}

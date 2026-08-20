@@ -66,6 +66,10 @@ type capabilityChat interface {
 	Capabilities(context.Context, string) (llm.Capabilities, error)
 }
 
+type requestSnapshotChat interface {
+	RequestSnapshot(*llm.Request) (json.RawMessage, error)
+}
+
 // Store is the durable single-writer seam the loop persists to.
 type Store interface {
 	session.FencedStore
@@ -164,8 +168,9 @@ type Loop struct {
 	Chat      Chat
 	Config    Config
 
-	mu     sync.Mutex
-	events []session.Event
+	mu            sync.Mutex
+	events        []session.Event
+	agentAttached bool
 }
 
 // NewLoop builds a Loop. cfg is normalized with reference defaults.
@@ -226,7 +231,13 @@ func (l *Loop) Subscribe(ctx context.Context, after uint64, filter EventFilter) 
 	}
 	hub := l.Config.EventHub
 	l.mu.Unlock()
-	return hub.SubscribeCursor(ctx, after, filter, func() ([]session.Event, error) {
+	sessionFilter := func(event session.Event) bool {
+		if event.SessionID != l.SessionID {
+			return false
+		}
+		return filter == nil || filter(event)
+	}
+	return hub.SubscribeCursor(ctx, after, sessionFilter, func() ([]session.Event, error) {
 		replay, err := l.Store.Load(ctx, l.SessionID, after, 0)
 		if err != nil {
 			return nil, fmt.Errorf("agent: load event subscription replay: %w", err)
@@ -382,7 +393,7 @@ func (l *Loop) ResumeApprovedTool(ctx context.Context, request tools.ApprovalReq
 		l.finish(&Result{}, "tool_concluded")
 		return nil
 	}
-	_, runErr := l.runTurnSteps(resumeCtx, lease, stopHeartbeat, em, turnID, &Result{}, nextStepIndex(stepID))
+	_, runErr := l.runTurnSteps(resumeCtx, lease, stopHeartbeat, em, turnID, &Result{}, nextStepIndex(stepID), nil)
 	return runErr
 }
 
@@ -468,21 +479,11 @@ func (l *Loop) RunInputWithID(ctx context.Context, inputType session.EventType, 
 	if err := l.append(loopCtx, lease, requestContext); err != nil {
 		return nil, err
 	}
-	userEventID := em.id()
-	if inputID != "" {
-		userEventID = inputID + ":input"
-	}
-	userEv := session.Event{
-		ID: userEventID, SessionID: l.SessionID, RunID: runID, TurnID: turnID, Type: inputType,
-		Data: session.UserTextWithInbox(input, inputID),
-	}
-	if err := l.append(loopCtx, lease, userEv); err != nil {
-		return nil, err
-	}
-	return l.runTurnSteps(loopCtx, lease, stopHeartbeat, em, turnID, &Result{Input: input}, 0)
+	initialInput := &StepInput{ID: inputID, Type: inputType, Text: input}
+	return l.runTurnSteps(loopCtx, lease, stopHeartbeat, em, turnID, &Result{Input: input}, 0, initialInput)
 }
 
-func (l *Loop) runTurnSteps(ctx context.Context, lease session.Lease, stopHeartbeat func() error, em *emitter, turnID string, result *Result, startStep int) (*Result, error) {
+func (l *Loop) runTurnSteps(ctx context.Context, lease session.Lease, stopHeartbeat func() error, em *emitter, turnID string, result *Result, startStep int, initialInput *StepInput) (*Result, error) {
 	cfg := l.Config
 	if startStep < 0 {
 		startStep = 0
@@ -502,33 +503,28 @@ func (l *Loop) runTurnSteps(ctx context.Context, lease session.Lease, stopHeartb
 			l.finish(result, "interrupted")
 			return result, ErrStopped
 		}
+		var inputs []StepInput
 		if cfg.NextStep != nil {
-			inputs := cfg.NextStep()
-			if err := l.appendStepInputs(ctx, lease, em, turnID, step, inputs); err != nil {
-				if cfg.RequeueStep != nil && len(inputs) > 0 {
-					cfg.RequeueStep(inputs)
-				}
-				return nil, err
-			}
+			inputs = cfg.NextStep()
 		}
-
-		over, err := l.preflight(ctx, lease, &compacted)
-		if err != nil {
-			_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "error")
-			return nil, err
-		}
-		if over {
-			_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "context_overflow")
-			return nil, ErrContextOverflow
-		}
-
 		stepAttempt := 0
-		done, reason, err := l.step(ctx, lease, em, turnID, step, stepAttempt, &toolCallCount, &totalTokens)
-		if err != nil {
+		var done bool
+		var reason string
+		var err error
+		for {
+			done, reason, err = l.step(ctx, lease, em, turnID, step, stepAttempt, initialInput, inputs, &compacted, &toolCallCount, &totalTokens)
+			initialInput = nil
+			if err == nil {
+				break
+			}
 			if ctx.Err() != nil {
 				if heartbeatErr := stopHeartbeat(); heartbeatErr != nil {
 					return nil, ErrLeaseLost
 				}
+			}
+			if errors.Is(err, ErrContextOverflow) {
+				_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "context_overflow")
+				return nil, ErrContextOverflow
 			}
 			if isOverflow(err) {
 				if overflowRetries >= cfg.MaxContextRetries {
@@ -550,15 +546,7 @@ func (l *Loop) runTurnSteps(ctx context.Context, lease session.Lease, stopHeartb
 				if compactErr == nil && ctx.Err() == nil {
 					compacted++
 					stepAttempt++
-					done, reason, err = l.step(ctx, lease, em, turnID, step, stepAttempt, &toolCallCount, &totalTokens)
-					if err != nil {
-						if isOverflow(err) {
-							_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "context_overflow")
-							return nil, ErrContextOverflow
-						}
-						_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "error")
-						return nil, err
-					}
+					continue
 				} else {
 					_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "context_overflow")
 					return nil, ErrContextOverflow
@@ -675,7 +663,7 @@ func (l *Loop) resolvedSystemPrompt() (string, error) {
 
 // step runs ONE model call plus its ordered scheduled tool executions. Returns
 // done=true when the assistant produced no further tool calls.
-func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnID string, step, attempt int, toolCallCount *int, totalTokens *int64) (done bool, reason string, err error) {
+func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnID string, step, attempt int, initialInput *StepInput, inputs []StepInput, compacted *int, toolCallCount *int, totalTokens *int64) (done bool, reason string, err error) {
 	cfg := l.Config
 	systemPrompt, guidanceErr := l.resolvedSystemPrompt()
 	if guidanceErr != nil {
@@ -692,11 +680,24 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 			_ = l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventStepEnd, Data: strJSON("error")})
 		}
 	}()
-
-	// Project the durable history into model messages.
-	msgs, _, err := l.project(ctx)
-	if err != nil {
-		return false, "", err
+	if attempt == 0 {
+		if initialInput != nil {
+			inputID := em.id()
+			if initialInput.ID != "" {
+				inputID = initialInput.ID + ":input"
+			}
+			if err := l.append(ctx, lease, session.Event{ID: inputID, SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: initialInput.Type, Data: session.UserTextWithInbox(initialInput.Text, initialInput.ID)}); err != nil {
+				return false, "", err
+			}
+		}
+		if len(inputs) > 0 {
+			if err := l.appendStepInputs(ctx, lease, em, turnID, step, inputs); err != nil {
+				if l.Config.RequeueStep != nil {
+					l.Config.RequeueStep(inputs)
+				}
+				return false, "", err
+			}
+		}
 	}
 
 	var resolvedCapabilities *llm.Capabilities
@@ -707,6 +708,20 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 		}
 		resolvedCapabilities = &capabilities
 	}
+	over, preflightErr := l.preflight(ctx, lease, compacted, resolvedCapabilities)
+	if preflightErr != nil {
+		return false, "", preflightErr
+	}
+	if over {
+		return false, "", ErrContextOverflow
+	}
+
+	// Project the durable history into model messages.
+	msgs, _, err := l.project(ctx)
+	if err != nil {
+		return false, "", err
+	}
+
 	var reqValue llm.Request
 	if cfg.ContextBuilder != nil {
 		snapshot, buildErr := cfg.ContextBuilder.Build(memctx.BuildInput{Model: cfg.Model, System: []memctx.Section{{Title: "system", Content: systemPrompt}}, Instructions: cfg.Instructions, ToolGuidance: cfg.ToolGuidance, Runtime: cfg.RuntimeContext, Workspace: cfg.WorkspaceContext, Tools: l.Tools.ModelTools(), Messages: msgs, MaxTokens: cfg.MaxTokens, Config: cfg.ProviderConfig, Stream: cfg.Stream, Capabilities: resolvedCapabilities, ParallelTools: true})
@@ -849,13 +864,17 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 		}
 	}
 
-	calls := resp.Message.ToolCalls()
 	if len(streamedMedia) == 0 {
 		for _, part := range resp.Message.Parts {
 			if part.Type == llm.PartMedia && part.Media != nil {
 				streamedMedia = append(streamedMedia, session.MediaBlock{MediaType: part.Media.MediaType, URL: part.Media.URL, Data: base64.StdEncoding.EncodeToString(part.Media.Data)})
 			}
 		}
+	}
+	finalParts := chooseStreamParts(resp.Message.Parts, streamedParts)
+	finalParts, calls, err := normalizeToolCallParts(finalParts, em)
+	if err != nil {
+		return false, "", err
 	}
 	if cfg.MaxToolCalls > 0 && *toolCallCount+len(calls) > cfg.MaxToolCalls {
 		return false, "", ErrToolLimit
@@ -874,7 +893,6 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 
 	if len(calls) == 0 {
 		// Final assistant reply; no further tools -> turn completes.
-		finalParts := chooseStreamParts(resp.Message.Parts, streamedParts)
 		ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID,
 			Type: session.EventAssistantMessage, Data: session.AssistantContentFromPartsWithMetadata(finalParts, resp.Message.Metadata, false)}
 		end := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventStepEnd, Data: strJSON("end")}
@@ -888,7 +906,6 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 	// Persist the assistant message WITH its tool calls durably (the calls
 	// must survive a crash so Recover can mark unknown outcomes rather than
 	// re-execute).
-	finalParts := chooseStreamParts(resp.Message.Parts, streamedParts)
 	asst := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID,
 		Type: session.EventAssistantMessage, Data: session.AssistantContentFromPartsWithMetadata(finalParts, resp.Message.Metadata, false)}
 	if err := l.append(ctx, lease, asst); err != nil {
@@ -969,6 +986,12 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 
 func (l *Loop) appendToolOutcome(ctx context.Context, lease session.Lease, em *emitter, outcome tools.Outcome, turnID, stepID string) (bool, error) {
 	if outcome.Err != nil {
+		if outcome.Result != nil {
+			if err := l.appendToolFailureResult(ctx, lease, em, outcome.Result, outcome.Err, turnID, stepID); err != nil {
+				return false, err
+			}
+			return false, nil
+		}
 		if err := l.appendToolResultErr(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, outcome.Err, turnID, stepID); err != nil {
 			return false, err
 		}
@@ -1005,6 +1028,35 @@ func (l *Loop) appendToolOutcome(ctx context.Context, lease session.Lease, em *e
 	return outcome.Result.ConcludesTurn, nil
 }
 
+func (l *Loop) appendToolFailureResult(ctx context.Context, lease session.Lease, em *emitter, result *tools.Result, fallback error, turnID, stepID string) error {
+	code, recovery := toolFailure(fallback)
+	if result.Code != "" {
+		code = result.Code
+	}
+	if result.Failure != nil && result.Failure.Message != "" {
+		recovery = result.Failure.Message
+	}
+	modelFacing := result.ModelFacing
+	if modelFacing == nil {
+		modelFacing = map[string]any{"error": map[string]any{"code": code, "message": recovery}}
+	}
+	output, err := json.Marshal(modelFacing)
+	if err != nil {
+		return fmt.Errorf("encode tool failure output: %w", err)
+	}
+	content := output
+	if len(result.Content) > 0 {
+		content, err = json.Marshal(result.Content)
+		if err != nil {
+			return fmt.Errorf("encode tool failure content: %w", err)
+		}
+	}
+	data := session.ToolResultStructuredPayloadWithOutput(result.CallID, result.Name, output, content, result.UI, code, true, result.Content, result.AdditionalContexts, false)
+	ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: result.CallID,
+		Type: session.EventToolResult, Data: data, SourceSeqs: l.assistantSourceSeqs(result.CallID, turnID, stepID)}
+	return l.append(ctx, lease, ev)
+}
+
 func validateToolOutcomes(calls []tools.Call, outcomes []tools.Outcome) error {
 	if len(outcomes) != len(calls) {
 		return fmt.Errorf("agent: tool runtime returned %d outcomes for %d calls", len(outcomes), len(calls))
@@ -1015,14 +1067,6 @@ func validateToolOutcomes(calls []tools.Call, outcomes []tools.Outcome) error {
 		}
 	}
 	return nil
-}
-
-func toDurableCalls(calls []llm.ToolCallRequest) []session.ToolCall {
-	out := make([]session.ToolCall, 0, len(calls))
-	for _, c := range calls {
-		out = append(out, session.ToolCall{CallID: c.CallID, Name: c.Name, Arguments: c.Arguments})
-	}
-	return out
 }
 
 func (l *Loop) appendToolResult(ctx context.Context, lease session.Lease, em *emitter, callID, name string, output, content json.RawMessage, meta map[string]any, code string, blocks []session.ContentBlock, contexts []llm.Message, concludesTurn bool, turnID, stepID string) error {
@@ -1195,7 +1239,14 @@ func (l *Loop) appendRequestHeader(ctx context.Context, lease session.Lease, em 
 		return fmt.Errorf("encode request header: %w", err)
 	}
 	configHash := fmt.Sprintf("%x", sha256.Sum256(req.Config))
-	requestHash := fmt.Sprintf("%x", sha256.Sum256(requestBytes))
+	requestSnapshot := requestBytes
+	if snapshotter, ok := l.Chat.(requestSnapshotChat); ok {
+		requestSnapshot, err = snapshotter.RequestSnapshot(req)
+		if err != nil {
+			return fmt.Errorf("resolve provider request snapshot: %w", err)
+		}
+	}
+	requestHash := fmt.Sprintf("%x", sha256.Sum256(requestSnapshot))
 	systemSections := make([]string, 0, len(req.System))
 	for _, message := range req.System {
 		for _, part := range message.Parts {
@@ -1204,7 +1255,6 @@ func (l *Loop) appendRequestHeader(ctx context.Context, lease session.Lease, em 
 			}
 		}
 	}
-	requestSnapshot := requestBytes
 	if req.Capabilities != nil {
 		data := session.RequestHeaderPayloadWithSnapshot(req.Model, l.Chat.Name(), systemSections, toolSchemas, configHash, requestHash, []llm.Capabilities{*req.Capabilities}, requestSnapshot)
 		return l.append(ctx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventRequestHeader, Data: data})
@@ -1232,7 +1282,7 @@ func (l *Loop) appendTurnEnd(ctx context.Context, lease session.Lease, em *emitt
 
 // preflight measures pressure; if over threshold it prunes or compacts so the
 // surface advances. Returns true when still over capacity after the attempt.
-func (l *Loop) preflight(ctx context.Context, lease session.Lease, compacted *int) (bool, error) {
+func (l *Loop) preflight(ctx context.Context, lease session.Lease, compacted *int, capabilities *llm.Capabilities) (bool, error) {
 	cfg := l.Config
 	msgs, _, err := l.project(ctx)
 	if err != nil {
@@ -1242,22 +1292,37 @@ func (l *Loop) preflight(ctx context.Context, lease session.Lease, compacted *in
 	if promptErr != nil {
 		return false, promptErr
 	}
-	if l.Config.ContextBuilder != nil {
-		var sections strings.Builder
-		sections.WriteString(systemPrompt)
-		for _, group := range [][]memctx.Section{l.Config.Instructions, l.Config.ToolGuidance, l.Config.RuntimeContext, l.Config.WorkspaceContext} {
-			for _, section := range group {
-				sections.WriteString("\n")
-				sections.WriteString(section.Title)
-				sections.WriteString("\n")
-				sections.WriteString(section.Content)
-			}
+	var usage int64
+	if cfg.ContextBuilder != nil {
+		snapshot, buildErr := cfg.ContextBuilder.Build(memctx.BuildInput{
+			Model: cfg.Model, System: []memctx.Section{{Title: "system", Content: systemPrompt}},
+			Instructions: cfg.Instructions, ToolGuidance: cfg.ToolGuidance, Runtime: cfg.RuntimeContext,
+			Workspace: cfg.WorkspaceContext, Tools: l.Tools.ModelTools(), Messages: msgs,
+			MaxTokens: cfg.MaxTokens, Config: cfg.ProviderConfig, Stream: cfg.Stream,
+			Capabilities: capabilities, ParallelTools: true,
+		})
+		if buildErr != nil {
+			return false, buildErr
 		}
-		systemPrompt = sections.String()
+		usage = snapshot.TokenEstimate
+	} else {
+		usage = estimateTokens(msgs) + estimateTokens([]*llm.Message{{Parts: []llm.Part{{Type: llm.PartText, Text: systemPrompt}}}}) + estimateToolTokens(l.Tools.ModelTools())
 	}
-	usage := estimateTokens(msgs) + estimateTokens([]*llm.Message{{Parts: []llm.Part{{Type: llm.PartText, Text: systemPrompt}}}})
-	window := cfg.ContextWindow - cfg.MaxOutput
-	if window <= 0 || usage < int64(float64(cfg.ContextWindow)*cfg.CompactThresholdRatio) {
+	contextWindow, maxOutput := cfg.ContextWindow, cfg.MaxOutput
+	if capabilities != nil {
+		if capabilities.ContextWindow > 0 {
+			contextWindow = capabilities.ContextWindow
+		}
+		if capabilities.MaxOutput > 0 {
+			maxOutput = capabilities.MaxOutput
+		}
+	}
+	window := contextWindow - maxOutput
+	threshold := int64(float64(window) * cfg.CompactThresholdRatio)
+	if threshold < 1 {
+		threshold = 1
+	}
+	if window <= 0 || usage < threshold {
 		return false, nil
 	}
 
@@ -1481,13 +1546,6 @@ func (l *Loop) cachedLast() uint64 {
 	return l.events[len(l.events)-1].Seq
 }
 
-func (l *Loop) lastSeq(events []session.Event) uint64 {
-	if len(events) == 0 {
-		return 0
-	}
-	return events[len(events)-1].Seq
-}
-
 func (l *Loop) nextGeneration(ctx context.Context) uint64 {
 	_, proj, err := l.project(ctx)
 	if err == nil && proj != nil {
@@ -1566,6 +1624,14 @@ func estimateTokens(msgs []*llm.Message) int64 {
 	return total
 }
 
+func estimateToolTokens(tools []*llm.ToolDefinition) int64 {
+	encoded, err := json.Marshal(tools)
+	if err != nil {
+		return 0
+	}
+	return int64((len(encoded) + 3) / 4)
+}
+
 func chooseStreamParts(response, streamed []llm.Part) []llm.Part {
 	if len(streamed) == 0 {
 		return response
@@ -1579,6 +1645,31 @@ func chooseStreamParts(response, streamed []llm.Part) []llm.Part {
 		}
 	}
 	return streamed
+}
+
+func normalizeToolCallParts(parts []llm.Part, em *emitter) ([]llm.Part, []llm.ToolCallRequest, error) {
+	normalized := make([]llm.Part, len(parts))
+	copy(normalized, parts)
+	calls := make([]llm.ToolCallRequest, 0)
+	seen := make(map[string]struct{})
+	for index := range normalized {
+		part := normalized[index]
+		if part.Type != llm.PartToolCall || part.ToolCall == nil {
+			continue
+		}
+		call := *part.ToolCall
+		if call.CallID == "" {
+			call.CallID = em.id()
+		}
+		if _, exists := seen[call.CallID]; exists {
+			return nil, nil, fmt.Errorf("agent: provider returned duplicate tool call id %q", call.CallID)
+		}
+		seen[call.CallID] = struct{}{}
+		call.Arguments = append(json.RawMessage(nil), part.ToolCall.Arguments...)
+		normalized[index].ToolCall = &call
+		calls = append(calls, call)
+	}
+	return normalized, calls, nil
 }
 
 func shadowedSeqsRetainingTail(events []session.Event, retain int) []uint64 {

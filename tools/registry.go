@@ -21,10 +21,13 @@ var ErrCodeModeUnavailable = fmt.Errorf("code mode requires an injected code run
 // (H-TOOLS-005).
 var toolNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
-// Hook is a pipeline extension point invoked before/after execution. Hooks are
-// snapshotted at dispatch time, so a hook slice can be mutated concurrently
-// without racing the running pipeline.
+// Hook is a pre-execution pipeline extension point. Hooks are snapshotted at
+// dispatch time, so a hook slice can be mutated concurrently without racing a
+// running pipeline.
 type Hook func(ctx context.Context, name string, input json.RawMessage) error
+
+// PostHook observes and may enrich the completed execution outcome.
+type PostHook func(context.Context, Execution, *Result) error
 type Observer func(context.Context, *Result)
 
 // Options configures a Registry.
@@ -47,7 +50,7 @@ type Registry struct {
 	mu              sync.RWMutex
 	definitions     map[string]*Definition
 	preExecute      []Hook
-	postExecute     []Hook
+	postExecute     []PostHook
 	defaultTimeout  time.Duration
 	sem             chan struct{}
 	sandbox         integration.Sandbox
@@ -68,7 +71,7 @@ func New(opts Options) *Registry {
 	if opts.DefaultTimeout <= 0 {
 		opts.DefaultTimeout = 5 * time.Minute
 	}
-	if opts.MaxParallel <= 0 {
+	if opts.MaxParallel < 0 {
 		opts.MaxParallel = 10
 	}
 	r := &Registry{
@@ -88,7 +91,9 @@ func New(opts Options) *Registry {
 	if r.codeLanguage == "" {
 		r.codeLanguage = "go"
 	}
-	r.sem = make(chan struct{}, opts.MaxParallel)
+	if opts.MaxParallel > 0 {
+		r.sem = make(chan struct{}, opts.MaxParallel)
+	}
 	return r
 }
 
@@ -233,7 +238,7 @@ func runBatchPool(limit, size int, run func(int)) {
 	if size == 0 {
 		return
 	}
-	if limit > size {
+	if limit <= 0 || limit > size {
 		limit = size
 	}
 	jobs := make(chan int)
@@ -273,11 +278,17 @@ func (r *Registry) Register(def *Definition) error {
 	if err := ValidateSchema(def.InputSchema); err != nil {
 		return fmt.Errorf("%w: tool %q input schema: %v", ErrInvalidArguments, def.Name, err)
 	}
+	if len(def.typedInputSchema) > 0 && !schemasEquivalent(def.InputSchema, def.typedInputSchema) {
+		return fmt.Errorf("%w: tool %q input schema does not match its typed input contract", ErrInvalidArguments, def.Name)
+	}
 	if schemaAbsent(def.OutputSchema) {
 		return fmt.Errorf("%w: tool %q output schema is required", ErrInvalidArguments, def.Name)
 	}
 	if err := ValidateSchema(def.OutputSchema); err != nil {
 		return fmt.Errorf("%w: tool %q output schema: %v", ErrInvalidArguments, def.Name, err)
+	}
+	if len(def.typedOutputSchema) > 0 && !schemasEquivalent(def.OutputSchema, def.typedOutputSchema) {
+		return fmt.Errorf("%w: tool %q output schema does not match its typed output contract", ErrInvalidArguments, def.Name)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -326,17 +337,17 @@ func (r *Registry) AddPreExecute(hook Hook) {
 	defer r.mu.Unlock()
 	r.preExecute = append(r.preExecute, hook)
 }
-func (r *Registry) AddPostExecute(hook Hook) {
+func (r *Registry) AddPostExecute(hook PostHook) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.postExecute = append(r.postExecute, hook)
 }
 
-func (r *Registry) snapshotHooks() (pre, post []Hook) {
+func (r *Registry) snapshotHooks() (pre []Hook, post []PostHook) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	pre = append([]Hook(nil), r.preExecute...)
-	post = append([]Hook(nil), r.postExecute...)
+	post = append([]PostHook(nil), r.postExecute...)
 	return pre, post
 }
 
@@ -572,10 +583,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 				retErr = fmt.Errorf("finalize tool content: %w", finalizeErr)
 				result.Kind = OutcomeFailure
 				result.Canonical = nil
-				result.ModelFacing = nil
-				result.UI = nil
 				result.Meta = nil
-				result.Content = nil
 				result.AdditionalContexts = nil
 				result.ConcludesTurn = false
 				result.Code = "FINALIZE_FAILED"
@@ -623,6 +631,12 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 	}()
 	preHooks, postHooks := r.snapshotHooks()
 	policies, guards, postPolicies := r.snapshotPolicies()
+	dispatchStarted := false
+	defer func() {
+		if !dispatchStarted && retErr != nil && (errors.Is(retErr, context.Canceled) || errors.Is(retErr, context.DeadlineExceeded)) {
+			retErr = fmt.Errorf("%w: %v", ErrAbortedBeforeDispatch, retErr)
+		}
+	}()
 
 	// Freeze arguments: never hand callers' mutable backing array to the
 	// executor or the model.
@@ -643,6 +657,16 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 		return nil, err
 	}
 	execution := Execution{SessionID: ec.SessionID, RunID: ec.RunID, TurnID: ec.TurnID, StepID: ec.StepID, CallID: callID, Name: name, Arguments: append(json.RawMessage(nil), args...), Mutates: def.MutatesWorkspace}
+	failAfterExecution := func(execErr error) (*Result, error) {
+		code := toolErrorCode(execErr)
+		result = &Result{Name: name, CallID: callID, Kind: OutcomeFailure, Code: code, Failure: &Failure{Code: code, Message: failureMessage(execErr)}}
+		for _, hook := range postHooks {
+			if hookErr := hook(ctx, execution, result); hookErr != nil {
+				return result, fmt.Errorf("tool post-execute: %w", hookErr)
+			}
+		}
+		return result, execErr
+	}
 	for _, policy := range policies {
 		decision, reason, err := policy(ctx, execution)
 		if err != nil {
@@ -696,6 +720,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			return nil, err
 		}
 	}
+	dispatchStarted = true
 	if ec.OnDispatch != nil {
 		if err := ec.OnDispatch(ctx, name, callID); err != nil {
 			return nil, err
@@ -705,30 +730,24 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 	canonical, err := def.Execute(ctx, ec, args)
 	if err != nil {
 		if pipelineCtx.Err() == context.DeadlineExceeded && parentCtx.Err() == nil {
-			return nil, ErrToolTimeout
+			return failAfterExecution(ErrToolTimeout)
 		}
-		return nil, err
+		return failAfterExecution(err)
 	}
 	if pipelineCtx.Err() == context.DeadlineExceeded && parentCtx.Err() == nil {
-		return nil, ErrToolTimeout
+		return failAfterExecution(ErrToolTimeout)
 	}
 
 	// Output validation before rendering/persistence (H-TOOLS-007).
 	if err := validateCanonicalOutput(def, canonical); err != nil {
-		return nil, err
-	}
-
-	for _, hook := range postHooks {
-		if err := hook(ctx, name, args); err != nil {
-			return nil, err
-		}
+		return failAfterExecution(err)
 	}
 
 	result = &Result{Name: name, CallID: callID, Kind: OutcomeSuccess, Canonical: canonical, ModelFacing: canonical}
 	if def.RenderModel != nil {
 		modelFacing, err := def.RenderModel(canonical)
 		if err != nil {
-			return nil, err
+			return failAfterExecution(err)
 		}
 		result.ModelFacing = modelFacing
 	}
@@ -736,10 +755,15 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 	if def.PresentUI != nil {
 		ui, err := def.PresentUI(canonical)
 		if err != nil {
-			return nil, err
+			return failAfterExecution(err)
 		}
 		result.UI = ui
 		result.Meta = ui
+	}
+	for _, hook := range postHooks {
+		if err := hook(ctx, execution, result); err != nil {
+			return result, fmt.Errorf("tool post-execute: %w", err)
+		}
 	}
 	for _, policy := range postPolicies {
 		decision, replacement, reason, err := policy(ctx, execution, result)
@@ -849,6 +873,8 @@ func cloneDefinition(def *Definition) *Definition {
 	clone := *def
 	clone.InputSchema = canonicalSchema(def.InputSchema)
 	clone.OutputSchema = canonicalSchema(def.OutputSchema)
+	clone.typedInputSchema = canonicalSchema(def.typedInputSchema)
+	clone.typedOutputSchema = canonicalSchema(def.typedOutputSchema)
 	if len(clone.InputSchema) == 0 {
 		clone.InputSchema = json.RawMessage(`{"type":"object","additionalProperties":false}`)
 	}
@@ -856,6 +882,10 @@ func cloneDefinition(def *Definition) *Definition {
 		clone.OutputSchema = json.RawMessage(`{}`)
 	}
 	return &clone
+}
+
+func schemasEquivalent(left, right json.RawMessage) bool {
+	return string(canonicalSchema(left)) == string(canonicalSchema(right))
 }
 
 func canonicalSchema(raw json.RawMessage) json.RawMessage {

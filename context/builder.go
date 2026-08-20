@@ -9,6 +9,12 @@ import (
 	"github.com/MIZUDINOV/awesome-go-agents/llm"
 )
 
+// Section is one ordered block of provider-facing context.
+type Section struct {
+	Title   string
+	Content string
+}
+
 // BuildInput is the immutable input set for one provider request. Category
 // order is fixed by Builder: system, instructions, tool guidance, runtime and
 // workspace, followed by derived history supplied in Messages.

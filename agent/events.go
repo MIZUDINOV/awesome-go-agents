@@ -66,9 +66,10 @@ const (
 )
 
 type NotificationSubscription struct {
-	hub  *EventHub
-	ch   chan Notification
-	done chan struct{}
+	hub       *EventHub
+	ch        chan Notification
+	done      chan struct{}
+	sessionID string
 }
 
 func (s *NotificationSubscription) Next(ctx context.Context) (Notification, error) {
@@ -113,9 +114,20 @@ func NewEventHub(buffer int) *EventHub {
 }
 
 func (h *EventHub) SubscribeNotifications(ctx context.Context) *NotificationSubscription {
+	return h.subscribeNotifications(ctx, "")
+}
+
+// SubscribeNotificationsFor limits a notification subscription to one
+// durable session. It is the session-safe form used by Agent handles when an
+// EventHub is shared by multiple loops.
+func (h *EventHub) SubscribeNotificationsFor(ctx context.Context, sessionID string) *NotificationSubscription {
+	return h.subscribeNotifications(ctx, sessionID)
+}
+
+func (h *EventHub) subscribeNotifications(ctx context.Context, sessionID string) *NotificationSubscription {
 	h.mu.Lock()
 	ch := make(chan Notification, h.limit)
-	sub := &NotificationSubscription{hub: h, ch: ch, done: make(chan struct{})}
+	sub := &NotificationSubscription{hub: h, ch: ch, done: make(chan struct{}), sessionID: sessionID}
 	h.notificationSubs[sub] = struct{}{}
 	h.mu.Unlock()
 	if done := ctx.Done(); done != nil {
@@ -144,6 +156,9 @@ func (h *EventHub) PublishNotification(notification Notification) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for sub := range h.notificationSubs {
+		if sub.sessionID != "" && notification.SessionID != sub.sessionID {
+			continue
+		}
 		select {
 		case sub.ch <- Notification{Type: notification.Type, SessionID: notification.SessionID, RunID: notification.RunID, CallID: notification.CallID, Data: append(json.RawMessage(nil), notification.Data...)}:
 		default:

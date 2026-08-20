@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	memctx "github.com/MIZUDINOV/awesome-go-agents/context"
 	"github.com/MIZUDINOV/awesome-go-agents/llm"
 	"github.com/MIZUDINOV/awesome-go-agents/session"
 	"github.com/MIZUDINOV/awesome-go-agents/tools"
@@ -104,12 +105,29 @@ func (s *cleanupLeaseStore) ReleaseLease(ctx context.Context, lease session.Leas
 
 type blockingProvider struct{ started chan struct{} }
 
+type failingProvider struct{ err error }
+
+type capabilityProvider struct {
+	*scriptedProvider
+	caps llm.Capabilities
+}
+
 func (p *blockingProvider) Name() string { return "blocking" }
 
 func (p *blockingProvider) Generate(ctx context.Context, _ *llm.Request, _ llm.StreamCallback) (*llm.Response, error) {
 	close(p.started)
 	<-ctx.Done()
 	return nil, ctx.Err()
+}
+
+func (p *failingProvider) Name() string { return "failing" }
+
+func (p *failingProvider) Generate(context.Context, *llm.Request, llm.StreamCallback) (*llm.Response, error) {
+	return nil, p.err
+}
+
+func (p *capabilityProvider) Capabilities(context.Context, string) (llm.Capabilities, error) {
+	return p.caps, nil
 }
 
 func (s *cancelOnAdmittedStore) AppendFencedCommitted(ctx context.Context, lease session.Lease, events []session.Event) (session.CommittedBatch, error) {
@@ -175,6 +193,194 @@ func TestEventHubReplayLiveHandoffAndLag(t *testing.T) {
 	}
 }
 
+func TestSharedEventHubIsSessionScoped(t *testing.T) {
+	hub := NewEventHub(8)
+	store := session.NewMemoryStore()
+	chat := &scriptedProvider{steps: []scriptedStep{{text: "done"}}}
+	loop := NewLoop("session-a", store, tools.New(tools.Options{}), chat, Config{EventHub: hub})
+	sub, err := loop.Subscribe(context.Background(), 0, nil)
+	check(t, err)
+	defer sub.Close()
+	hub.Publish(session.Event{ID: "other", SessionID: "session-b", Seq: 1, Type: session.EventUserMessage, Data: session.UserText("other")})
+	hub.Publish(session.Event{ID: "empty", Seq: 1, Type: session.EventUserMessage, Data: session.UserText("empty")})
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := sub.Next(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("cross-session event error=%v", err)
+	}
+	hub.Publish(session.Event{ID: "own", SessionID: "session-a", Seq: 2, Type: session.EventUserMessage, Data: session.UserText("own")})
+	event, err := sub.Next(context.Background())
+	check(t, err)
+	if event.ID != "own" {
+		t.Fatalf("event=%+v", event)
+	}
+
+	notifications := hub.SubscribeNotificationsFor(context.Background(), "session-a")
+	defer notifications.Close()
+	hub.PublishNotification(Notification{Type: "other", SessionID: "session-b"})
+	hub.PublishNotification(Notification{Type: "empty"})
+	hub.PublishNotification(Notification{Type: "own", SessionID: "session-a"})
+	notification, err := notifications.Next(context.Background())
+	check(t, err)
+	if notification.Type != "own" {
+		t.Fatalf("notification=%+v", notification)
+	}
+}
+
+func TestToolCallIDIsNormalizedBeforeAssistantMessage(t *testing.T) {
+	store := newMemoryStore()
+	registry := tools.New(tools.Options{})
+	registry.MustRegister(&tools.Definition{
+		Name: "probe", InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
+		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) { return "ok", nil },
+	})
+	chat := &scriptedProvider{steps: []scriptedStep{
+		{calls: []llm.ToolCallRequest{{Name: "probe", Arguments: json.RawMessage(`{}`)}}},
+		{text: "done"},
+	}}
+	loop := NewLoop("stable-call-id", store, registry, chat, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
+	if _, err := loop.Run(context.Background(), "run"); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Load(context.Background(), "stable-call-id", 0, 0)
+	check(t, err)
+	var assistantID, callID string
+	var assistantSeq, userSeq, stepSeq uint64
+	for _, event := range events {
+		switch event.Type {
+		case session.EventUserMessage:
+			if userSeq == 0 {
+				userSeq = event.Seq
+			}
+		case session.EventStepStart:
+			if stepSeq == 0 {
+				stepSeq = event.Seq
+			}
+		case session.EventAssistantMessage:
+			if assistantID != "" {
+				continue
+			}
+			var payload struct {
+				ToolCalls []session.ToolCall `json:"tool_calls"`
+			}
+			if json.Unmarshal(event.Data, &payload) == nil && len(payload.ToolCalls) == 1 {
+				assistantID = payload.ToolCalls[0].CallID
+				assistantSeq = event.Seq
+			}
+		case session.EventToolCall:
+			if callID == "" {
+				callID = event.CallID
+			}
+		}
+	}
+	if assistantID == "" || assistantID != callID {
+		t.Fatalf("assistant id=%q call id=%q", assistantID, callID)
+	}
+	if userSeq == 0 || stepSeq == 0 || userSeq <= stepSeq {
+		t.Fatalf("event order user=%d step=%d", userSeq, stepSeq)
+	}
+	if assistantSeq == 0 {
+		t.Fatal("missing assistant message")
+	}
+	chat.mu.Lock()
+	if len(chat.calls) != 2 {
+		t.Fatalf("provider calls=%d", len(chat.calls))
+	}
+	continued := chat.calls[1]
+	chat.mu.Unlock()
+	foundAssistant, foundResult := false, false
+	for _, message := range continued.Messages {
+		if message.Role == llm.RoleAssistant && len(message.ToolCalls()) == 1 && message.ToolCalls()[0].CallID == assistantID {
+			foundAssistant = true
+		}
+		if message.Role == llm.RoleTool && len(message.ToolResults()) == 1 && message.ToolResults()[0].CallID == assistantID {
+			foundResult = true
+		}
+	}
+	if !foundAssistant || !foundResult {
+		t.Fatalf("continuation assistant=%v result=%v", foundAssistant, foundResult)
+	}
+}
+
+func TestPreflightUsesProviderCapabilitiesAndBuilderEstimate(t *testing.T) {
+	chat := &capabilityProvider{
+		scriptedProvider: &scriptedProvider{steps: []scriptedStep{{text: "done"}}},
+		caps:             llm.Capabilities{ContextWindow: 2000, MaxOutput: 100},
+	}
+	loop := NewLoop("provider-capabilities", newMemoryStore(), tools.New(tools.Options{}), chat, Config{
+		Model: "m", Owner: "test", SystemPrompt: "sys", ContextWindow: 100, MaxOutput: 10,
+		ContextBuilder: memctx.NewBuilder(),
+	})
+	if _, err := loop.Run(context.Background(), strings.Repeat("large input ", 100)); err != nil {
+		t.Fatalf("provider capability-aware preflight rejected request: %v", err)
+	}
+}
+
+func TestFinalizerFailurePreservesModelFacingToolResult(t *testing.T) {
+	store := newMemoryStore()
+	registry := tools.New(tools.Options{})
+	registry.MustRegister(&tools.Definition{
+		Name: "finalize_fail", InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
+		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+			return map[string]any{"canonical": true}, nil
+		},
+		FinalizeContent: func(result *tools.Result) error {
+			result.ModelFacing = "partial output"
+			return errors.New("finalizer failed")
+		},
+	})
+	chat := &scriptedProvider{steps: []scriptedStep{
+		{calls: []llm.ToolCallRequest{{CallID: "finalize-1", Name: "finalize_fail", Arguments: json.RawMessage(`{}`)}}},
+		{text: "continued"},
+	}}
+	loop := NewLoop("finalizer-result", store, registry, chat, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
+	if _, err := loop.Run(context.Background(), "run"); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Load(context.Background(), "finalizer-result", 0, 0)
+	check(t, err)
+	var resultData []byte
+	for _, event := range events {
+		if event.Type == session.EventToolResult && event.CallID == "finalize-1" {
+			resultData = event.Data
+		}
+	}
+	if !strings.Contains(string(resultData), "partial output") || !strings.Contains(string(resultData), "FINALIZE_FAILED") {
+		t.Fatalf("durable finalizer result=%s", resultData)
+	}
+}
+
+func TestFailedInboxRunIsRequeued(t *testing.T) {
+	store := newMemoryStore()
+	loop := NewLoop("requeue", store, tools.New(tools.Options{}), &failingProvider{err: errors.New("provider down")}, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
+	handle, err := NewAgent(loop)
+	check(t, err)
+	defer func() { _ = handle.Dispose(context.Background()) }()
+	check(t, handle.FollowUp(context.Background(), "retry me"))
+	deadline := time.Now().Add(time.Second)
+	var events []session.Event
+	for time.Now().Before(deadline) {
+		events, err = store.Load(context.Background(), "requeue", 0, 0)
+		check(t, err)
+		found := false
+		for _, event := range events {
+			found = found || event.Type == session.EventInboxRequeued
+		}
+		if found {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	foundRequeued, foundCompleted := false, false
+	for _, event := range events {
+		foundRequeued = foundRequeued || event.Type == session.EventInboxRequeued
+		foundCompleted = foundCompleted || event.Type == session.EventInboxCompleted
+	}
+	if !foundRequeued || foundCompleted {
+		t.Fatalf("requeued=%v completed=%v events=%d", foundRequeued, foundCompleted, len(events))
+	}
+}
+
 func TestStatefulAgentFollowUpAndDispose(t *testing.T) {
 	store := session.NewMemoryStore()
 	chat := &scriptedProvider{steps: []scriptedStep{{text: "done"}, {text: "done again"}}}
@@ -203,6 +409,16 @@ func TestStatefulAgentFollowUpAndDispose(t *testing.T) {
 	}
 	if handle.Status() != StatusDisposed {
 		t.Fatalf("status=%s", handle.Status())
+	}
+}
+
+func TestLoopRejectsSecondAgentAttachment(t *testing.T) {
+	loop := NewLoop("single-agent", newMemoryStore(), tools.New(tools.Options{}), &scriptedProvider{}, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
+	first, err := NewAgent(loop)
+	check(t, err)
+	defer func() { _ = first.Dispose(context.Background()) }()
+	if _, err := NewAgent(loop); err == nil {
+		t.Fatal("second agent attachment unexpectedly succeeded")
 	}
 }
 
@@ -495,6 +711,50 @@ func TestPendingApprovalResumesAfterAgentRestart(t *testing.T) {
 	}
 	if !foundStepEnd || !foundTurnEnd {
 		t.Fatalf("approval resume lifecycle step_end=%v turn_end=%v", foundStepEnd, foundTurnEnd)
+	}
+}
+
+func TestResumedApprovalHonorsHandleCancel(t *testing.T) {
+	store := newMemoryStore()
+	request := tools.ApprovalRequest{SessionID: "approval-cancel", RunID: "run-old", CallID: "approval-cancel-1", ToolName: "protected", Arguments: json.RawMessage(`{}`), Reason: "test"}
+	requestData, _ := json.Marshal(request)
+	_, err := store.Append(context.Background(), "approval-cancel", []session.Event{
+		{ID: "cancel-turn-start", SessionID: "approval-cancel", RunID: "run-old", TurnID: "turn-cancel", Type: session.EventTurnStart, Data: json.RawMessage(`{"text":"start"}`)},
+		{ID: "cancel-assistant", SessionID: "approval-cancel", RunID: "run-old", TurnID: "turn-cancel", StepID: "turn-cancel-step-00", Type: session.EventAssistantMessage, Data: session.AssistantContent("", "", []session.ToolCall{{CallID: request.CallID, Name: request.ToolName, Arguments: request.Arguments}})},
+		{ID: "cancel-call", SessionID: "approval-cancel", RunID: "run-old", TurnID: "turn-cancel", StepID: "turn-cancel-step-00", CallID: request.CallID, Type: session.EventToolCall, Data: session.ToolCallPayload(request.CallID, request.ToolName, request.Arguments)},
+		{ID: "cancel-admitted", SessionID: "approval-cancel", RunID: "run-old", TurnID: "turn-cancel", StepID: "turn-cancel-step-00", CallID: request.CallID, Type: session.EventToolAdmitted, Data: json.RawMessage(`{"text":"admitted"}`)},
+		{ID: "cancel-requested", SessionID: "approval-cancel", RunID: request.RunID, TurnID: "turn-cancel", StepID: "turn-cancel-step-00", CallID: request.CallID, Type: session.EventApprovalRequested, Data: requestData},
+	})
+	check(t, err)
+	started := make(chan struct{})
+	registry := tools.New(tools.Options{})
+	registry.MustRegister(&tools.Definition{
+		Name: request.ToolName, InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
+		Execute: func(ctx context.Context, _ tools.ExecContext, _ json.RawMessage) (any, error) {
+			close(started)
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+	loop := NewLoop("approval-cancel", store, registry, &scriptedProvider{steps: []scriptedStep{{text: "continued"}}}, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
+	handle, err := NewAgent(loop)
+	check(t, err)
+	defer func() { _ = handle.Dispose(context.Background()) }()
+	resumeDone := make(chan error, 1)
+	go func() { resumeDone <- handle.Approve(context.Background(), request.CallID) }()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("approved tool did not start")
+	}
+	check(t, handle.Cancel(context.Background(), CancelOptions{KeepInbox: true}))
+	select {
+	case err := <-resumeDone:
+		if !errors.Is(err, ErrStopped) {
+			t.Fatalf("resume error=%v, want ErrStopped", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("resumed approval did not stop after cancel")
 	}
 }
 

@@ -47,6 +47,7 @@ const (
 	EventInjectedContext   EventType = "context/injected"
 	EventInboxQueued       EventType = "inbox/queued"
 	EventInboxClaimed      EventType = "inbox/claimed"
+	EventInboxRequeued     EventType = "inbox/requeued"
 	EventInboxCompleted    EventType = "inbox/completed"
 	EventInboxDiscarded    EventType = "inbox/discarded"
 	EventApprovalRequested EventType = "approval/requested"
@@ -81,7 +82,7 @@ var knownTypes = map[EventType]bool{
 	EventStepStart: true, EventStepEnd: true,
 	EventUserMessage: true, EventAssistantChunk: true, EventAssistantMessage: true,
 	EventSteeringMessage: true, EventInjectedContext: true,
-	EventInboxQueued: true, EventInboxClaimed: true, EventInboxCompleted: true, EventInboxDiscarded: true,
+	EventInboxQueued: true, EventInboxClaimed: true, EventInboxRequeued: true, EventInboxCompleted: true, EventInboxDiscarded: true,
 	EventApprovalRequested: true, EventApprovalResolved: true,
 	EventToolCall: true, EventToolResult: true,
 	EventToolAdmitted: true, EventToolDispatched: true, EventToolRunning: true,
@@ -534,9 +535,10 @@ func ToolResultStructuredPayloadWithOutput(callID, name string, output, content 
 	return mustJSON(payload)
 }
 
-// RequestHeaderPayload records the canonical request header: exactly what was
-// sent to the provider for a step after adapter defaults were resolved. It is
-// durable so the exact request can be reconstructed on replay (H-REQUEST-001).
+// RequestHeaderPayload records the request header and an optional provider
+// snapshot. Adapters that expose their resolved wire payload populate the
+// snapshot; otherwise it remains the provider-neutral request. It is durable
+// so the request context used by a step can be reconstructed on replay.
 func RequestHeaderPayload(model, provider string, system []string, tools []string, configHash, requestHash string, capabilities ...llm.Capabilities) json.RawMessage {
 	return requestHeaderPayload(model, provider, system, tools, configHash, requestHash, capabilities, nil)
 }

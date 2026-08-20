@@ -41,9 +41,3 @@ func (m *Meter) EstimateBytes(data []byte) int64 {
 	}
 	return m.Estimate(string(data))
 }
-
-// DefaultCompactionRatios are the DSH-style trigger/target fractions.
-const (
-	DefaultThresholdRatio = 0.80 // compact at ~80% of context window
-	DefaultTargetRatio    = 0.50 // aim to free ~50% of window
-)

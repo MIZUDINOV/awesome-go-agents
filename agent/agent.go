@@ -145,28 +145,46 @@ func NewAgent(loop *Loop) (*Handle, error) {
 	if loop == nil || loop.Store == nil || loop.Tools == nil || loop.Chat == nil {
 		return nil, fmt.Errorf("agent: loop dependencies are required")
 	}
+	loop.mu.Lock()
+	if loop.agentAttached {
+		loop.mu.Unlock()
+		return nil, fmt.Errorf("agent: loop already has an attached agent")
+	}
 	if loop.Config.EventHub == nil {
 		loop.Config.EventHub = NewEventHub(64)
 	}
+	scopedTools := loop.Tools
 	if root, ok := loop.Tools.(*tools.Registry); ok {
-		loop.Tools = root.NewScope()
+		scopedTools = root.NewScope()
+	}
+	loop.agentAttached = true
+	loop.mu.Unlock()
+	releaseAttachment := func() {
+		loop.mu.Lock()
+		loop.agentAttached = false
+		loop.mu.Unlock()
 	}
 	h := &Handle{loop: loop, session: session.NewSession(loop.SessionID, loop.Store), status: StatusIdle, wake: make(chan struct{}, 1), changed: make(chan struct{}, 1), stop: make(chan struct{}), done: make(chan struct{})}
+	if err := h.restoreInbox(context.Background()); err != nil {
+		releaseAttachment()
+		return nil, fmt.Errorf("agent: restore inbox: %w", err)
+	}
+	h.approval = newApprovalBroker(loop.Config.EventHub, loop.Store, loop.SessionID)
+	if err := h.approval.restore(context.Background()); err != nil {
+		releaseAttachment()
+		return nil, fmt.Errorf("agent: restore approvals: %w", err)
+	}
+	loop.mu.Lock()
+	loop.Tools = scopedTools
 	if loop.Config.NextStep == nil {
 		loop.Config.NextStep = h.claimNextStepInputs
 	}
 	if loop.Config.RequeueStep == nil {
 		loop.Config.RequeueStep = h.requeueStepInputs
 	}
-	if err := h.restoreInbox(context.Background()); err != nil {
-		return nil, fmt.Errorf("agent: restore inbox: %w", err)
-	}
-	h.approval = newApprovalBroker(loop.Config.EventHub, loop.Store, loop.SessionID)
-	if err := h.approval.restore(context.Background()); err != nil {
-		return nil, fmt.Errorf("agent: restore approvals: %w", err)
-	}
+	loop.mu.Unlock()
 	h.approval.setResume(h.resumeApprovedTool)
-	if setter, ok := loop.Tools.(interface{ SetApprovalService(tools.ApprovalService) }); ok {
+	if setter, ok := scopedTools.(interface{ SetApprovalService(tools.ApprovalService) }); ok {
 		setter.SetApprovalService(h.approval)
 	}
 	go h.worker()
@@ -405,11 +423,15 @@ func (h *Handle) resumeApprovedTool(ctx context.Context, request tools.ApprovalR
 		return ErrAgentBusy
 	}
 	h.status = StatusRunning
+	runCtx, cancel := context.WithCancel(ctx)
+	h.runCancel = cancel
 	h.signalChanged()
 	h.mu.Unlock()
 	h.emitStatus(StatusRunning)
 	defer func() {
+		cancel()
 		h.mu.Lock()
+		h.runCancel = nil
 		disposed := h.status == StatusDisposed
 		if !disposed {
 			h.status = StatusIdle
@@ -428,7 +450,7 @@ func (h *Handle) resumeApprovedTool(ctx context.Context, request tools.ApprovalR
 			}
 		}
 	}()
-	return h.loop.ResumeApprovedTool(ctx, request, approved)
+	return h.loop.ResumeApprovedTool(runCtx, request, approved)
 }
 
 func (h *Handle) Subscribe(ctx context.Context, after uint64, filter EventFilter) (*Subscription, error) {
@@ -436,7 +458,7 @@ func (h *Handle) Subscribe(ctx context.Context, after uint64, filter EventFilter
 }
 
 func (h *Handle) SubscribeNotifications(ctx context.Context) *NotificationSubscription {
-	return h.loop.Config.EventHub.SubscribeNotifications(ctx)
+	return h.loop.Config.EventHub.SubscribeNotificationsFor(ctx, h.ID())
 }
 
 // Run is the compatibility one-shot API. Stateful callers should use
@@ -527,12 +549,15 @@ func (h *Handle) worker() {
 			}
 			_, runErr := h.loop.RunInputWithID(runCtx, inputType, item.id, item.text)
 			_ = h.session.Refresh(context.Background())
-			if errors.Is(runErr, ErrBusy) {
-				h.mu.Lock()
-				h.inbox = append([]inboxItem{item}, h.inbox...)
-				h.mu.Unlock()
+			if runErr == nil {
+				if completeErr := h.appendInbox(context.Background(), session.EventInboxCompleted, item); completeErr != nil {
+					runErr = completeErr
+					h.requeueAfterRun(item)
+				}
 			} else {
-				_ = h.appendInbox(context.Background(), session.EventInboxCompleted, item)
+				// A failed or cancelled fenced run has not consumed the inbox
+				// command. Keep it durable and in memory for a later retry.
+				h.requeueAfterRun(item)
 			}
 			if runErr != nil && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded) {
 				h.loop.Config.EventHub.PublishNotification(Notification{
@@ -553,6 +578,11 @@ func (h *Handle) worker() {
 			if !disposed {
 				h.emitStatus(StatusIdle)
 			}
+			if runErr != nil {
+				// Leave the failed command pending without entering a hot
+				// retry loop. A later wake or a restarted handle can retry it.
+				break
+			}
 		}
 	}
 }
@@ -567,11 +597,26 @@ func (h *Handle) nextWakeableIndexLocked() int {
 }
 
 func (h *Handle) appendInbox(ctx context.Context, typ session.EventType, item inboxItem) error {
+	return h.appendInboxEvent(ctx, typ, item, item.id+":"+string(typ))
+}
+
+func (h *Handle) appendInboxEvent(ctx context.Context, typ session.EventType, item inboxItem, eventID string) error {
 	data := session.InboxPayloadJSON(item.id, inboxKindName(item.kind), item.text)
 	_, err := appendDurable(ctx, h.loop.Store, h.loop.Config.EventHub, h.loop.SessionID, session.Event{
-		ID: item.id + ":" + string(typ), SessionID: h.loop.SessionID, Type: typ, Data: data,
+		ID: eventID, SessionID: h.loop.SessionID, Type: typ, Data: data,
 	})
 	return err
+}
+
+func (h *Handle) requeueAfterRun(item inboxItem) {
+	eventID := fmt.Sprintf("%s:%s:%d", item.id, session.EventInboxRequeued, atomic.AddUint64(&inboxCounter, 1))
+	_ = h.appendInboxEvent(context.Background(), session.EventInboxRequeued, item, eventID)
+	h.mu.Lock()
+	if h.status != StatusDisposed {
+		h.inbox = append([]inboxItem{item}, h.inbox...)
+		h.signalChanged()
+	}
+	h.mu.Unlock()
 }
 
 func inboxKindName(kind inboxKind) string {
@@ -610,9 +655,11 @@ func (h *Handle) restoreInbox(ctx context.Context) error {
 	queued := map[string]inboxItem{}
 	queuedSeq := map[string]uint64{}
 	terminal := map[string]bool{}
+	requeued := map[string]bool{}
 	inputSeen := map[string]bool{}
 	inputRun := map[string]string{}
 	runEnded := map[string]bool{}
+	failedRuns := map[string]bool{}
 	for _, event := range events {
 		if event.Type == session.EventUserMessage || event.Type == session.EventSteeringMessage || event.Type == session.EventInjectedContext {
 			var payload struct {
@@ -625,18 +672,33 @@ func (h *Handle) restoreInbox(ctx context.Context) error {
 		}
 		if event.Type == session.EventTurnEnd && event.RunID != "" {
 			runEnded[event.RunID] = true
+			var payload struct {
+				Reason string `json:"reason"`
+			}
+			if json.Unmarshal(event.Data, &payload) == nil {
+				switch payload.Reason {
+				case "error", "cancelled", "context_overflow":
+					failedRuns[event.RunID] = true
+				}
+			}
+		}
+		if event.Type == session.EventRequestError && event.RunID != "" {
+			failedRuns[event.RunID] = true
 		}
 		switch event.Type {
-		case session.EventInboxQueued:
+		case session.EventInboxQueued, session.EventInboxRequeued:
 			var payload session.InboxPayload
 			if json.Unmarshal(event.Data, &payload) == nil && payload.ItemID != "" {
 				queued[payload.ItemID] = inboxItem{id: payload.ItemID, kind: inboxKindFromName(payload.Kind), text: payload.Text}
 				queuedSeq[payload.ItemID] = event.Seq
+				requeued[payload.ItemID] = event.Type == session.EventInboxRequeued
+				terminal[payload.ItemID] = false
 			}
 		case session.EventInboxCompleted, session.EventInboxDiscarded:
 			var payload session.InboxPayload
 			if json.Unmarshal(event.Data, &payload) == nil {
 				terminal[payload.ItemID] = true
+				requeued[payload.ItemID] = false
 			}
 		}
 	}
@@ -655,7 +717,7 @@ func (h *Handle) restoreInbox(ctx context.Context) error {
 		if terminal[id] {
 			continue
 		}
-		if inputSeen[id] && runEnded[inputRun[id]] {
+		if inputSeen[id] && runEnded[inputRun[id]] && !failedRuns[inputRun[id]] && !requeued[id] {
 			// A completed turn already consumed this input. Seal the queue
 			// lifecycle without replaying the user message.
 			if err := h.appendInbox(ctx, session.EventInboxCompleted, item); err != nil {

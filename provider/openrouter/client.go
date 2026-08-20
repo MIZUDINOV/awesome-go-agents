@@ -54,6 +54,23 @@ func New(apiKey string, logger *slog.Logger) *Client {
 
 func (c *Client) Name() string { return ProviderName }
 
+// RequestSnapshot returns the exact OpenRouter JSON body Generate would send
+// for req, including adapter defaults and provider-specific fields.
+func (c *Client) RequestSnapshot(req *llm.Request) (json.RawMessage, error) {
+	if req == nil {
+		return nil, fmt.Errorf("openrouter: request is required")
+	}
+	config, err := decodeConfig(req.Config)
+	if err != nil {
+		return nil, err
+	}
+	payload, err := buildRequest(req.Model, req, config, req.Stream)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(payload)
+}
+
 // Capabilities resolves model capacity from the configured authoritative
 // source (CapabilitiesFor override, then ModelCatalog). An unknown model or a
 // missing source is an explicit error: capabilities are never guessed from a
@@ -147,7 +164,7 @@ func (c *Client) Generate(ctx context.Context, req *llm.Request, cb llm.StreamCa
 		}
 		return nil, err
 	}
-	result, err := acc.response(callCtx, cb, time.Since(started), req)
+	result, err := acc.response(callCtx, cb, time.Since(started))
 	if err != nil {
 		return nil, err
 	}

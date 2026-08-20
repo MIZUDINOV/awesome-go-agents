@@ -206,7 +206,7 @@ func (a *accumulator) providerError(envelope *errorEnvelope) error {
 
 // response assembles the final llm.Response from accumulated state and emits
 // completed tool-call events.
-func (a *accumulator) response(ctx context.Context, cb llm.StreamCallback, duration time.Duration, req *llm.Request) (*llm.Response, error) {
+func (a *accumulator) response(ctx context.Context, cb llm.StreamCallback, duration time.Duration) (*llm.Response, error) {
 	parts := make([]llm.Part, 0, 2+len(a.tools))
 	if a.text.Len() > 0 {
 		parts = append(parts, llm.Part{Type: llm.PartText, Text: a.text.String()})

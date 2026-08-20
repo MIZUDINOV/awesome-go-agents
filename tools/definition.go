@@ -7,6 +7,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"time"
 
@@ -89,6 +90,11 @@ type Definition struct {
 	// OutputSchema validates the canonical result and is mandatory at register.
 	OutputSchema json.RawMessage
 
+	// typed*Schema are populated by DefineTool. They keep a typed definition's
+	// runtime schema and its Go type contract from drifting apart.
+	typedInputSchema  json.RawMessage
+	typedOutputSchema json.RawMessage
+
 	// Execute implements the tool. Required.
 	Execute Executor
 	// RenderModel optionally shapes what the model sees as the result.
@@ -128,6 +134,8 @@ func (d *Definition) IsConcurrencySafe(input json.RawMessage) bool {
 
 // DefineToolOptions is the typed authoring surface. It compiles into the
 // erased Definition so providers never receive runtime callbacks or bindings.
+// When a schema override is omitted, it is generated from the corresponding
+// Go type, keeping typed decoding and model validation on one source of truth.
 type DefineToolOptions[I any, O any] struct {
 	Name             string
 	Description      string
@@ -145,17 +153,20 @@ type DefineToolOptions[I any, O any] struct {
 
 // DefineTool converts a typed definition into the runtime representation.
 func DefineTool[I any, O any](opts DefineToolOptions[I, O]) *Definition {
+	expectedInputSchema := generatedSchema[I]()
+	expectedOutputSchema := generatedSchema[O]()
 	inputSchema := append(json.RawMessage(nil), opts.InputSchema...)
 	if len(inputSchema) == 0 {
-		inputSchema = json.RawMessage(`{"type":"object","additionalProperties":false}`)
+		inputSchema = append(json.RawMessage(nil), expectedInputSchema...)
 	}
 	outputSchema := append(json.RawMessage(nil), opts.OutputSchema...)
 	if len(outputSchema) == 0 {
-		outputSchema = append(json.RawMessage(nil), AnyOutputSchema...)
+		outputSchema = append(json.RawMessage(nil), expectedOutputSchema...)
 	}
 	return &Definition{
 		Name: opts.Name, Description: opts.Description, Version: opts.Version,
 		InputSchema: inputSchema, OutputSchema: outputSchema,
+		typedInputSchema: expectedInputSchema, typedOutputSchema: expectedOutputSchema,
 		Timeout: opts.Timeout, MutatesWorkspace: opts.MutatesWorkspace,
 		ConcurrencySafeFor: func(input json.RawMessage) bool {
 			var args I
@@ -193,6 +204,14 @@ func DefineTool[I any, O any](opts DefineToolOptions[I, O]) *Definition {
 		},
 		FinalizeContent: opts.FinalizeContent,
 	}
+}
+
+func generatedSchema[T any]() json.RawMessage {
+	schema, err := FromStruct[T]()
+	if err != nil {
+		panic(fmt.Sprintf("tools: generate typed schema for %T: %v", *new(T), err))
+	}
+	return schema
 }
 
 // Result is the three-part tool outcome per the DSH model:

@@ -100,6 +100,35 @@ func TestRunBatchCommitsModelOrderAcrossParallelCalls(t *testing.T) {
 	}
 }
 
+func TestZeroMaxParallelMeansUnlimited(t *testing.T) {
+	registry := New(Options{MaxParallel: 0})
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	registry.MustRegister(&Definition{
+		Name: "parallel", InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema, ConcurrencySafe: true,
+		Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) {
+			started <- struct{}{}
+			<-release
+			return "ok", nil
+		},
+	})
+	done := make(chan []Outcome, 1)
+	go func() {
+		done <- registry.RunBatch(context.Background(), ExecContext{}, []Call{{Name: "parallel", CallID: "one", Input: []byte(`{}`)}, {Name: "parallel", CallID: "two", Input: []byte(`{}`)}})
+	}()
+	for i := 0; i < 2; i++ {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("unlimited parallel calls did not overlap")
+		}
+	}
+	close(release)
+	if outcomes := <-done; len(outcomes) != 2 || outcomes[0].Err != nil || outcomes[1].Err != nil {
+		t.Fatalf("outcomes=%#v", outcomes)
+	}
+}
+
 func TestRegistryModelToolsStripsRuntime(t *testing.T) {
 	registry := New(Options{})
 	err := registry.Register(&Definition{
@@ -371,6 +400,79 @@ func TestRegistryPolicyGuardApprovalAndFinalizer(t *testing.T) {
 	}
 }
 
+func TestPostExecuteReceivesFailureOutcome(t *testing.T) {
+	registry := New(Options{})
+	executionErr := errors.New("execution failed")
+	seen := false
+	registry.AddPostExecute(func(_ context.Context, _ Execution, result *Result) error {
+		seen = result.Kind == OutcomeFailure
+		result.ModelFacing = "partial"
+		return nil
+	})
+	registry.MustRegister(&Definition{
+		Name: "fails", InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema,
+		Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) { return nil, executionErr },
+	})
+	result, err := registry.Run(context.Background(), ExecContext{}, "fails", "failure-hook", []byte(`{}`))
+	if !errors.Is(err, executionErr) || !seen || result == nil || result.ModelFacing != "partial" {
+		t.Fatalf("err=%v seen=%v result=%+v", err, seen, result)
+	}
+}
+
+func TestCancellationBeforeDispatchIsClassified(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	registry := New(Options{})
+	registry.AddPreExecute(func(context.Context, string, json.RawMessage) error {
+		cancel()
+		return ctx.Err()
+	})
+	registry.MustRegister(&Definition{
+		Name: "cancel", InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema,
+		Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) { return "unexpected", nil },
+	})
+	if _, err := registry.Run(ctx, ExecContext{}, "cancel", "cancel-before-dispatch", []byte(`{}`)); !errors.Is(err, ErrAbortedBeforeDispatch) {
+		t.Fatalf("error=%v, want ErrAbortedBeforeDispatch", err)
+	}
+}
+
+func TestDefineToolGeneratesTypedSchemas(t *testing.T) {
+	type input struct {
+		Name string `json:"name" jsonschema:"required"`
+	}
+	type output struct {
+		Count int `json:"count" jsonschema:"required"`
+	}
+	definition := DefineTool[input, output](DefineToolOptions[input, output]{
+		Name: "typed", Execute: func(context.Context, ExecContext, input) (output, error) {
+			return output{Count: 1}, nil
+		},
+	})
+	if err := ValidateInput(definition.InputSchema, []byte(`{"name":"ok"}`)); err != nil {
+		t.Fatalf("generated input schema rejected valid input: %v", err)
+	}
+	if err := ValidateInput(definition.OutputSchema, []byte(`{"count":1}`)); err != nil {
+		t.Fatalf("generated output schema rejected valid output: %v", err)
+	}
+	if err := ValidateInput(definition.OutputSchema, []byte(`{"count":"wrong"}`)); err == nil {
+		t.Fatal("generated output schema accepted invalid output")
+	}
+}
+
+func TestDefineToolRejectsSchemaDrift(t *testing.T) {
+	type input struct {
+		Name string `json:"name" jsonschema:"required"`
+	}
+	definition := DefineTool[input, string](DefineToolOptions[input, string]{
+		Name:        "typed_drift",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"other":{"type":"string"}}}`),
+		Execute:     func(context.Context, ExecContext, input) (string, error) { return "ok", nil },
+	})
+	if err := (New(Options{})).Register(definition); !errors.Is(err, ErrInvalidArguments) {
+		t.Fatalf("Register error=%v, want typed schema mismatch", err)
+	}
+}
+
 func TestFinalizerDoesNotReplaceExecutionError(t *testing.T) {
 	registry := New(Options{})
 	executionErr := errors.New("execution failed")
@@ -424,7 +526,7 @@ func TestScopedRegistryRunsRootHooksForLocalTools(t *testing.T) {
 	root := New(Options{})
 	pre, post := 0, 0
 	root.AddPreExecute(func(context.Context, string, json.RawMessage) error { pre++; return nil })
-	root.AddPostExecute(func(context.Context, string, json.RawMessage) error { post++; return nil })
+	root.AddPostExecute(func(context.Context, Execution, *Result) error { post++; return nil })
 	scope := root.NewScope()
 	if err := scope.Register(&Definition{Name: "local", InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema, Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) { return "ok", nil }}); err != nil {
 		t.Fatal(err)
