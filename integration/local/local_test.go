@@ -136,6 +136,44 @@ func TestLocalSandboxReadOnlyDeniesWrites(t *testing.T) {
 	}
 }
 
+func TestLocalSandboxWorkspaceWriteDeniesUncontainedCommands(t *testing.T) {
+	root := newTestEnv(t)
+	sb := NewLocalSandbox(root)
+	err := sb.CheckCommand(context.Background(), "u1", integration.Command{Command: "echo hi", Workdir: root}, integration.AccessWrite)
+	var denial *integration.Denial
+	if !errors.As(err, &denial) {
+		t.Fatalf("expected command containment denial, got %v", err)
+	}
+	if denial.Code != "SANDBOX_DENIED_COMMAND_CONTAINMENT" {
+		t.Fatalf("denial code = %q", denial.Code)
+	}
+	sb.SetMode("u1", integration.ModeDangerFullAccess)
+	if err := sb.CheckCommand(context.Background(), "u1", integration.Command{Command: "echo hi", Workdir: root}, integration.AccessWrite); err != nil {
+		t.Fatalf("danger-full-access command = %v", err)
+	}
+}
+
+func TestLocalSandboxGlobalToolAllowList(t *testing.T) {
+	root := newTestEnv(t)
+	sb := NewLocalSandbox(root)
+	ctx := context.Background()
+	sb.GrantTool("", "read")
+	if err := sb.AllowTool(ctx, "u1", "read", false); err != nil {
+		t.Fatalf("global grant denied: %v", err)
+	}
+	if err := sb.AllowTool(ctx, "u1", "write", true); err == nil {
+		t.Fatal("unlisted global tool was allowed")
+	}
+	sb.GrantTool("u1", "write")
+	if err := sb.AllowTool(ctx, "u1", "write", true); err == nil {
+		t.Fatal("owner tool was allowed despite global allow-list")
+	}
+	sb.GrantTool("", "write")
+	if err := sb.AllowTool(ctx, "u1", "write", true); err != nil {
+		t.Fatalf("combined global and owner grant denied: %v", err)
+	}
+}
+
 func TestLocalSubprocessRunsBounded(t *testing.T) {
 	root := newTestEnv(t)
 	sub := NewLocalSubprocess(DefaultSubprocessOptions())
@@ -208,4 +246,24 @@ func TestLocalJobsOwnerScoped(t *testing.T) {
 		t.Errorf("kill own job: %v", err)
 	}
 	_ = os.MkdirAll(root, 0o755)
+}
+
+func TestLocalJobsWaitAndTimeout(t *testing.T) {
+	root := newTestEnv(t)
+	sub := NewLocalSubprocess(DefaultSubprocessOptions())
+	manager := NewLocalJobManager(sub, DefaultJobManagerOptions())
+	ctx := context.Background()
+	id, err := manager.Start(ctx, job.Spec{Kind: "shell", Command: "ping -n 30 127.0.0.1 > nul", Workdir: root}, "owner-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Output(ctx, id, job.OutputOptions{Wait: true, Timeout: 20 * time.Millisecond}, "owner-a"); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("wait timeout error = %v", err)
+	}
+	if err := manager.Kill(ctx, id, "test cleanup", "owner-a"); err != nil {
+		t.Fatalf("kill timed-out job: %v", err)
+	}
+	if _, err := manager.Output(ctx, id, job.OutputOptions{Wait: true, Timeout: 5 * time.Second}, "owner-a"); err != nil {
+		t.Fatalf("wait for completion: %v", err)
+	}
 }

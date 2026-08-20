@@ -417,6 +417,7 @@ func TestPendingApprovalResumesAfterAgentRestart(t *testing.T) {
 	request := tools.ApprovalRequest{SessionID: "approval-resume", RunID: "run-old", CallID: "approval-1", ToolName: "protected", Arguments: json.RawMessage(`{}`), Reason: "test"}
 	requestData, _ := json.Marshal(request)
 	if _, err := store.Append(context.Background(), "approval-resume", []session.Event{
+		{ID: "approval-turn-start", SessionID: "approval-resume", RunID: "run-old", TurnID: "turn-0001", Type: session.EventTurnStart, Data: json.RawMessage(`{"text":"start"}`)},
 		{ID: "approval-assistant", SessionID: "approval-resume", RunID: "run-old", TurnID: "turn-0001", StepID: "turn-0001-step-00", Type: session.EventAssistantMessage, Data: session.AssistantContent("", "", []session.ToolCall{{CallID: request.CallID, Name: request.ToolName, Arguments: request.Arguments}})},
 		{ID: "approval-call", SessionID: "approval-resume", RunID: "run-old", TurnID: "turn-0001", StepID: "turn-0001-step-00", CallID: request.CallID, Type: session.EventToolCall, Data: session.ToolCallPayload(request.CallID, request.ToolName, request.Arguments)},
 		{ID: "approval-admitted", SessionID: "approval-resume", RunID: "run-old", TurnID: "turn-0001", StepID: "turn-0001-step-00", CallID: request.CallID, Type: session.EventToolAdmitted, Data: json.RawMessage(`{"text":"admitted"}`)},
@@ -436,7 +437,8 @@ func TestPendingApprovalResumesAfterAgentRestart(t *testing.T) {
 	registry.AddPolicy(func(context.Context, tools.Execution) (tools.PolicyDecision, string, error) {
 		return tools.PolicyAsk, "test", nil
 	})
-	loop := NewLoop("approval-resume", store, registry, &scriptedProvider{}, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
+	chat := &scriptedProvider{steps: []scriptedStep{{text: "continued after approval"}}}
+	loop := NewLoop("approval-resume", store, registry, chat, Config{Model: "m", Owner: "test", SystemPrompt: "sys"})
 	handle, err := NewAgent(loop)
 	if err != nil {
 		t.Fatal(err)
@@ -460,6 +462,39 @@ func TestPendingApprovalResumesAfterAgentRestart(t *testing.T) {
 	}
 	if !foundResult {
 		t.Fatal("approval result was not durably resumed")
+	}
+	chat.mu.Lock()
+	requestCount := len(chat.calls)
+	var continuedRequest llm.Request
+	if requestCount == 1 {
+		continuedRequest = chat.calls[0]
+	}
+	chat.mu.Unlock()
+	if requestCount != 1 {
+		t.Fatalf("continued provider requests = %d, want 1", requestCount)
+	}
+	foundToolResult := false
+	for _, message := range continuedRequest.Messages {
+		for _, result := range message.ToolResults() {
+			if result.CallID == request.CallID {
+				foundToolResult = true
+			}
+		}
+	}
+	if !foundToolResult {
+		t.Fatal("continued provider request did not contain the approved tool result")
+	}
+	foundStepEnd, foundTurnEnd := false, false
+	for _, event := range events {
+		if event.Type == session.EventStepEnd && event.StepID == "turn-0001-step-00" {
+			foundStepEnd = true
+		}
+		if event.Type == session.EventTurnEnd && event.TurnID == "turn-0001" {
+			foundTurnEnd = true
+		}
+	}
+	if !foundStepEnd || !foundTurnEnd {
+		t.Fatalf("approval resume lifecycle step_end=%v turn_end=%v", foundStepEnd, foundTurnEnd)
 	}
 }
 

@@ -146,7 +146,8 @@ func TestCoreSandboxDenialStableCode(t *testing.T) {
 
 // bash runs with bounded output and structured exit codes.
 func TestCoreBashRuns(t *testing.T) {
-	registry, _, root, vars := newTestEnv(t)
+	registry, sandbox, root, vars := newTestEnv(t)
+	sandbox.SetMode("session-1", integration.ModeDangerFullAccess)
 	m := call(t, registry, "bash", vars, map[string]any{"command": "echo bash-ok", "workdir": root}).(bashOutput)
 	if m.ExitCode != 0 || !strings.Contains(m.Output, "bash-ok") {
 		t.Errorf("bash result = %+v", m)
@@ -183,7 +184,8 @@ func TestCoreGlobGrep(t *testing.T) {
 
 // job lifecycle, owner scoped.
 func TestCoreJobs(t *testing.T) {
-	registry, _, root, vars := newTestEnv(t)
+	registry, sandbox, root, vars := newTestEnv(t)
+	sandbox.SetMode("session-1", integration.ModeDangerFullAccess)
 	start := call(t, registry, "job_start", vars, map[string]any{"command": "echo j1", "workdir": root}).(jobStartOutput)
 	id := start.JobID
 	if id == "" {

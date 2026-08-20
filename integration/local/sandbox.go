@@ -5,6 +5,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/MIZUDINOV/awesome-go-agents/integration"
 )
@@ -15,6 +16,7 @@ import (
 type LocalSandbox struct {
 	root string
 	fs   *LocalFileSystem
+	mu   sync.RWMutex
 	// modes maps owner -> containment mode (default workspace-write).
 	modes map[string]integration.Mode
 	// allowedTools maps owner -> tool allow-list ("" = default allow all).
@@ -38,11 +40,15 @@ func (s *LocalSandbox) Root() string { return s.root }
 
 // SetMode sets the containment mode for an owner.
 func (s *LocalSandbox) SetMode(owner string, mode integration.Mode) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.modes[owner] = mode
 }
 
 // Mode returns the containment mode for the owner.
 func (s *LocalSandbox) Mode(owner string) integration.Mode {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
 	if mode, ok := s.modes[owner]; ok {
 		return mode
 	}
@@ -52,6 +58,8 @@ func (s *LocalSandbox) Mode(owner string) integration.Mode {
 // GrantTool permits a tool for an owner ("" = all owners). The allow-list is
 // enforced by AllowTool at execution time (H-TOOLS-010).
 func (s *LocalSandbox) GrantTool(owner, toolName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.allowedTools[owner] == nil {
 		s.allowedTools[owner] = map[string]bool{}
 	}
@@ -60,6 +68,8 @@ func (s *LocalSandbox) GrantTool(owner, toolName string) {
 
 // RevokeTool denies a tool for an owner.
 func (s *LocalSandbox) RevokeTool(owner, toolName string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.allowedTools[owner] == nil {
 		s.allowedTools[owner] = map[string]bool{}
 	}
@@ -91,19 +101,24 @@ func (s *LocalSandbox) ResolvePath(ctx context.Context, owner, rawPath, cwd stri
 	return target, nil
 }
 
-// CheckCommand admits a command: the workdir must be inside the root, and
-// read-only sessions may not run mutating commands.
+// CheckCommand admits a command only when the execution world provides a real
+// command boundary. LocalSubprocess runs an unrestricted host shell, so
+// workspace-write fails closed instead of pretending that a checked workdir
+// contains paths used later by the shell. Explicit danger-full-access is the
+// opt-in for trusted local development; production should use E2B or another
+// OS-enforced sandbox.
 func (s *LocalSandbox) CheckCommand(_ context.Context, owner string, cmd integration.Command, access integration.Access) error {
 	if strings.TrimSpace(cmd.Workdir) == "" {
 		return integration.SandboxDenied("SANDBOX_DENIED_WORKDIR", "bash", cmd.Workdir, "a working directory is required")
 	}
-	workdir, err := filepath.Abs(cmd.Workdir)
-	if err != nil || !s.withinRoot(workdir) {
-		return integration.SandboxDenied("SANDBOX_DENIED_OUTSIDE_ROOT", "bash", cmd.Workdir, "the workdir escapes the workspace root")
-	}
-	if access == integration.AccessWrite && s.Mode(owner) == integration.ModeReadOnly {
+	mode := s.Mode(owner)
+	if access == integration.AccessWrite && mode == integration.ModeReadOnly {
 		return integration.SandboxDenied("SANDBOX_DENIED_READONLY", "bash", cmd.Command,
 			"the session is read-only; mutating commands are blocked by policy")
+	}
+	if mode != integration.ModeDangerFullAccess {
+		return integration.SandboxDenied("SANDBOX_DENIED_COMMAND_CONTAINMENT", "bash", cmd.Command,
+			"the local execution environment cannot enforce command containment; use a real sandbox or explicit danger-full-access")
 	}
 	return nil
 }
@@ -111,10 +126,17 @@ func (s *LocalSandbox) CheckCommand(_ context.Context, owner string, cmd integra
 // AllowTool admits a tool execution (H-TOOLS-010: same visibility for schema
 // lookup and execution).
 func (s *LocalSandbox) AllowTool(_ context.Context, owner, toolName string, mutation bool) error {
-	if set, ok := s.allowedTools[owner]; ok {
-		if allowed, known := set[toolName]; known && !allowed {
-			return integration.SandboxDenied("SANDBOX_DENIED_TOOL", toolName, owner, "the tool is not permitted for this session")
-		}
+	s.mu.RLock()
+	global, hasGlobal := s.allowedTools[""]
+	ownerSet, hasOwner := s.allowedTools[owner]
+	globalAllowed, globalKnown := global[toolName]
+	ownerAllowed, ownerKnown := ownerSet[toolName]
+	s.mu.RUnlock()
+	if hasGlobal && (!globalKnown || !globalAllowed) {
+		return integration.SandboxDenied("SANDBOX_DENIED_TOOL", toolName, owner, "the tool is not permitted by the global session allow-list")
+	}
+	if hasOwner && (!ownerKnown || !ownerAllowed) {
+		return integration.SandboxDenied("SANDBOX_DENIED_TOOL", toolName, owner, "the tool is not permitted for this session")
 	}
 	if mutation && s.Mode(owner) == integration.ModeReadOnly && isMutatingTool(toolName) {
 		return integration.SandboxDenied("SANDBOX_DENIED_READONLY", toolName, owner, "the session is read-only")

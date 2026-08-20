@@ -101,10 +101,11 @@ func TestRecoverClosesTurnAndMarksUnknown(t *testing.T) {
 	lease, _ := store.ClaimLease(ctx, "s1", "w", time.Minute, "tenant-1")
 	// Open turn + a durable tool/call whose result was never persisted.
 	if _, err := store.AppendFenced(ctx, lease, []Event{
-		{Type: EventTurnStart, Data: json.RawMessage(`{}`)},
-		{Type: EventToolCall, ID: "t:call1", CallID: "call1", Data: ToolCallPayload("call1", "write", json.RawMessage(`{"path":"a.ts"}`))},
-		{Type: EventToolDispatched, CallID: "call1", Data: json.RawMessage(`{"text":"dispatched"}`)},
-		{Type: EventToolRunning, CallID: "call1", Data: json.RawMessage(`{"text":"running"}`)},
+		{RunID: "run-1", TurnID: "turn-1", Type: EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "turn-1-step-00", Type: EventStepStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "turn-1-step-00", CallID: "call1", Type: EventToolCall, ID: "t:call1", Data: ToolCallPayload("call1", "write", json.RawMessage(`{"path":"a.ts"}`))},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "turn-1-step-00", CallID: "call1", Type: EventToolDispatched, Data: json.RawMessage(`{"text":"dispatched"}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "turn-1-step-00", CallID: "call1", Type: EventToolRunning, Data: json.RawMessage(`{"text":"running"}`)},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -136,6 +137,52 @@ func TestRecoverClosesTurnAndMarksUnknown(t *testing.T) {
 	}
 	if !foundUnknown {
 		t.Error("missing TOOL_OUTCOME_UNKNOWN result for dangling call")
+	}
+	resultIndex, stepEndIndex, turnEndIndex := -1, -1, -1
+	for index, event := range all {
+		if event.Type == EventToolResult && event.CallID == "call1" {
+			resultIndex = index
+		}
+		if event.Type == EventStepEnd && event.StepID == "turn-1-step-00" {
+			stepEndIndex = index
+		}
+		if event.Type == EventTurnEnd && event.TurnID == "turn-1" {
+			turnEndIndex = index
+		}
+	}
+	if resultIndex < 0 || stepEndIndex < 0 || turnEndIndex < 0 || !(resultIndex < stepEndIndex && stepEndIndex < turnEndIndex) {
+		t.Fatalf("recovery lifecycle order result=%d step_end=%d turn_end=%d", resultIndex, stepEndIndex, turnEndIndex)
+	}
+}
+
+func TestRecoverClosesOpenStep(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	lease, _ := store.ClaimLease(ctx, "s-step", "w", time.Minute, "tenant-1")
+	if _, err := store.AppendFenced(ctx, lease, []Event{
+		{RunID: "run-1", TurnID: "turn-1", StepID: "turn-1-step-00", Type: EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "turn-1-step-00", Type: EventStepStart, Data: json.RawMessage(`{}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.ReleaseLease(ctx, lease)
+	lease, _ = store.ClaimLease(ctx, "s-step", "w2", time.Minute, "tenant-1")
+	report, err := store.Recover(ctx, lease)
+	if err != nil {
+		t.Fatalf("recover: %v", err)
+	}
+	if report.StepsClosed != 1 {
+		t.Fatalf("steps closed = %d, want 1", report.StepsClosed)
+	}
+	all, _ := store.Load(ctx, "s-step", 0, 0)
+	found := false
+	for _, event := range all {
+		if event.Type == EventStepEnd && event.StepID == "turn-1-step-00" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("missing recovered step/end")
 	}
 }
 

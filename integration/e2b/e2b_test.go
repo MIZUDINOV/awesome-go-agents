@@ -100,6 +100,16 @@ func (f *fakeTransport) Start(_ context.Context, command, workdir, owner string)
 	return id, nil
 }
 
+func (f *fakeTransport) List(_ context.Context, owner string) ([]job.Descriptor, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]job.Descriptor, 0, len(f.jobs))
+	for id, value := range f.jobs {
+		out = append(out, job.Descriptor{ID: job.ID(id), Kind: "shell", Status: value.Status})
+	}
+	return out, nil
+}
+
 func (f *fakeTransport) Output(_ context.Context, id, owner string, tail, wait bool) (job.Output, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

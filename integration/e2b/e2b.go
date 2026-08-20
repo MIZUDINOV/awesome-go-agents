@@ -40,6 +40,7 @@ type Transport interface {
 	Run(ctx context.Context, command, workdir string, timeoutSec int) (integration.Result, error)
 	// Start/Output/Kill manage background jobs remotely (owner-scoped).
 	Start(ctx context.Context, command, workdir, owner string) (string, error)
+	List(ctx context.Context, owner string) ([]job.Descriptor, error)
 	Output(ctx context.Context, id, owner string, tail, wait bool) (job.Output, error)
 	Kill(ctx context.Context, id, reason, owner string) error
 	// Deny returns a structured denial if access to resource is not permitted
@@ -271,12 +272,17 @@ func (j *remoteJobs) Start(ctx context.Context, spec job.Spec, owner string) (jo
 }
 
 func (j *remoteJobs) List(ctx context.Context, owner string) ([]job.Descriptor, error) {
-	// Remote listing is optional; best effort via empty list.
-	return nil, nil
+	return j.transport.List(ctx, owner)
 }
 
 func (j *remoteJobs) Output(ctx context.Context, id job.ID, opts job.OutputOptions, owner string) (job.Output, error) {
-	return j.transport.Output(ctx, string(id), owner, opts.Tail, opts.Wait)
+	outputCtx := ctx
+	cancel := func() {}
+	if opts.Timeout > 0 {
+		outputCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
+	}
+	defer cancel()
+	return j.transport.Output(outputCtx, string(id), owner, opts.Tail, opts.Wait)
 }
 
 func (j *remoteJobs) Kill(ctx context.Context, id job.ID, reason string, owner string) error {

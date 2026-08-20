@@ -119,6 +119,61 @@ func InterruptedDraftEvents(events []Event, sessionID string) []Event {
 	return result
 }
 
+// InterruptedStepEndEvents closes every step/start that has no matching
+// step/end. Recovery emits one deterministic terminal event per step so a
+// crash cannot leave an open step lifecycle behind.
+func InterruptedStepEndEvents(events []Event, sessionID string) []Event {
+	type openStep struct {
+		event Event
+		seq   uint64
+		key   string
+	}
+	open := make(map[string]openStep)
+	for _, event := range events {
+		if event.StepID == "" || event.TurnID == "" {
+			continue
+		}
+		key := draftKey(event.RunID, event.TurnID, event.StepID)
+		switch event.Type {
+		case EventStepStart:
+			open[key] = openStep{event: event, seq: event.Seq, key: key}
+		case EventStepEnd:
+			delete(open, key)
+		}
+	}
+	steps := make([]openStep, 0, len(open))
+	for _, step := range open {
+		steps = append(steps, step)
+	}
+	sort.Slice(steps, func(i, j int) bool {
+		if steps[i].seq == steps[j].seq {
+			return steps[i].key < steps[j].key
+		}
+		return steps[i].seq < steps[j].seq
+	})
+	out := make([]Event, 0, len(steps))
+	for _, step := range steps {
+		digest := sha256.Sum256([]byte(step.key))
+		out = append(out, Event{
+			ID:        "recover:step-end:" + hex.EncodeToString(digest[:]),
+			SessionID: firstNonEmptySessionID(step.event.SessionID, sessionID),
+			RunID:     step.event.RunID,
+			TurnID:    step.event.TurnID,
+			StepID:    step.event.StepID,
+			Type:      EventStepEnd,
+			Data:      mustJSON(map[string]any{"reason": "interrupted"}),
+		})
+	}
+	return out
+}
+
+func firstNonEmptySessionID(value, fallback string) string {
+	if value != "" {
+		return value
+	}
+	return fallback
+}
+
 func draftKey(runID, turnID, stepID string) string {
 	return fmt.Sprintf("%s/%s/%s", runID, turnID, stepID)
 }

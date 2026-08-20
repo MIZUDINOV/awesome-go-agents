@@ -786,13 +786,16 @@ func (b *approvalBroker) Decide(ctx context.Context, callID string, approved boo
 	b.mu.Lock()
 	decision, ok := b.pending[callID]
 	requested := b.requested[callID]
-	_, alreadyDecided := b.decisions[callID]
+	previousDecision, alreadyDecided := b.decisions[callID]
 	request := b.requests[callID]
 	resume := b.resume
 	b.mu.Unlock()
 	if alreadyDecided {
+		if previousDecision != approved {
+			return fmt.Errorf("agent: approval %s was already resolved", callID)
+		}
 		if decision == nil && requested && resume != nil && request.CallID != "" {
-			return resume(ctx, request, approved)
+			return resume(ctx, request, previousDecision)
 		}
 		return nil
 	}

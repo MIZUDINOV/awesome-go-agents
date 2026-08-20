@@ -1,7 +1,6 @@
 package context
 
 import (
-	"fmt"
 	"strings"
 
 	"github.com/MIZUDINOV/awesome-go-agents/llm"
@@ -92,6 +91,3 @@ func (a *Assembler) render(sections []Section) string {
 
 // RenderSection is a helper for callers building Section slices.
 func RenderSection(title, content string) Section { return Section{Title: title, Content: content} }
-
-// ensure fmt is used (deferred helpers may use it).
-var _ = fmt.Sprintf

@@ -35,6 +35,7 @@ type accumulator struct {
 	openRouterMetadata json.RawMessage
 	usage              Usage
 	tools              map[int]*toolAccumulator
+	toolOrder          []int
 	streamStarted      bool
 	startedAt          time.Time
 	firstSemanticAt    time.Time
@@ -63,7 +64,7 @@ func consumeSSE(ctx context.Context, body io.Reader, acc *accumulator, cb llm.St
 		if err := json.Unmarshal([]byte(value), &chunk); err != nil {
 			return fmt.Errorf("decode OpenRouter SSE event: %w", err)
 		}
-		return acc.addChunk(ctx, chunk, cb)
+		return acc.addChunk(ctx, chunk, cb, false)
 	}
 	for scanner.Scan() {
 		if err := ctx.Err(); err != nil {
@@ -104,7 +105,7 @@ func consumeSSE(ctx context.Context, body io.Reader, acc *accumulator, cb llm.St
 	return nil
 }
 
-func (a *accumulator) addChunk(ctx context.Context, chunk chatChunk, cb llm.StreamCallback) error {
+func (a *accumulator) addChunk(ctx context.Context, chunk chatChunk, cb llm.StreamCallback, complete bool) error {
 	if chunk.ID != "" {
 		a.id = chunk.ID
 	}
@@ -128,7 +129,7 @@ func (a *accumulator) addChunk(ctx context.Context, chunk chatChunk, cb llm.Stre
 			return a.providerError(choice.Error)
 		}
 		delta := choice.Delta
-		if delta.Content == nil && choice.Message.Content != nil {
+		if complete || !hasChatDelta(delta) {
 			delta = choice.Message
 		}
 		if delta.Content != nil && *delta.Content != "" {
@@ -162,10 +163,17 @@ func (a *accumulator) addChunk(ctx context.Context, chunk chatChunk, cb llm.Stre
 			a.annotations = joinRawArray(a.annotations, delta.Annotations)
 		}
 		for _, call := range delta.ToolCalls {
-			state := a.tools[call.Index]
+			index := call.Index
+			if complete {
+				// Complete Chat Completions responses do not reliably carry an
+				// index. Their array position is the canonical order.
+				index = len(a.toolOrder)
+			}
+			state := a.tools[index]
 			if state == nil {
 				state = &toolAccumulator{}
-				a.tools[call.Index] = state
+				a.tools[index] = state
+				a.toolOrder = append(a.toolOrder, index)
 			}
 			if call.ID != "" {
 				state.ID = call.ID
@@ -206,15 +214,8 @@ func (a *accumulator) response(ctx context.Context, cb llm.StreamCallback, durat
 	if a.reasoningSummary.Len() > 0 {
 		parts = append(parts, llm.Part{Type: llm.PartReasoning, Reasoning: a.reasoningSummary.String()})
 	}
-	ordered := make([]*toolAccumulator, len(a.tools))
-	for index, tool := range a.tools {
-		ordered[index] = tool
-	}
-	for index := 0; index < len(ordered); index++ {
-		tool := ordered[index]
-		if tool == nil {
-			continue
-		}
+	for _, index := range a.toolOrder {
+		tool := a.tools[index]
 		arguments := strings.TrimSpace(tool.Arguments.String())
 		if arguments == "" {
 			arguments = "{}"
@@ -263,8 +264,10 @@ func (a *accumulator) response(ctx context.Context, cb llm.StreamCallback, durat
 
 func mapFinishReason(reason string) llm.FinishReason {
 	switch reason {
-	case "stop", "tool_calls":
+	case "stop":
 		return llm.FinishReasonStop
+	case "tool_calls":
+		return llm.FinishReasonToolCalls
 	case "length":
 		return llm.FinishReasonLength
 	case "content_filter":
@@ -319,6 +322,11 @@ func reasoningSummaries(raw json.RawMessage) []string {
 	return summaries
 }
 
+func hasChatDelta(delta chatDelta) bool {
+	return delta.Role != "" || delta.Content != nil || len(delta.ToolCalls) > 0 ||
+		delta.Reasoning != nil || len(delta.ReasoningDetails) > 0 || len(delta.Annotations) > 0
+}
+
 func routingMetadata(raw json.RawMessage) RoutingMetadata {
 	var document struct {
 		Requested        string `json:"requested"`
@@ -369,5 +377,5 @@ func decodeNonStreaming(ctx context.Context, body io.Reader, acc *accumulator) e
 	if err := decoder.Decode(&chunk); err != nil {
 		return fmt.Errorf("decode OpenRouter response: %w", err)
 	}
-	return acc.addChunk(ctx, chunk, nil)
+	return acc.addChunk(ctx, chunk, nil, true)
 }

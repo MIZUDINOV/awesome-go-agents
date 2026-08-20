@@ -274,5 +274,3 @@ func decodeConfig(value json.RawMessage) (GenerateConfig, error) {
 	}
 	return config, nil
 }
-
-var _ = fmt.Sprintf

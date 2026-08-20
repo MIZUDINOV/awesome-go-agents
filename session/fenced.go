@@ -46,6 +46,8 @@ type RecoveryReport struct {
 	// They received synthetic TOOL_OUTCOME_UNKNOWN results (never blind retry
 	// of side-effecting work, H-RECOVERY-003/H-ANTI-009).
 	DanglingCalls []string
+	// StepsClosed is the number of orphaned model steps closed during recovery.
+	StepsClosed int
 	// EventsAppended is the number of recovery events persisted.
 	EventsAppended int
 }
@@ -283,13 +285,10 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 	}
 	var recovery []Event
 	recovery = append(recovery, InterruptedDraftEvents(all, lease.SessionID)...)
+	stepEnds := InterruptedStepEndEvents(all, lease.SessionID)
+	report.StepsClosed = len(stepEnds)
 	if openTurns > 0 {
 		report.TurnClosed = true
-		recovery = append(recovery, Event{
-			ID: "recover:turn-end:" + openTurnID, RunID: openRunID, TurnID: openTurnID,
-			Type: EventTurnEnd, SessionID: lease.SessionID,
-			Data: mustJSON(map[string]any{"reason": "interrupted"}),
-		})
 	}
 	dangling := danglingCallIDs(all)
 	callEvents := toolCallEvents(all)
@@ -313,6 +312,16 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 				"call_id": callID, "name": callName, "is_error": true, "code": code,
 				"output": map[string]any{},
 			}),
+		})
+	}
+	// Keep terminal events ordered: tool outcomes settle dispatch first, then
+	// the step, and only then the containing turn.
+	recovery = append(recovery, stepEnds...)
+	if openTurns > 0 {
+		recovery = append(recovery, Event{
+			ID: "recover:turn-end:" + openTurnID, RunID: openRunID, TurnID: openTurnID,
+			Type: EventTurnEnd, SessionID: lease.SessionID,
+			Data: mustJSON(map[string]any{"reason": "interrupted"}),
 		})
 	}
 	if len(recovery) > 0 {

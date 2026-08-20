@@ -47,6 +47,29 @@ func TestRegistryExecutePipeline(t *testing.T) {
 	}
 }
 
+func TestResultFreezeDeepCopiesTypedNestedValues(t *testing.T) {
+	type child struct {
+		Values []string
+	}
+	type output struct {
+		Labels map[string]string
+		Child  *child
+	}
+	original := output{Labels: map[string]string{"status": "ok"}, Child: &child{Values: []string{"one"}}}
+	result := (&Result{Canonical: original, ModelFacing: map[string]any{"nested": []any{map[string]string{"value": "ok"}}}}).Freeze()
+	copyValue := result.Canonical.(output)
+	copyValue.Labels["status"] = "changed"
+	copyValue.Child.Values[0] = "changed"
+	model := result.ModelFacing.(map[string]any)
+	model["nested"].([]any)[0].(map[string]string)["value"] = "changed"
+	if original.Labels["status"] != "ok" || original.Child.Values[0] != "one" {
+		t.Fatalf("typed canonical value was aliased: %+v", original)
+	}
+	if result.ModelFacing.(map[string]any)["nested"].([]any)[0].(map[string]string)["value"] != "changed" {
+		t.Fatal("frozen model value was not independently mutable")
+	}
+}
+
 func TestRunBatchCommitsModelOrderAcrossParallelCalls(t *testing.T) {
 	registry := New(Options{MaxParallel: 2})
 	started := make(chan string, 2)

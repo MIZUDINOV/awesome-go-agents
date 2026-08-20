@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"github.com/MIZUDINOV/awesome-go-agents/integration"
 	"github.com/MIZUDINOV/awesome-go-agents/integration/local"
 	"github.com/MIZUDINOV/awesome-go-agents/llm"
+	"github.com/MIZUDINOV/awesome-go-agents/provider/openrouter"
 	"github.com/MIZUDINOV/awesome-go-agents/session"
 	"github.com/MIZUDINOV/awesome-go-agents/tools"
 	"github.com/MIZUDINOV/awesome-go-agents/tools/core"
@@ -94,6 +97,75 @@ func newHarness(t *testing.T, ws string, owner string, steps []e2eStep, cfg Conf
 	}
 	loop := NewLoop("e2e-"+owner, store, registry, chat, cfg)
 	return &harness{store: store, chat: chat, loop: loop, sandbox: sandbox, ws: ws, owner: owner}
+}
+
+func TestE2E_OpenRouterToolResultWireRoundTrip(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "main.txt"), []byte("hello from wire\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var payload struct {
+			Messages []struct {
+				Role       string `json:"role"`
+				ToolCallID string `json:"tool_call_id"`
+				ToolCalls  []struct {
+					ID string `json:"id"`
+				} `json:"tool_calls"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
+			t.Errorf("decode OpenRouter request: %v", err)
+		}
+		if requests == 2 {
+			assistantCall, toolResult := false, false
+			for _, message := range payload.Messages {
+				for _, call := range message.ToolCalls {
+					assistantCall = assistantCall || call.ID == "wire-read-1"
+				}
+				if message.Role == "tool" && message.ToolCallID == "wire-read-1" {
+					toolResult = true
+				}
+			}
+			if !assistantCall || !toolResult {
+				t.Errorf("second request lost assistant/tool pairing: %+v", payload.Messages)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if requests == 1 {
+			_, _ = w.Write([]byte(`{"id":"wire-1","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"wire-read-1","type":"function","function":{"name":"read","arguments":"{\"file_path\":\"main.txt\"}"}}]},"finish_reason":"tool_calls"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"wire-2","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}`))
+	}))
+	defer server.Close()
+
+	sandbox := local.NewLocalSandbox(ws)
+	sub := local.NewLocalSubprocess(local.DefaultSubprocessOptions())
+	registry := tools.New(tools.Options{})
+	if err := core.Register(registry, core.Deps{
+		Sandbox: sandbox, FS: local.NewLocalFileSystem(ws), Subprocess: sub,
+		Jobs: local.NewLocalJobManager(sub, local.DefaultJobManagerOptions()),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	chat := &openrouter.Client{
+		APIKey: "test-key", BaseURL: server.URL, HTTPClient: server.Client(),
+		CapabilitiesFor: func(string) (llm.Capabilities, bool) {
+			return llm.Capabilities{SupportsStreaming: false, SupportsParallelToolCalls: false, ContextWindow: 128000}, true
+		},
+	}
+	loop := NewLoop("wire-roundtrip", session.NewMemoryStore(), registry, chat, Config{
+		Model: "m", Owner: "wire-test", SystemPrompt: "sys", Vars: map[string]any{"cwd": ws},
+	})
+	if _, err := loop.Run(context.Background(), "read main.txt"); err != nil {
+		t.Fatalf("loop: %v", err)
+	}
+	if requests != 2 {
+		t.Fatalf("OpenRouter requests = %d, want 2", requests)
+	}
 }
 
 // toolResults returns the durable tool/result Data for a call name, in order.
@@ -323,15 +395,39 @@ func TestE2E_ScenarioF_ProviderOverflow(t *testing.T) {
 		t.Fatalf("expected at least one compaction during overflow recovery, got %d", result.CompactCount)
 	}
 	// Durable compaction events present.
-	events, _ := h.store.Load(context.Background(), "e2e-F", 0, 0)
+	events, err := h.store.Load(context.Background(), "e2e-F", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	compacted := 0
+	stepStarts := map[string]bool{}
+	stepEnds := map[string]bool{}
 	for _, e := range events {
 		if e.Type == session.EventCompactionStart || e.Type == session.EventCompactionSummary {
 			compacted++
 		}
+		if e.Type == session.EventStepStart {
+			stepStarts[e.StepID] = true
+		}
+		if e.Type == session.EventStepEnd {
+			stepEnds[e.StepID] = true
+		}
 	}
 	if compacted < 2 {
 		t.Fatalf("expected compaction/start+summary events, got %d", compacted)
+	}
+	initialStep, retryStep := false, false
+	for stepID := range stepStarts {
+		initialStep = initialStep || strings.HasSuffix(stepID, "-step-00")
+		retryStep = retryStep || strings.HasSuffix(stepID, "-step-00-retry-01")
+	}
+	if len(stepStarts) != 2 || !initialStep || !retryStep {
+		t.Fatalf("overflow step attempts = %v, want initial + retry", stepStarts)
+	}
+	for stepID := range stepStarts {
+		if !stepEnds[stepID] {
+			t.Fatalf("step %q has no matching step/end", stepID)
+		}
 	}
 }
 

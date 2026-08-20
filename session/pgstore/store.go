@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -55,9 +56,8 @@ type Store struct {
 	native   bool   // native schema (lease/tenant columns present)
 }
 
-// New returns a Store bound to pool in native mode. sessionID is stored as
-// text; tenant isolation is enforced for fenced operations once WithTenant is
-// configured.
+// New returns a Store bound to pool in native mode. Native reads and writes
+// require WithTenant so an unconfigured store cannot access shared tables.
 func New(db *pgxpool.Pool) *Store {
 	return &Store{db: db, events: "agentkit_events", sessions: "agentkit_sessions", native: true}
 }
@@ -85,7 +85,7 @@ func (s *Store) WithSessionsTable(name string) *Store {
 
 // WithTenant pins the tenant id applied to every native query.
 func (s *Store) WithTenant(tenantID string) *Store {
-	s.tenant = tenantID
+	s.tenant = strings.TrimSpace(tenantID)
 	return s
 }
 
@@ -99,10 +99,20 @@ func (s *Store) requireNativeAndTenant() error {
 	return nil
 }
 
+func (s *Store) requireTenantForNativeQuery() error {
+	if s.native && s.tenant == "" {
+		return ErrNoTenant
+	}
+	return nil
+}
+
 // Append persists events with atomic per-session sequence allocation. This is
 // the lease-less compatibility path (session.Store contract); the durable
 // loop should use AppendFenced under a lease.
 func (s *Store) Append(ctx context.Context, sessionID string, events []session.Event) (uint64, error) {
+	if err := s.requireTenantForNativeQuery(); err != nil {
+		return 0, err
+	}
 	if len(events) == 0 {
 		seq, err := s.Sequence(ctx, sessionID)
 		return seq, err
@@ -243,6 +253,9 @@ func (s *Store) AppendFenced(ctx context.Context, lease session.Lease, events []
 // loops. The legacy method remains available for host adapters. The lease
 // makes the post-commit lookup safe from another writer for this session.
 func (s *Store) AppendFencedCommitted(ctx context.Context, lease session.Lease, events []session.Event) (session.CommittedBatch, error) {
+	if err := s.requireNativeAndTenant(); err != nil {
+		return session.CommittedBatch{}, err
+	}
 	if len(events) == 0 {
 		return session.CommittedBatch{}, nil
 	}
@@ -285,6 +298,9 @@ func (s *Store) AppendFencedCommitted(ctx context.Context, lease session.Lease, 
 // AppendCommitted is the lease-less compatibility form. New durable loops
 // should use AppendFencedCommitted so a host-owned fence protects the append.
 func (s *Store) AppendCommitted(ctx context.Context, sessionID string, events []session.Event) (session.CommittedBatch, error) {
+	if err := s.requireTenantForNativeQuery(); err != nil {
+		return session.CommittedBatch{}, err
+	}
 	if len(events) == 0 {
 		return session.CommittedBatch{}, nil
 	}
@@ -420,13 +436,10 @@ func (s *Store) Recover(ctx context.Context, lease session.Lease) (*session.Reco
 	}
 	var recovery []session.Event
 	recovery = append(recovery, session.InterruptedDraftEvents(events, lease.SessionID)...)
+	stepEnds := session.InterruptedStepEndEvents(events, lease.SessionID)
+	report.StepsClosed = len(stepEnds)
 	if openTurns > 0 {
 		report.TurnClosed = true
-		recovery = append(recovery, session.Event{
-			ID: "recover:turn-end:" + openTurnID, RunID: openRunID, TurnID: openTurnID,
-			Type: session.EventTurnEnd, SessionID: lease.SessionID,
-			Data: mustJSON(map[string]any{"reason": "interrupted"}),
-		})
 	}
 	callIDs := make([]string, 0)
 	callEvents := make(map[string]session.Event)
@@ -511,6 +524,16 @@ func (s *Store) Recover(ctx context.Context, lease session.Lease) (*session.Reco
 				}),
 			})
 		}
+	}
+	// Settle tool results before closing the step and turn so the durable
+	// lifecycle remains tool/result -> step/end -> turn/end.
+	recovery = append(recovery, stepEnds...)
+	if openTurns > 0 {
+		recovery = append(recovery, session.Event{
+			ID: "recover:turn-end:" + openTurnID, RunID: openRunID, TurnID: openTurnID,
+			Type: session.EventTurnEnd, SessionID: lease.SessionID,
+			Data: mustJSON(map[string]any{"reason": "interrupted"}),
+		})
 	}
 	if len(recovery) > 0 {
 		if _, err := s.AppendFenced(ctx, lease, recovery); err != nil {
@@ -614,6 +637,9 @@ func eventIDs(events []session.Event) []string {
 }
 
 func (s *Store) Load(ctx context.Context, sessionID string, afterSeq uint64, limit int) ([]session.Event, error) {
+	if err := s.requireTenantForNativeQuery(); err != nil {
+		return nil, err
+	}
 	args := []any{sessionID, afterSeq}
 	predicate := ""
 	if s.native && s.tenant != "" {
@@ -635,6 +661,9 @@ func (s *Store) Load(ctx context.Context, sessionID string, afterSeq uint64, lim
 }
 
 func (s *Store) loadByIDs(ctx context.Context, sessionID string, ids []string) ([]session.Event, error) {
+	if err := s.requireTenantForNativeQuery(); err != nil {
+		return nil, err
+	}
 	if len(ids) == 0 {
 		return nil, nil
 	}
@@ -661,6 +690,9 @@ func (s *Store) loadByIDs(ctx context.Context, sessionID string, ids []string) (
 }
 
 func (s *Store) Tail(ctx context.Context, sessionID string, limit int) ([]session.Event, error) {
+	if err := s.requireTenantForNativeQuery(); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		return s.Load(ctx, sessionID, 0, 0)
 	}
@@ -682,6 +714,9 @@ func (s *Store) Tail(ctx context.Context, sessionID string, limit int) ([]sessio
 }
 
 func (s *Store) Sequence(ctx context.Context, sessionID string) (uint64, error) {
+	if err := s.requireTenantForNativeQuery(); err != nil {
+		return 0, err
+	}
 	if s.native {
 		var seq uint64
 		err := s.db.QueryRow(ctx, fmt.Sprintf(`SELECT COALESCE((SELECT next_seq FROM %s WHERE session_id=$1 AND tenant_id=$2),0)`, s.sessions),

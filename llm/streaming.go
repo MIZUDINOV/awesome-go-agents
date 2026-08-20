@@ -1,6 +1,9 @@
 package llm
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // StreamEventType classifies each streaming event.
 type StreamEventType string
@@ -45,17 +48,37 @@ type StreamCallback func(ctx context.Context, event StreamEvent) error
 // A terminal provider failure is delivered as an event with Err set; the
 // channel then closes without a Done event.
 func CollectStream(ctx context.Context, p Provider, req *Request) (<-chan StreamEvent, error) {
+	if p == nil {
+		return nil, errors.New("llm: provider is required")
+	}
 	out := make(chan StreamEvent)
 	go func() {
 		defer close(out)
-		_, _ = p.Generate(ctx, req, func(_ context.Context, event StreamEvent) error {
+		doneSent := false
+		send := func(event StreamEvent) bool {
 			select {
 			case out <- event:
-				return nil
+				return true
 			case <-ctx.Done():
+				return false
+			}
+		}
+		response, err := p.Generate(ctx, req, func(_ context.Context, event StreamEvent) error {
+			if event.Type == StreamEventDone {
+				doneSent = true
+			}
+			if !send(event) {
 				return ctx.Err()
 			}
+			return nil
 		})
+		if err != nil {
+			_ = send(StreamEvent{Err: err})
+			return
+		}
+		if response != nil && !doneSent {
+			_ = send(StreamEvent{Type: StreamEventDone, Response: response})
+		}
 	}()
 	return out, nil
 }

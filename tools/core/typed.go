@@ -603,9 +603,10 @@ func jobListToolTyped(deps Deps) *tools.Definition {
 }
 
 type jobOutputInput struct {
-	JobID string `json:"job_id" jsonschema:"required,description=Owned background job identifier."`
-	Wait  bool   `json:"wait,omitempty" jsonschema:"description=Wait until the job reaches a terminal state."`
-	Tail  bool   `json:"tail,omitempty" jsonschema:"description=Return output since the previous read when supported."`
+	JobID          string `json:"job_id" jsonschema:"required,description=Owned background job identifier."`
+	Wait           bool   `json:"wait,omitempty" jsonschema:"description=Wait until the job reaches a terminal state."`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"description=Maximum seconds to wait when wait is true."`
+	Tail           bool   `json:"tail,omitempty" jsonschema:"description=Return output since the previous read when supported."`
 }
 
 type jobOutputOutput struct {
@@ -625,7 +626,10 @@ func jobOutputToolTyped(deps Deps) *tools.Definition {
 			if deps.Jobs == nil {
 				return jobOutputOutput{}, fmt.Errorf("job_output: execution environment does not support background jobs")
 			}
-			out, err := deps.Jobs.Output(ctx, job.ID(args.JobID), job.OutputOptions{Wait: args.Wait, Tail: args.Tail}, ownerOf(ec))
+			if args.TimeoutSeconds < 0 {
+				return jobOutputOutput{}, fmt.Errorf("%w: timeout_seconds must not be negative", tools.ErrInvalidArguments)
+			}
+			out, err := deps.Jobs.Output(ctx, job.ID(args.JobID), job.OutputOptions{Wait: args.Wait, Timeout: time.Duration(args.TimeoutSeconds) * time.Second, Tail: args.Tail}, ownerOf(ec))
 			if err != nil {
 				return jobOutputOutput{}, err
 			}

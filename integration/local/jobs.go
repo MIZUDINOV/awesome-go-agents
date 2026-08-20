@@ -124,10 +124,39 @@ func (m *LocalJobManager) List(_ context.Context, owner string) ([]job.Descripto
 }
 
 // Output reads job output; Tail returns only bytes since the previous read.
-func (m *LocalJobManager) Output(_ context.Context, id job.ID, opts job.OutputOptions, owner string) (job.Output, error) {
+// When Wait is set, it blocks until the job reaches a terminal state or the
+// caller context/option timeout expires.
+func (m *LocalJobManager) Output(ctx context.Context, id job.ID, opts job.OutputOptions, owner string) (job.Output, error) {
+	m.mu.Lock()
+	j, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return job.Output{}, fmt.Errorf("job %s: not found", id)
+	}
+	if owner != "" && j.owner != owner {
+		m.mu.Unlock()
+		return job.Output{}, fmt.Errorf("job %s: access denied (cross-owner)", id)
+	}
+	done := j.done
+	running := j.status == job.StateRunning
+	m.mu.Unlock()
+	if opts.Wait && running {
+		waitCtx := ctx
+		cancel := func() {}
+		if opts.Timeout > 0 {
+			waitCtx, cancel = context.WithTimeout(ctx, opts.Timeout)
+		}
+		defer cancel()
+		select {
+		case <-done:
+		case <-waitCtx.Done():
+			return job.Output{}, waitCtx.Err()
+		}
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	j, ok := m.jobs[id]
+	j, ok = m.jobs[id]
 	if !ok {
 		return job.Output{}, fmt.Errorf("job %s: not found", id)
 	}

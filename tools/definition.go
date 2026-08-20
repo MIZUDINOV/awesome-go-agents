@@ -7,6 +7,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"time"
 
 	"github.com/MIZUDINOV/awesome-go-agents/integration"
@@ -283,34 +284,123 @@ func (r *Result) Freeze() *Result {
 	return &out
 }
 
-// cloneResultValue copies the JSON-shaped values used by canonical/model/UI
-// projections without changing the concrete type of typed tool results.
+// cloneResultValue copies JSON-shaped and typed values used by canonical,
+// model/UI projections without changing the concrete type of tool results.
 func cloneResultValue(value any) any {
-	switch typed := value.(type) {
-	case nil:
+	if value == nil {
 		return nil
-	case json.RawMessage:
-		return append(json.RawMessage(nil), typed...)
-	case []byte:
-		return append([]byte(nil), typed...)
-	case map[string]any:
-		out := make(map[string]any, len(typed))
-		for key, item := range typed {
-			out[key] = cloneResultValue(item)
+	}
+	state := &cloneResultState{seen: make(map[cloneResultVisit]reflect.Value)}
+	cloned := cloneResultReflect(reflect.ValueOf(value), state)
+	if !cloned.IsValid() || !cloned.CanInterface() {
+		return nil
+	}
+	return cloned.Interface()
+}
+
+type cloneResultVisit struct {
+	typ  reflect.Type
+	kind reflect.Kind
+	ptr  uintptr
+}
+
+type cloneResultState struct {
+	seen map[cloneResultVisit]reflect.Value
+}
+
+func cloneResultReflect(value reflect.Value, state *cloneResultState) reflect.Value {
+	if !value.IsValid() {
+		return reflect.Value{}
+	}
+	switch value.Kind() {
+	case reflect.Interface:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		cloned := cloneResultReflect(value.Elem(), state)
+		out := reflect.New(value.Type()).Elem()
+		if cloned.IsValid() && cloned.Type().AssignableTo(value.Type()) {
+			out.Set(cloned)
+		} else if cloned.IsValid() && cloned.Type().Implements(value.Type()) {
+			out.Set(cloned)
 		}
 		return out
-	case []any:
-		out := make([]any, len(typed))
-		for i, item := range typed {
-			out[i] = cloneResultValue(item)
+	case reflect.Pointer:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneResultVisit{typ: value.Type(), kind: value.Kind(), ptr: value.Pointer()}
+		if cloned, ok := state.seen[visit]; ok {
+			return cloned
+		}
+		out := reflect.New(value.Type().Elem())
+		state.seen[visit] = out
+		setClonedField(out.Elem(), cloneResultReflect(value.Elem(), state))
+		return out
+	case reflect.Map:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneResultVisit{typ: value.Type(), kind: value.Kind(), ptr: value.Pointer()}
+		if cloned, ok := state.seen[visit]; ok {
+			return cloned
+		}
+		out := reflect.MakeMapWithSize(value.Type(), value.Len())
+		state.seen[visit] = out
+		iter := value.MapRange()
+		for iter.Next() {
+			key := cloneResultReflect(iter.Key(), state)
+			item := cloneResultReflect(iter.Value(), state)
+			if key.IsValid() && item.IsValid() {
+				out.SetMapIndex(key, item)
+			}
 		}
 		return out
-	case []string:
-		return append([]string(nil), typed...)
-	case map[string]string:
-		return map[string]string(typed)
+	case reflect.Slice:
+		if value.IsNil() {
+			return reflect.Zero(value.Type())
+		}
+		visit := cloneResultVisit{typ: value.Type(), kind: value.Kind(), ptr: value.Pointer()}
+		if visit.ptr != 0 {
+			if cloned, ok := state.seen[visit]; ok {
+				return cloned
+			}
+		}
+		out := reflect.MakeSlice(value.Type(), value.Len(), value.Len())
+		if visit.ptr != 0 {
+			state.seen[visit] = out
+		}
+		for i := 0; i < value.Len(); i++ {
+			setClonedField(out.Index(i), cloneResultReflect(value.Index(i), state))
+		}
+		return out
+	case reflect.Array:
+		out := reflect.New(value.Type()).Elem()
+		for i := 0; i < value.Len(); i++ {
+			setClonedField(out.Index(i), cloneResultReflect(value.Index(i), state))
+		}
+		return out
+	case reflect.Struct:
+		out := reflect.New(value.Type()).Elem()
+		out.Set(value)
+		for i := 0; i < value.NumField(); i++ {
+			if !value.Field(i).CanInterface() || !out.Field(i).CanSet() {
+				continue
+			}
+			setClonedField(out.Field(i), cloneResultReflect(value.Field(i), state))
+		}
+		return out
 	default:
 		return value
+	}
+}
+
+func setClonedField(destination, source reflect.Value) {
+	if !destination.IsValid() || !destination.CanSet() || !source.IsValid() {
+		return
+	}
+	if source.Type().AssignableTo(destination.Type()) {
+		destination.Set(source)
 	}
 }
 

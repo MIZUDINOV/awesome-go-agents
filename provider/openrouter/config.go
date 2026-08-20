@@ -9,7 +9,6 @@ import (
 	"math"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 	"unicode/utf8"
 )
@@ -134,5 +133,3 @@ func parseRetryAfter(value string) time.Duration {
 	}
 	return 0
 }
-
-var _ = strings.TrimSpace
