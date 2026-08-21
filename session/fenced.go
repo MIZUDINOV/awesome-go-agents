@@ -286,12 +286,16 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 	var recovery []Event
 	recovery = append(recovery, InterruptedDraftEvents(all, lease.SessionID)...)
 	stepEnds := InterruptedStepEndEvents(all, lease.SessionID)
-	deferredWaiting := len(pendingDeferredCallIDs(all)) > 0
-	if deferredWaiting {
-		stepEnds = nil
+	deferredSteps, deferredTurns := pendingDeferredScopes(all)
+	filteredStepEnds := stepEnds[:0]
+	for _, stepEnd := range stepEnds {
+		if !deferredSteps[draftKey(stepEnd.RunID, stepEnd.TurnID, stepEnd.StepID)] {
+			filteredStepEnds = append(filteredStepEnds, stepEnd)
+		}
 	}
+	stepEnds = filteredStepEnds
 	report.StepsClosed = len(stepEnds)
-	if openTurns > 0 {
+	if openTurns > 0 && !deferredTurns[openTurnID] {
 		report.TurnClosed = true
 	}
 	dangling := danglingCallIDs(all)
@@ -321,19 +325,15 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 	// Keep terminal events ordered: tool outcomes settle dispatch first, then
 	// the step, and only then the containing turn.
 	// A deferred call is an intentional wait, not an interrupted step. Keep
-	// its turn open so the host can resume the original call without creating
-	// a steering turn or losing the tool/result pairing.
-	if deferredWaiting {
-		report.TurnClosed = false
-	} else {
-		recovery = append(recovery, stepEnds...)
-		if openTurns > 0 {
-			recovery = append(recovery, Event{
-				ID: "recover:turn-end:" + openTurnID, RunID: openRunID, TurnID: openTurnID,
-				Type: EventTurnEnd, SessionID: lease.SessionID,
-				Data: mustJSON(map[string]any{"reason": "interrupted"}),
-			})
-		}
+	// only its containing step/turn open; unrelated open lifecycles still need
+	// deterministic recovery closure.
+	recovery = append(recovery, stepEnds...)
+	if openTurns > 0 && !deferredTurns[openTurnID] {
+		recovery = append(recovery, Event{
+			ID: "recover:turn-end:" + openTurnID, RunID: openRunID, TurnID: openTurnID,
+			Type: EventTurnEnd, SessionID: lease.SessionID,
+			Data: mustJSON(map[string]any{"reason": "interrupted"}),
+		})
 	}
 	if len(recovery) > 0 {
 		if _, err := s.AppendFenced(ctx, lease, recovery); err != nil {
@@ -499,32 +499,32 @@ func danglingCallIDs(events []Event) []string {
 	return dangling
 }
 
-func pendingDeferredCallIDs(events []Event) []string {
+func pendingDeferredScopes(events []Event) (map[string]bool, map[string]bool) {
 	state := make(map[string]bool)
-	order := make([]string, 0)
-	seen := make(map[string]bool)
+	locations := make(map[string]Event)
 	for _, event := range events {
 		if event.CallID == "" {
 			continue
 		}
-		if !seen[event.CallID] {
-			seen[event.CallID] = true
-			order = append(order, event.CallID)
-		}
 		switch event.Type {
 		case EventToolDeferred:
 			state[event.CallID] = true
+			locations[event.CallID] = event
 		case EventToolResumeStarted, EventToolResult:
 			state[event.CallID] = false
 		}
 	}
-	pending := make([]string, 0)
-	for _, callID := range order {
-		if state[callID] {
-			pending = append(pending, callID)
+	steps := make(map[string]bool)
+	turns := make(map[string]bool)
+	for callID, pending := range state {
+		if !pending {
+			continue
 		}
+		event := locations[callID]
+		steps[draftKey(event.RunID, event.TurnID, event.StepID)] = true
+		turns[event.TurnID] = true
 	}
-	return pending
+	return steps, turns
 }
 
 func decodeJSON(data []byte, out any) error {

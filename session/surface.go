@@ -100,6 +100,7 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		Fingerprint:  regionFingerprint(s.spec.Compacted),
 		ShadowedSeqs: sortedShadowed(shadowed),
 	}
+	legacySummary := proj.Summary != ""
 
 	// First pass: fold durable compaction transactions into the projection.
 	// Format v1 summaries are kept readable as legacy replacements. Format v2
@@ -116,8 +117,13 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		surfaceSeen   bool
 		end           bool
 	}
+	type surfaceReplacement struct {
+		sourceSeqs []uint64
+		summary    string
+	}
 	transactions := make(map[string]*compactionTransaction)
 	transactionOrder := make([]string, 0)
+	replacements := make([]surfaceReplacement, 0)
 	getTransaction := func(transactionID string) *compactionTransaction {
 		tx := transactions[transactionID]
 		if tx == nil {
@@ -148,6 +154,9 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 	for _, event := range events {
 		switch event.Type {
 		case EventCompactionStart:
+			if event.FormatVersion < 2 {
+				continue
+			}
 			var payload struct {
 				Generation    uint64   `json:"generation"`
 				TransactionID string   `json:"transaction_id"`
@@ -156,10 +165,17 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 			if err := json.Unmarshal(event.Data, &payload); err != nil {
 				return nil, nil, fmt.Errorf("session: decode compaction/start at seq %d: %w", event.Seq, err)
 			}
-			if payload.TransactionID != "" {
-				tx := getTransaction(payload.TransactionID)
-				tx.generation, tx.sourceSeqs, tx.start = payload.Generation, append([]uint64(nil), payload.SourceSeqs...), true
+			if payload.TransactionID == "" {
+				return nil, nil, fmt.Errorf("session: compaction/start at seq %d has no transaction id", event.Seq)
 			}
+			if err := validateCompactionSourceSeqs(payload.SourceSeqs); err != nil {
+				return nil, nil, fmt.Errorf("session: compaction/start at seq %d: %w", event.Seq, err)
+			}
+			tx := getTransaction(payload.TransactionID)
+			if tx.start || tx.summarySeen || tx.surfaceSeen || tx.end {
+				return nil, nil, fmt.Errorf("session: compaction transaction %q has invalid start order", payload.TransactionID)
+			}
+			tx.generation, tx.sourceSeqs, tx.start = payload.Generation, append([]uint64(nil), payload.SourceSeqs...), true
 		case EventCompactionSummary:
 			payload, err := decodeCompactionSummary(event.Data)
 			if err != nil {
@@ -176,16 +192,31 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 				if err := apply(payload.Generation, seqs, payload.Summary, payload.Fingerprint, event.Seq); err != nil {
 					return nil, nil, err
 				}
+				legacySummary = legacySummary || payload.Summary != ""
 				continue
 			}
-			if payload.TransactionID != "" {
-				tx := getTransaction(payload.TransactionID)
-				tx.generation, tx.sourceSeqs, tx.summary, tx.fingerprint, tx.summarySeen = payload.Generation, append([]uint64(nil), payload.SourceSeqs...), payload.Summary, payload.Fingerprint, true
-				if len(tx.sourceSeqs) == 0 {
-					tx.sourceSeqs = append([]uint64(nil), payload.ShadowedSeqs...)
-				}
+			if payload.TransactionID == "" {
+				return nil, nil, fmt.Errorf("session: compaction/summary at seq %d has no transaction id", event.Seq)
 			}
+			seqs := payload.SourceSeqs
+			if len(seqs) == 0 {
+				seqs = payload.ShadowedSeqs
+			}
+			if err := validateCompactionSourceSeqs(seqs); err != nil {
+				return nil, nil, fmt.Errorf("session: compaction/summary at seq %d: %w", event.Seq, err)
+			}
+			tx := getTransaction(payload.TransactionID)
+			if !tx.start || tx.summarySeen || tx.surfaceSeen || tx.end {
+				return nil, nil, fmt.Errorf("session: compaction transaction %q has invalid summary order", payload.TransactionID)
+			}
+			if tx.generation != payload.Generation || !sameSeqs(tx.sourceSeqs, seqs) {
+				return nil, nil, fmt.Errorf("session: compaction transaction %q summary does not match start", payload.TransactionID)
+			}
+			tx.summary, tx.fingerprint, tx.summarySeen = payload.Summary, payload.Fingerprint, true
 		case EventCompactionSurface:
+			if event.FormatVersion < 2 {
+				continue
+			}
 			var payload struct {
 				Generation    uint64   `json:"generation"`
 				TransactionID string   `json:"transaction_id"`
@@ -196,14 +227,24 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 			if err := json.Unmarshal(event.Data, &payload); err != nil {
 				return nil, nil, fmt.Errorf("session: decode compaction/surface at seq %d: %w", event.Seq, err)
 			}
-			if payload.TransactionID != "" {
-				tx := getTransaction(payload.TransactionID)
-				tx.generation, tx.summary, tx.fingerprint, tx.surfaceSeen = payload.Generation, payload.Summary, payload.Fingerprint, true
-				if len(payload.SourceSeqs) > 0 {
-					tx.sourceSeqs = append([]uint64(nil), payload.SourceSeqs...)
-				}
+			if payload.TransactionID == "" {
+				return nil, nil, fmt.Errorf("session: compaction/surface at seq %d has no transaction id", event.Seq)
 			}
+			if err := validateCompactionSourceSeqs(payload.SourceSeqs); err != nil {
+				return nil, nil, fmt.Errorf("session: compaction/surface at seq %d: %w", event.Seq, err)
+			}
+			tx := getTransaction(payload.TransactionID)
+			if !tx.start || !tx.summarySeen || tx.surfaceSeen || tx.end {
+				return nil, nil, fmt.Errorf("session: compaction transaction %q has invalid surface order", payload.TransactionID)
+			}
+			if tx.generation != payload.Generation || !sameSeqs(tx.sourceSeqs, payload.SourceSeqs) || tx.summary != payload.Summary || tx.fingerprint != payload.Fingerprint {
+				return nil, nil, fmt.Errorf("session: compaction transaction %q surface does not match summary", payload.TransactionID)
+			}
+			tx.surfaceSeen = true
 		case EventCompactionEnd:
+			if event.FormatVersion < 2 {
+				continue
+			}
 			var payload struct {
 				Generation    uint64 `json:"generation"`
 				TransactionID string `json:"transaction_id"`
@@ -211,9 +252,17 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 			if err := json.Unmarshal(event.Data, &payload); err != nil {
 				return nil, nil, fmt.Errorf("session: decode compaction/end at seq %d: %w", event.Seq, err)
 			}
-			if tx := transactions[payload.TransactionID]; tx != nil {
-				tx.generation, tx.end = payload.Generation, true
+			if payload.TransactionID == "" {
+				return nil, nil, fmt.Errorf("session: compaction/end at seq %d has no transaction id", event.Seq)
 			}
+			tx := transactions[payload.TransactionID]
+			if tx == nil || !tx.start || !tx.summarySeen || !tx.surfaceSeen || tx.end {
+				return nil, nil, fmt.Errorf("session: compaction transaction %q has invalid end order", payload.TransactionID)
+			}
+			if tx.generation != payload.Generation {
+				return nil, nil, fmt.Errorf("session: compaction transaction %q end does not match start", payload.TransactionID)
+			}
+			tx.end = true
 		}
 	}
 	for _, transactionID := range transactionOrder {
@@ -224,6 +273,7 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		if err := apply(tx.generation, tx.sourceSeqs, tx.summary, tx.fingerprint, 0); err != nil {
 			return nil, nil, err
 		}
+		replacements = append(replacements, surfaceReplacement{sourceSeqs: append([]uint64(nil), tx.sourceSeqs...), summary: tx.summary})
 	}
 	proj.ShadowedSeqs = sortedShadowed(shadowed)
 
@@ -233,12 +283,15 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		return nil, nil, err
 	}
 
-	// Second pass: build the messages from non-shadowed surface events.
-	var messages []*llm.Message
+	// Second pass: build surface nodes from non-shadowed events. A durable
+	// replacement is inserted where its first source surface event lived;
+	// source seqs are not treated as a numeric range.
+	type surfaceNode struct {
+		seq      uint64
+		messages []*llm.Message
+	}
+	nodes := make([]surfaceNode, 0)
 	for _, event := range events {
-		if shadowed[event.Seq] {
-			continue
-		}
 		if !event.Type.Surface() {
 			continue
 		}
@@ -246,13 +299,49 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		messages = append(messages, extra...)
+		nodes = append(nodes, surfaceNode{seq: event.Seq, messages: extra})
+	}
+	for _, replacement := range replacements {
+		selected := make(map[uint64]bool, len(replacement.sourceSeqs))
+		for _, seq := range replacement.sourceSeqs {
+			selected[seq] = true
+		}
+		insertAt := -1
+		for index, node := range nodes {
+			if selected[node.seq] {
+				insertAt = index
+				break
+			}
+		}
+		if insertAt < 0 {
+			return nil, nil, fmt.Errorf("session: compaction replacement has no visible source surface")
+		}
+		folded := make([]surfaceNode, 0, len(nodes)-len(selected)+1)
+		inserted := false
+		for _, node := range nodes {
+			if selected[node.seq] {
+				if !inserted {
+					folded = append(folded, surfaceNode{messages: []*llm.Message{llm.NewUserMessage(replacement.summary)}})
+					inserted = true
+				}
+				continue
+			}
+			folded = append(folded, node)
+		}
+		nodes = folded
+	}
+	var messages []*llm.Message
+	for _, node := range nodes {
+		if node.seq != 0 && shadowed[node.seq] {
+			continue
+		}
+		messages = append(messages, node.messages...)
 	}
 
 	if s.spec.SystemSnapshot != "" {
 		messages = append([]*llm.Message{llm.NewTextMessage(llm.RoleSystem, s.spec.SystemSnapshot)}, messages...)
 	}
-	if proj.Summary != "" {
+	if legacySummary && len(replacements) == 0 && proj.Summary != "" {
 		messages = append([]*llm.Message{llm.NewUserMessage(proj.Summary)}, messages...)
 	}
 	return messages, proj, nil
@@ -404,6 +493,32 @@ func decodeCompactionSummary(data json.RawMessage) (compactionSummaryPayload, er
 		return payload, fmt.Errorf("decode payload: %w", err)
 	}
 	return payload, nil
+}
+
+func validateCompactionSourceSeqs(seqs []uint64) error {
+	if len(seqs) == 0 {
+		return fmt.Errorf("source_seqs must not be empty")
+	}
+	seen := make(map[uint64]bool, len(seqs))
+	for _, seq := range seqs {
+		if seq == 0 || seen[seq] {
+			return fmt.Errorf("source_seqs must contain unique positive sequences")
+		}
+		seen[seq] = true
+	}
+	return nil
+}
+
+func sameSeqs(left, right []uint64) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // validatePairing ensures no visible tool/result is orphaned by shadowing:

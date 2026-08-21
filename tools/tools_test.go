@@ -218,14 +218,31 @@ func TestValidateInput(t *testing.T) {
 	}
 }
 
-func TestValidateInputConstraints(t *testing.T) {
-	schema := json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","maxLength":3},"count":{"type":"integer","minimum":1,"maximum":2},"tags":{"type":"array","minItems":1,"maxItems":2}},"required":["name","count"]}`)
-	if err := ValidateInput(schema, []byte(`{"name":"ok","count":1,"tags":["one"]}`)); err != nil {
-		t.Fatalf("valid constrained input rejected: %v", err)
+func TestValidateInputRejectsUnsupportedConstraints(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","maxLength":3}}}`)
+	if err := ValidateSchema(schema); !errors.Is(err, ErrUnsupportedSchema) {
+		t.Fatalf("constraint schema error = %v, want ErrUnsupportedSchema", err)
 	}
-	for _, input := range []string{`{"name":"long","count":1}`, `{"name":"ok","count":0}`, `{"name":"ok","count":1,"tags":[]}`} {
-		if err := ValidateInput(schema, []byte(input)); err == nil {
-			t.Fatalf("invalid constrained input accepted: %s", input)
+}
+
+func TestValidateSchemaMatchesDSHSubset(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"mode":{"type":"string","enum":["safe","fast"],"const":"safe"}},"required":["mode"],"additionalProperties":false}`)
+	if err := ValidateInput(schema, []byte(`{"mode":"safe"}`)); err != nil {
+		t.Fatalf("valid const input rejected: %v", err)
+	}
+	if err := ValidateInput(schema, []byte(`{"mode":"fast"}`)); err == nil {
+		t.Fatal("const mismatch accepted")
+	}
+	invalid := []json.RawMessage{
+		json.RawMessage(`{"oneOf":[{"type":"string"}]}`),
+		json.RawMessage(`{"type":"string","oneOf":[{"type":"string"},{"type":"number"}]}`),
+		json.RawMessage(`{"properties":{"name":{"type":"string"}}}`),
+		json.RawMessage(`{"type":"string","minimum":1}`),
+		json.RawMessage(`{"const":"safe"}`),
+	}
+	for _, candidate := range invalid {
+		if err := ValidateSchema(candidate); err == nil {
+			t.Fatalf("unsupported schema accepted: %s", candidate)
 		}
 	}
 }
@@ -482,6 +499,23 @@ func TestDefineToolRejectsSchemaDrift(t *testing.T) {
 	})
 	if err := (New(Options{})).Register(definition); !errors.Is(err, ErrInvalidArguments) {
 		t.Fatalf("Register error=%v, want typed schema mismatch", err)
+	}
+}
+
+func TestDefineToolRejectsOutputSchemaDrift(t *testing.T) {
+	type input struct {
+		Name string `json:"name" jsonschema:"required"`
+	}
+	type output struct {
+		Count int `json:"count" jsonschema:"required"`
+	}
+	definition := DefineTool[input, output](DefineToolOptions[input, output]{
+		Name:         "typed_output_drift",
+		OutputSchema: json.RawMessage(`{"type":"object","properties":{"other":{"type":"string"}}}`),
+		Execute:      func(context.Context, ExecContext, input) (output, error) { return output{Count: 1}, nil },
+	})
+	if err := (New(Options{})).Register(definition); !errors.Is(err, ErrInvalidArguments) {
+		t.Fatalf("Register error=%v, want typed output schema mismatch", err)
 	}
 }
 

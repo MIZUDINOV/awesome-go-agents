@@ -138,22 +138,18 @@ func (d *Definition) IsConcurrencySafe(input json.RawMessage) bool {
 // When a schema override is omitted, it is generated from the corresponding
 // Go type, keeping typed decoding and model validation on one source of truth.
 type DefineToolOptions[I any, O any] struct {
-	Name         string
-	Description  string
-	Version      string
-	InputSchema  json.RawMessage
-	OutputSchema json.RawMessage
-	// OutputSchemaAuthoritative allows a host adapter to expose a strict
-	// envelope around a runtime JSON payload whose concrete shape is supplied
-	// by a separately versioned host contract. Input remains fully typed.
-	OutputSchemaAuthoritative bool
-	Timeout                   time.Duration
-	MutatesWorkspace          bool
-	ConcurrencySafe           func(I) bool
-	Execute                   func(context.Context, ExecContext, I) (O, error)
-	RenderModel               func(O) (any, error)
-	PresentUI                 func(O) (map[string]any, error)
-	FinalizeContent           func(*Result) error
+	Name             string
+	Description      string
+	Version          string
+	InputSchema      json.RawMessage
+	OutputSchema     json.RawMessage
+	Timeout          time.Duration
+	MutatesWorkspace bool
+	ConcurrencySafe  func(I) bool
+	Execute          func(context.Context, ExecContext, I) (O, error)
+	RenderModel      func(O) (any, error)
+	PresentUI        func(O) (map[string]any, error)
+	FinalizeContent  func(*Result) error
 }
 
 // DefineTool converts a typed definition into the runtime representation.
@@ -209,9 +205,7 @@ func DefineTool[I any, O any](opts DefineToolOptions[I, O]) *Definition {
 		},
 		FinalizeContent: opts.FinalizeContent,
 	}
-	if !opts.OutputSchemaAuthoritative {
-		definition.typedOutputSchema = expectedOutputSchema
-	}
+	definition.typedOutputSchema = expectedOutputSchema
 	return definition
 }
 

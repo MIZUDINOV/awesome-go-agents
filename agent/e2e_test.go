@@ -291,7 +291,7 @@ func TestE2E_ScenarioF_ProviderOverflow(t *testing.T) {
 	ws := t.TempDir()
 	h := newHarness(t, ws, "F", []e2eStep{{text: "recovered"}, {text: "done"}}, Config{
 		Model: "m", Owner: "F", SystemPrompt: "sys", MaxContextRetries: 2,
-		ContextWindow: 60, MaxOutput: 10, CompactThresholdRatio: 0.80,
+		ContextWindow: 10000, MaxOutput: 10, CompactThresholdRatio: 0.80,
 		Compactor: &countingCompactor{f: func(generation uint64, events []session.Event, sourceSeqs []uint64) (string, string, error) {
 			return "[summary]", "fp-F", nil
 		}},
@@ -306,7 +306,10 @@ func TestE2E_ScenarioF_ProviderOverflow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = h.store.AppendFenced(context.Background(), lease, []session.Event{{SessionID: "e2e-F", Type: session.EventUserMessage, Data: session.UserText(strings.Repeat("old ", 40))}})
+	_, err = h.store.AppendFenced(context.Background(), lease, []session.Event{
+		{SessionID: "e2e-F", Type: session.EventUserMessage, Data: session.UserText(strings.Repeat("old ", 40))},
+		{SessionID: "e2e-F", Type: session.EventUserMessage, Data: session.UserText(strings.Repeat("older ", 40))},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

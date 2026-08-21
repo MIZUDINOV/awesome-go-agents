@@ -131,8 +131,8 @@ func (s *Session) CompactionSummary(ctx context.Context, generation uint64, tran
 	if transactionID == "" {
 		return 0, fmt.Errorf("session: compaction requires a transaction id")
 	}
-	if len(shadowedSeqs) == 0 && throughSeq == 0 {
-		return 0, fmt.Errorf("session: compaction covers no events")
+	if len(shadowedSeqs) == 0 {
+		return 0, fmt.Errorf("session: compaction requires exact shadowed sequences")
 	}
 	common := Event{SessionID: s.ID}
 	start := common

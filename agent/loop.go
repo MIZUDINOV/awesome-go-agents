@@ -369,6 +369,17 @@ func (l *Loop) ResumeTool(ctx context.Context, request ToolResume) error {
 	if resumeStarted {
 		return ErrDeferredExecutionStarted
 	}
+	em := &emitter{sessionID: l.SessionID, runID: deferred.RunID, n: l.eventCount()}
+	// The compatibility path accepts an externally materialized result, but it
+	// still records the same side-effect barrier as the in-process resume path.
+	// A crash after this point must become UNKNOWN rather than invite a retry.
+	if err := l.append(durableContext(ctx), lease, session.Event{
+		ID: em.id(), SessionID: l.SessionID, RunID: deferred.RunID, TurnID: deferred.TurnID, StepID: deferred.StepID,
+		CallID: request.CallID, Type: session.EventToolResumeStarted,
+		Data: session.ToolResumeStartedPayload(request.CallID, toolName, request.ResumeKey),
+	}); err != nil {
+		return err
+	}
 	result := request.Result
 	if result == nil {
 		result = &tools.Result{Name: toolName, CallID: request.CallID}
@@ -379,7 +390,6 @@ func (l *Loop) ResumeTool(ctx context.Context, request ToolResume) error {
 	if result.Name == "" {
 		result.Name = toolName
 	}
-	em := &emitter{sessionID: l.SessionID, runID: deferred.RunID, n: l.eventCount()}
 	continuation, err := l.appendToolOutcome(durableContext(ctx), lease, em, tools.Outcome{
 		Call: tools.Call{Name: result.Name, CallID: request.CallID}, Result: result, Err: request.Err,
 	}, deferred.TurnID, deferred.StepID)
@@ -1064,7 +1074,10 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 	}
 	stepEnded := false
 	defer func() {
-		if err != nil && !stepEnded {
+		// A deferred tool leaves the step open until its original call is
+		// resumed. Closing it here would put step/end before tool/result and
+		// force recovery to invent a second step boundary.
+		if err != nil && !stepEnded && !errors.Is(err, ErrToolDeferred) {
 			_ = l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventStepEnd, Data: strJSON("error")})
 		}
 	}()
@@ -1378,13 +1391,13 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 			continuation = toolConclude
 		}
 	}
+	if continuation == toolDeferred {
+		return false, "tool_deferred", ErrToolDeferred
+	}
 	if err := l.append(persistCtx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventStepEnd, Data: strJSON("tools_done")}); err != nil {
 		return false, "", err
 	}
 	stepEnded = true
-	if continuation == toolDeferred {
-		return false, "tool_deferred", ErrToolDeferred
-	}
 	if ctx.Err() != nil {
 		return false, "", ErrStopped
 	}
@@ -1783,7 +1796,11 @@ func (l *Loop) preflight(ctx context.Context, lease session.Lease, compacted *in
 func (l *Loop) compactFallback(ctx context.Context, lease session.Lease, msgs []*llm.Message) (uint64, error) {
 	events := l.snapshotEvents()
 	generation := l.nextGeneration(ctx)
-	shadowed := shadowedSeqsRetainingTail(events, l.Config.RetainTailEvents)
+	_, projection, err := l.project(ctx)
+	if err != nil {
+		return 0, err
+	}
+	shadowed := shadowedSeqsRetainingTail(events, l.Config.RetainTailEvents, projection.ShadowedSeqs)
 	if len(shadowed) == 0 {
 		return 0, fmt.Errorf("agent: no compactable surface before retained tail")
 	}
@@ -1838,7 +1855,11 @@ func (l *Loop) compact(ctx context.Context, lease session.Lease) (uint64, error)
 	}
 	events := l.snapshotEvents()
 	generation := l.nextGeneration(ctx)
-	shadowed := shadowedSeqsRetainingTail(events, l.Config.RetainTailEvents)
+	_, projection, err := l.project(ctx)
+	if err != nil {
+		return 0, err
+	}
+	shadowed := shadowedSeqsRetainingTail(events, l.Config.RetainTailEvents, projection.ShadowedSeqs)
 	if len(shadowed) == 0 {
 		return 0, fmt.Errorf("agent: no compactable surface before retained tail")
 	}
@@ -2113,10 +2134,14 @@ func normalizeToolCallParts(parts []llm.Part, em *emitter) ([]llm.Part, []llm.To
 	return normalized, calls, nil
 }
 
-func shadowedSeqsRetainingTail(events []session.Event, retain int) []uint64 {
+func shadowedSeqsRetainingTail(events []session.Event, retain int, alreadyShadowed []uint64) []uint64 {
+	shadowed := make(map[uint64]bool, len(alreadyShadowed))
+	for _, seq := range alreadyShadowed {
+		shadowed[seq] = true
+	}
 	surface := make([]session.Event, 0, len(events))
 	for _, event := range events {
-		if event.Type.Surface() {
+		if event.Type.Surface() && !shadowed[event.Seq] {
 			surface = append(surface, event)
 		}
 	}

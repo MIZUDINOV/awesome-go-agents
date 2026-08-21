@@ -305,6 +305,39 @@ func TestSurfaceV2CompactionUsesExactSourceSeqs(t *testing.T) {
 	}
 }
 
+func TestSurfaceV2CompactionReplacesExactSurfaceSpan(t *testing.T) {
+	format := EventFormatVersion
+	events := []Event{
+		{Seq: 1, FormatVersion: format, Type: EventUserMessage, Data: UserText("prefix")},
+		{Seq: 2, FormatVersion: format, Type: EventAssistantMessage, Data: AssistantContent("old A", "", nil)},
+		{Seq: 3, FormatVersion: format, Type: EventUserMessage, Data: UserText("old B")},
+		{Seq: 4, FormatVersion: format, Type: EventAssistantMessage, Data: AssistantContent("tail", "", nil)},
+		{Seq: 5, FormatVersion: format, Type: EventCompactionStart, Data: CompactionStartPayload(1, "tx-span", []uint64{2, 3})},
+		{Seq: 6, FormatVersion: format, Type: EventCompactionSummary, Data: CompactionSummaryPayload(1, "tx-span", 3, []uint64{2, 3}, "summary", "fp")},
+		{Seq: 7, FormatVersion: format, Type: EventCompactionSurface, Data: CompactionSurfacePayload(1, "tx-span", []uint64{2, 3}, "summary", "fp")},
+		{Seq: 8, FormatVersion: format, Type: EventCompactionEnd, Data: CompactionEndPayload(1, "tx-span")},
+	}
+	msgs, _, err := NewSurface(SurfaceSpec{}).Project(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 3 || msgs[0].Text() != "prefix" || msgs[1].Text() != "summary" || msgs[2].Text() != "tail" {
+		t.Fatalf("surface replacement moved or lost prefix/tail: %+v", msgs)
+	}
+}
+
+func TestSurfaceRejectsMismatchedCompactionTransaction(t *testing.T) {
+	format := EventFormatVersion
+	events := []Event{
+		{Seq: 1, FormatVersion: format, Type: EventUserMessage, Data: UserText("old")},
+		{Seq: 2, FormatVersion: format, Type: EventCompactionStart, Data: CompactionStartPayload(1, "tx-bad", []uint64{1})},
+		{Seq: 3, FormatVersion: format, Type: EventCompactionSummary, Data: CompactionSummaryPayload(1, "tx-bad", 2, []uint64{2}, "summary", "fp")},
+	}
+	if _, _, err := NewSurface(SurfaceSpec{}).Project(events); err == nil {
+		t.Fatal("mismatched compaction transaction should be rejected")
+	}
+}
+
 func TestSurfaceV2InterruptedCompactionDoesNotChangeSurface(t *testing.T) {
 	format := EventFormatVersion
 	events := []Event{
@@ -348,6 +381,13 @@ func TestSessionDurableCompaction(t *testing.T) {
 	}
 	if _, err := session.CompactionSummary(ctx, 1, "tx-1", 2, []uint64{1, 2}, "SUMMARY", "fp-1"); err != nil {
 		t.Fatalf("compaction: %v", err)
+	}
+	events, err := session.Events(ctx)
+	if err != nil {
+		t.Fatalf("events after compaction: %v", err)
+	}
+	if len(events) != 7 {
+		t.Fatalf("raw history length = %d, want 7 (compaction is a projection replacement)", len(events))
 	}
 	// Re-hydrate from a fresh session over the same store: identical surface.
 	replay := NewSession("s1", store)

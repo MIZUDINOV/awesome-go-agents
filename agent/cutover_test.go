@@ -85,13 +85,14 @@ func TestDeferredToolCanResumeThroughAgentAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var deferred, result bool
+	var deferred, resumeStarted, result bool
 	for _, event := range events {
 		deferred = deferred || event.Type == session.EventToolDeferred
+		resumeStarted = resumeStarted || event.Type == session.EventToolResumeStarted && event.CallID == "call-1"
 		result = result || event.Type == session.EventToolResult && event.CallID == "call-1"
 	}
-	if !deferred || !result {
-		t.Fatalf("deferred=%v result=%v, want both durable events", deferred, result)
+	if !deferred || !resumeStarted || !result {
+		t.Fatalf("deferred=%v resume_started=%v result=%v, want durable resume barrier", deferred, resumeStarted, result)
 	}
 }
 
@@ -132,8 +133,9 @@ func TestDeferredToolResumesOriginalCallWithoutNewTurn(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	turnStarts, resumeStarts, results := 0, 0, 0
-	resumeIndex, resultIndex := -1, -1
+	turnStarts, resumeStarts, results, resolvedStepEnds := 0, 0, 0, 0
+	resumeIndex, resultIndex, resolvedStepEndIndex := -1, -1, -1
+	resolvedStepID := ""
 	for index, event := range events {
 		switch event.Type {
 		case session.EventTurnStart:
@@ -145,11 +147,20 @@ func TestDeferredToolResumesOriginalCallWithoutNewTurn(t *testing.T) {
 			if event.CallID == "call-1" {
 				results++
 				resultIndex = index
+				resolvedStepID = event.StepID
+			}
+		case session.EventStepEnd:
+			if resolvedStepID != "" && event.StepID == resolvedStepID {
+				resolvedStepEnds++
+				resolvedStepEndIndex = index
 			}
 		}
 	}
 	if turnStarts != 1 || resumeStarts != 1 || results != 1 || resumeIndex < 0 || resultIndex <= resumeIndex {
 		t.Fatalf("resume lifecycle turns=%d resume_started=%d results=%d indexes=%d/%d", turnStarts, resumeStarts, results, resumeIndex, resultIndex)
+	}
+	if resolvedStepEnds != 1 || resolvedStepEndIndex <= resultIndex {
+		t.Fatalf("deferred step lifecycle step_ends=%d result=%d step_end=%d", resolvedStepEnds, resultIndex, resolvedStepEndIndex)
 	}
 }
 

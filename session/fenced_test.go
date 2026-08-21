@@ -215,6 +215,39 @@ func TestRecoverKeepsDeferredToolWaiting(t *testing.T) {
 	}
 }
 
+func TestRecoverClosesUnrelatedStepBesideDeferredStep(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	lease, _ := store.ClaimLease(ctx, "s-deferred-scope", "w", time.Minute, "tenant-1")
+	if _, err := store.AppendFenced(ctx, lease, []Event{
+		{RunID: "run-1", TurnID: "turn-1", Type: EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-deferred", Type: EventStepStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-deferred", CallID: "call-1", Type: EventToolCall, ID: "call-1", Data: ToolCallPayload("call-1", "read", json.RawMessage(`{}`))},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-deferred", CallID: "call-1", Type: EventToolDeferred, Data: json.RawMessage(`{"name":"read","resume_key":"workspace:call-1"}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-unrelated", Type: EventStepStart, Data: json.RawMessage(`{}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.ReleaseLease(ctx, lease)
+	lease, _ = store.ClaimLease(ctx, "s-deferred-scope", "w2", time.Minute, "tenant-1")
+	report, err := store.Recover(ctx, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.StepsClosed != 1 || report.TurnClosed {
+		t.Fatalf("recovery scope report = %+v, want one unrelated step and open deferred turn", report)
+	}
+	all, _ := store.Load(ctx, "s-deferred-scope", 0, 0)
+	for _, event := range all {
+		if event.Type != EventStepEnd {
+			continue
+		}
+		if event.StepID != "step-unrelated" {
+			t.Fatalf("recovery closed deferred step %q", event.StepID)
+		}
+	}
+}
+
 func TestRecoverMarksResumeStartedAsUnknown(t *testing.T) {
 	store := NewMemoryStore()
 	ctx := context.Background()
