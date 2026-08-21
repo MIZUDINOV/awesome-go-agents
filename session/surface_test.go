@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"testing"
 	"time"
 
@@ -323,6 +324,51 @@ func TestSurfaceV2CompactionReplacesExactSurfaceSpan(t *testing.T) {
 	}
 	if len(msgs) != 3 || msgs[0].Text() != "prefix" || msgs[1].Text() != "summary" || msgs[2].Text() != "tail" {
 		t.Fatalf("surface replacement moved or lost prefix/tail: %+v", msgs)
+	}
+}
+
+func TestSurfaceV2DurableReplacementCanBeCompactedAgain(t *testing.T) {
+	format := EventFormatVersion
+	first := CompactionSurfaceReplacementPayload(1, "tx-1", []uint64{1}, "summary one", []ContentBlock{TextBlock("summary one")}, "fp-1")
+	second := CompactionSurfaceReplacementPayload(2, "tx-2", []uint64{5}, "summary two", []ContentBlock{TextBlock("summary two")}, "fp-2")
+	events := []Event{
+		{Seq: 1, FormatVersion: format, Type: EventUserMessage, Data: UserText("old")},
+		{Seq: 2, FormatVersion: format, Type: EventUserMessage, Data: UserText("tail")},
+		{Seq: 3, FormatVersion: format, Type: EventCompactionStart, Data: CompactionStartPayload(1, "tx-1", []uint64{1})},
+		{Seq: 4, FormatVersion: format, Type: EventCompactionSummary, Data: CompactionSummaryPayload(1, "tx-1", 1, []uint64{1}, "summary one", "fp-1")},
+		{Seq: 5, FormatVersion: format, Type: EventUserMessage, Data: first},
+		{Seq: 6, FormatVersion: format, Type: EventCompactionEnd, Data: CompactionEndPayload(1, "tx-1")},
+		{Seq: 7, FormatVersion: format, Type: EventCompactionStart, Data: CompactionStartPayload(2, "tx-2", []uint64{5})},
+		{Seq: 8, FormatVersion: format, Type: EventCompactionSummary, Data: CompactionSummaryPayload(2, "tx-2", 5, []uint64{5}, "summary two", "fp-2")},
+		{Seq: 9, FormatVersion: format, Type: EventUserMessage, Data: second},
+		{Seq: 10, FormatVersion: format, Type: EventCompactionEnd, Data: CompactionEndPayload(2, "tx-2")},
+	}
+	msgs, projection, err := NewSurface(SurfaceSpec{}).Project(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 || msgs[0].Text() != "summary two" || msgs[1].Text() != "tail" {
+		t.Fatalf("recompacted durable surface = %+v", msgs)
+	}
+	if !reflect.DeepEqual(projection.ShadowedSeqs, []uint64{1, 5}) {
+		t.Fatalf("shadowed source seqs = %v, want [1 5]", projection.ShadowedSeqs)
+	}
+}
+
+func TestSurfaceV2OpenCompactionDoesNotExposeReplacement(t *testing.T) {
+	format := EventFormatVersion
+	events := []Event{
+		{Seq: 1, FormatVersion: format, Type: EventUserMessage, Data: UserText("old")},
+		{Seq: 2, FormatVersion: format, Type: EventCompactionStart, Data: CompactionStartPayload(1, "tx-open", []uint64{1})},
+		{Seq: 3, FormatVersion: format, Type: EventCompactionSummary, Data: CompactionSummaryPayload(1, "tx-open", 1, []uint64{1}, "summary", "fp")},
+		{Seq: 4, FormatVersion: format, Type: EventUserMessage, Data: CompactionSurfaceReplacementPayload(1, "tx-open", []uint64{1}, "summary", []ContentBlock{TextBlock("summary")}, "fp")},
+	}
+	msgs, projection, err := NewSurface(SurfaceSpec{}).Project(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Text() != "old" || projection.Summary != "" {
+		t.Fatalf("open replacement changed surface: messages=%+v projection=%+v", msgs, projection)
 	}
 }
 

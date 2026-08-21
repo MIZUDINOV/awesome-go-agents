@@ -127,10 +127,14 @@ func TestRecoverClosesTurnAndMarksUnknown(t *testing.T) {
 	for _, e := range all {
 		if e.Type == EventToolResult && e.CallID == "call1" {
 			var p struct {
-				Code string `json:"code"`
+				Code   string          `json:"code"`
+				Output json.RawMessage `json:"output"`
 			}
 			_ = json.Unmarshal(e.Data, &p)
 			if p.Code == "TOOL_OUTCOME_UNKNOWN" {
+				if len(p.Output) != 0 {
+					t.Fatalf("recovery canonical output leaked into durable result: %s", e.Data)
+				}
 				foundUnknown = true
 			}
 		}

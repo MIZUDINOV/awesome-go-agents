@@ -102,6 +102,7 @@ type CompactionCheckpoint struct {
 	ThroughSeq        uint64
 	ShadowedSeqs      []uint64
 	Summary           string
+	SummaryBlocks     []ContentBlock
 	SummarySHA256     string
 	SourceFingerprint string
 }
@@ -313,13 +314,11 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 		if !dispatched[callID] {
 			code = "ABORTED_BEFORE_DISPATCH"
 		}
+		content := mustJSON(map[string]any{"error": map[string]any{"code": code, "message": "The tool outcome was not durably observed."}})
 		recovery = append(recovery, Event{
 			ID: "recover:unknown:" + callID, RunID: callEvent.RunID, TurnID: callEvent.TurnID,
 			StepID: callEvent.StepID, Type: EventToolResult, SessionID: lease.SessionID, CallID: callID,
-			Data: mustJSON(map[string]any{
-				"call_id": callID, "name": callName, "is_error": true, "code": code,
-				"output": map[string]any{},
-			}),
+			Data: ToolResultStructuredPayloadWithContent(callID, callName, content, nil, code, true, nil, nil, false),
 		})
 	}
 	// Keep terminal events ordered: tool outcomes settle dispatch first, then

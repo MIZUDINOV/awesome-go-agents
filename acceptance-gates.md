@@ -40,7 +40,7 @@ go test -tags integration ./internal/projectchat/... -count=1
 | read-before-edit + CAS | `LocalFileSystem` observation registry + content-hash version CAS (`ErrStaleVersion`/`ErrNotObserved`) | `integration/local/local_test.go`, `tools/core/core_test.go`, `agent/e2e_test.go` (scenarios A, B) |
 | sandbox containment | `LocalSandbox` same boundary for file and command admission; stable `SANDBOX_DENIED_*` codes; never suggests a bash bypass | `integration/local/local_test.go`, `agent/e2e_test.go` (scenario I) |
 | crash recovery | `FencedStore.Recover` (turn close + `TOOL_OUTCOME_UNKNOWN`), run by the loop before any new work | `agent/agent_test.go`, `wzhooh-back/internal/projectchat` host-store tests |
-| context overflow/compaction integrity | `preflight` prune->compact->bounded retry; durable `compaction/start|summary|end` + ledger checkpoint | `agent/agent_test.go`, `agent/e2e_test.go` (scenarios E, F) |
+| context overflow/compaction integrity | `preflight` prune->compact->bounded retry; durable `compaction/start -> summary -> user/message(surface_op=replace) -> end` + ledger checkpoint | `agent/agent_test.go`, `agent/e2e_test.go` (scenarios E, F) |
 | stateful public Agent | durable ordered inbox, next-step steering/injection, approval pause/resume, idle/dispose lifecycle | `agent/agent_test.go` |
 | commit-before-publish events | replay/live handoff, sequence ordering under concurrent commits, bounded lag termination and cursor recovery | `agent/events.go`, `agent/agent_test.go` |
 | typed content and streaming recovery | block codecs, durable assistant chunks, assembled interrupted drafts and media | `session/blocks.go`, `session/recovery.go`, `agent/loop.go` |

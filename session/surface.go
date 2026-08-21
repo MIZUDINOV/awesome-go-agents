@@ -10,8 +10,8 @@ import (
 )
 
 // CompactedRegion describes a slice of events that has been summarised. The
-// projection replaces that region with a single synthetic user message carrying
-// the summary.
+// projection replaces that region with a single user message carrying the
+// structured summary.
 //
 // ShadowedSeqs, when present, is the EXACT list of shadowed sequences
 // (H-SURFACE-005); ThroughSeq is the inclusive prefix convenience kept for
@@ -26,6 +26,9 @@ type CompactedRegion struct {
 	ShadowedSeqs []uint64
 	// Summary is the compaction checkpoint text.
 	Summary string
+	// SummaryBlocks is the structured replacement content. Summary is retained
+	// as a compatibility projection for older callers.
+	SummaryBlocks []ContentBlock
 	// Generation increases each time the region is replaced (H-SURFACE-010).
 	Generation uint64
 	// Fingerprint digests the source region for drift detection.
@@ -54,15 +57,17 @@ type Projection struct {
 	ShadowedSeqs []uint64
 	// Summary is the effective checkpoint text ("" when nothing is shadowed).
 	Summary string
+	// SummaryBlocks is the structured summary content used by the model surface.
+	SummaryBlocks []ContentBlock
 	// Fingerprint digests the shadowed source region.
 	Fingerprint string
 }
 
 // Surface projects a run of events into provider-neutral LLM messages. It is
 // the durable-history → model-context boundary: diagnostic events (turn/step
-// lifecycles, chunks, usage, tool/call, compaction bookkeeping) never reach
-// the model. Projection is deterministic: replaying the same log produces the
-// identical surface (H-SURFACE-009).
+// lifecycles, chunks, usage, tool/call and incomplete compaction transactions)
+// never reach the model. Projection is deterministic: replaying the same log
+// produces the identical surface (H-SURFACE-009).
 type Surface struct {
 	spec SurfaceSpec
 }
@@ -95,10 +100,11 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 	}
 
 	proj := &Projection{
-		Generation:   regionGeneration(s.spec.Compacted),
-		Summary:      regionSummary(s.spec.Compacted),
-		Fingerprint:  regionFingerprint(s.spec.Compacted),
-		ShadowedSeqs: sortedShadowed(shadowed),
+		Generation:    regionGeneration(s.spec.Compacted),
+		Summary:       regionSummary(s.spec.Compacted),
+		SummaryBlocks: regionSummaryBlocks(s.spec.Compacted),
+		Fingerprint:   regionFingerprint(s.spec.Compacted),
+		ShadowedSeqs:  sortedShadowed(shadowed),
 	}
 	legacySummary := proj.Summary != ""
 
@@ -107,19 +113,23 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 	// requires the explicit surface event and a sealed end event, so an
 	// interrupted transaction cannot change the model surface during replay.
 	type compactionTransaction struct {
-		generation    uint64
-		transactionID string
-		sourceSeqs    []uint64
-		summary       string
-		fingerprint   string
-		start         bool
-		summarySeen   bool
-		surfaceSeen   bool
-		end           bool
+		generation      uint64
+		transactionID   string
+		sourceSeqs      []uint64
+		summary         string
+		summaryBlocks   []ContentBlock
+		fingerprint     string
+		start           bool
+		summarySeen     bool
+		replacementSeen bool
+		replacementSeq  uint64
+		end             bool
 	}
 	type surfaceReplacement struct {
-		sourceSeqs []uint64
-		summary    string
+		sourceSeqs     []uint64
+		summary        string
+		blocks         []ContentBlock
+		replacementSeq uint64
 	}
 	transactions := make(map[string]*compactionTransaction)
 	transactionOrder := make([]string, 0)
@@ -133,7 +143,7 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		}
 		return tx
 	}
-	apply := func(generation uint64, sourceSeqs []uint64, summary, fingerprint string, seq uint64) error {
+	apply := func(generation uint64, sourceSeqs []uint64, summary string, blocks []ContentBlock, fingerprint string, seq uint64) error {
 		if generation > 0 && generation < proj.Generation {
 			return fmt.Errorf("session: compaction generation regressed at seq %d (%d < %d)", seq, generation, proj.Generation)
 		}
@@ -146,6 +156,11 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 			proj.Generation = generation
 		}
 		proj.Summary = summary
+		if len(blocks) > 0 {
+			proj.SummaryBlocks = cloneContentBlocks(blocks)
+		} else if summary != "" {
+			proj.SummaryBlocks = []ContentBlock{TextBlock(summary)}
+		}
 		if fingerprint != "" {
 			proj.Fingerprint = fingerprint
 		}
@@ -172,7 +187,7 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 				return nil, nil, fmt.Errorf("session: compaction/start at seq %d: %w", event.Seq, err)
 			}
 			tx := getTransaction(payload.TransactionID)
-			if tx.start || tx.summarySeen || tx.surfaceSeen || tx.end {
+			if tx.start || tx.summarySeen || tx.replacementSeen || tx.end {
 				return nil, nil, fmt.Errorf("session: compaction transaction %q has invalid start order", payload.TransactionID)
 			}
 			tx.generation, tx.sourceSeqs, tx.start = payload.Generation, append([]uint64(nil), payload.SourceSeqs...), true
@@ -189,7 +204,7 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 				if len(seqs) == 0 {
 					seqs = payload.SourceSeqs
 				}
-				if err := apply(payload.Generation, seqs, payload.Summary, payload.Fingerprint, event.Seq); err != nil {
+				if err := apply(payload.Generation, seqs, payload.Summary, payload.Blocks, payload.Fingerprint, event.Seq); err != nil {
 					return nil, nil, err
 				}
 				legacySummary = legacySummary || payload.Summary != ""
@@ -206,23 +221,24 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 				return nil, nil, fmt.Errorf("session: compaction/summary at seq %d: %w", event.Seq, err)
 			}
 			tx := getTransaction(payload.TransactionID)
-			if !tx.start || tx.summarySeen || tx.surfaceSeen || tx.end {
+			if !tx.start || tx.summarySeen || tx.replacementSeen || tx.end {
 				return nil, nil, fmt.Errorf("session: compaction transaction %q has invalid summary order", payload.TransactionID)
 			}
 			if tx.generation != payload.Generation || !sameSeqs(tx.sourceSeqs, seqs) {
 				return nil, nil, fmt.Errorf("session: compaction transaction %q summary does not match start", payload.TransactionID)
 			}
-			tx.summary, tx.fingerprint, tx.summarySeen = payload.Summary, payload.Fingerprint, true
+			tx.summary, tx.summaryBlocks, tx.fingerprint, tx.summarySeen = payload.Summary, payload.Blocks, payload.Fingerprint, true
 		case EventCompactionSurface:
 			if event.FormatVersion < 2 {
 				continue
 			}
 			var payload struct {
-				Generation    uint64   `json:"generation"`
-				TransactionID string   `json:"transaction_id"`
-				SourceSeqs    []uint64 `json:"source_seqs"`
-				Summary       string   `json:"summary"`
-				Fingerprint   string   `json:"fingerprint"`
+				Generation    uint64         `json:"generation"`
+				TransactionID string         `json:"transaction_id"`
+				SourceSeqs    []uint64       `json:"source_seqs"`
+				Summary       string         `json:"summary"`
+				Blocks        []ContentBlock `json:"blocks"`
+				Fingerprint   string         `json:"fingerprint"`
 			}
 			if err := json.Unmarshal(event.Data, &payload); err != nil {
 				return nil, nil, fmt.Errorf("session: decode compaction/surface at seq %d: %w", event.Seq, err)
@@ -234,13 +250,38 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 				return nil, nil, fmt.Errorf("session: compaction/surface at seq %d: %w", event.Seq, err)
 			}
 			tx := getTransaction(payload.TransactionID)
-			if !tx.start || !tx.summarySeen || tx.surfaceSeen || tx.end {
+			if !tx.start || !tx.summarySeen || tx.replacementSeen || tx.end {
 				return nil, nil, fmt.Errorf("session: compaction transaction %q has invalid surface order", payload.TransactionID)
 			}
 			if tx.generation != payload.Generation || !sameSeqs(tx.sourceSeqs, payload.SourceSeqs) || tx.summary != payload.Summary || tx.fingerprint != payload.Fingerprint {
 				return nil, nil, fmt.Errorf("session: compaction transaction %q surface does not match summary", payload.TransactionID)
 			}
-			tx.surfaceSeen = true
+			tx.replacementSeen = true
+			if tx.summaryBlocks == nil {
+				tx.summaryBlocks = payload.Blocks
+			}
+		case EventUserMessage:
+			payload, ok, err := decodeSurfaceReplacement(event.Data)
+			if err != nil {
+				return nil, nil, fmt.Errorf("session: decode surface replacement at seq %d: %w", event.Seq, err)
+			}
+			if !ok {
+				continue
+			}
+			if event.FormatVersion < 2 {
+				continue
+			}
+			if err := validateCompactionSourceSeqs(payload.SourceSeqs); err != nil {
+				return nil, nil, fmt.Errorf("session: surface replacement at seq %d: %w", event.Seq, err)
+			}
+			tx := getTransaction(payload.TransactionID)
+			if !tx.start || !tx.summarySeen || tx.replacementSeen || tx.end {
+				return nil, nil, fmt.Errorf("session: compaction transaction %q has invalid replacement order", payload.TransactionID)
+			}
+			if tx.generation != payload.Generation || !sameSeqs(tx.sourceSeqs, payload.SourceSeqs) || tx.summary != payload.Summary || tx.fingerprint != payload.Fingerprint {
+				return nil, nil, fmt.Errorf("session: compaction transaction %q replacement does not match summary", payload.TransactionID)
+			}
+			tx.summaryBlocks, tx.replacementSeen, tx.replacementSeq = payload.Blocks, true, event.Seq
 		case EventCompactionEnd:
 			if event.FormatVersion < 2 {
 				continue
@@ -256,7 +297,7 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 				return nil, nil, fmt.Errorf("session: compaction/end at seq %d has no transaction id", event.Seq)
 			}
 			tx := transactions[payload.TransactionID]
-			if tx == nil || !tx.start || !tx.summarySeen || !tx.surfaceSeen || tx.end {
+			if tx == nil || !tx.start || !tx.summarySeen || !tx.replacementSeen || tx.end {
 				return nil, nil, fmt.Errorf("session: compaction transaction %q has invalid end order", payload.TransactionID)
 			}
 			if tx.generation != payload.Generation {
@@ -267,13 +308,13 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 	}
 	for _, transactionID := range transactionOrder {
 		tx := transactions[transactionID]
-		if !tx.start || !tx.summarySeen || !tx.surfaceSeen || !tx.end {
+		if !tx.start || !tx.summarySeen || !tx.replacementSeen || !tx.end {
 			continue
 		}
-		if err := apply(tx.generation, tx.sourceSeqs, tx.summary, tx.fingerprint, 0); err != nil {
+		if err := apply(tx.generation, tx.sourceSeqs, tx.summary, tx.summaryBlocks, tx.fingerprint, 0); err != nil {
 			return nil, nil, err
 		}
-		replacements = append(replacements, surfaceReplacement{sourceSeqs: append([]uint64(nil), tx.sourceSeqs...), summary: tx.summary})
+		replacements = append(replacements, surfaceReplacement{sourceSeqs: append([]uint64(nil), tx.sourceSeqs...), summary: tx.summary, blocks: cloneContentBlocks(tx.summaryBlocks), replacementSeq: tx.replacementSeq})
 	}
 	proj.ShadowedSeqs = sortedShadowed(shadowed)
 
@@ -291,9 +332,31 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		messages []*llm.Message
 	}
 	nodes := make([]surfaceNode, 0)
+	completedReplacement := make(map[uint64]surfaceReplacement)
+	for _, replacement := range replacements {
+		if replacement.replacementSeq > 0 {
+			completedReplacement[replacement.replacementSeq] = replacement
+		}
+	}
 	for _, event := range events {
 		if !event.Type.Surface() {
 			continue
+		}
+		if event.Type == EventUserMessage {
+			_, replacement, err := decodeSurfaceReplacement(event.Data)
+			if err != nil {
+				return nil, nil, fmt.Errorf("session: decode surface replacement at seq %d: %w", event.Seq, err)
+			}
+			if replacement {
+				if folded, complete := completedReplacement[event.Seq]; complete {
+					message, err := summaryMessage(folded.summary, folded.blocks)
+					if err != nil {
+						return nil, nil, fmt.Errorf("session: build durable compaction replacement: %w", err)
+					}
+					nodes = append(nodes, surfaceNode{seq: event.Seq, messages: []*llm.Message{message}})
+				}
+				continue
+			}
 		}
 		extra, err := projectSurfaceEvents(event)
 		if err != nil {
@@ -319,9 +382,16 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		folded := make([]surfaceNode, 0, len(nodes)-len(selected)+1)
 		inserted := false
 		for _, node := range nodes {
+			if replacement.replacementSeq > 0 && node.seq == replacement.replacementSeq {
+				continue
+			}
 			if selected[node.seq] {
 				if !inserted {
-					folded = append(folded, surfaceNode{messages: []*llm.Message{llm.NewUserMessage(replacement.summary)}})
+					message, err := summaryMessage(replacement.summary, replacement.blocks)
+					if err != nil {
+						return nil, nil, fmt.Errorf("session: build compaction replacement: %w", err)
+					}
+					folded = append(folded, surfaceNode{seq: replacement.replacementSeq, messages: []*llm.Message{message}})
 					inserted = true
 				}
 				continue
@@ -342,7 +412,11 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		messages = append([]*llm.Message{llm.NewTextMessage(llm.RoleSystem, s.spec.SystemSnapshot)}, messages...)
 	}
 	if legacySummary && len(replacements) == 0 && proj.Summary != "" {
-		messages = append([]*llm.Message{llm.NewUserMessage(proj.Summary)}, messages...)
+		message, err := summaryMessage(proj.Summary, proj.SummaryBlocks)
+		if err != nil {
+			return nil, nil, fmt.Errorf("session: build legacy compaction summary: %w", err)
+		}
+		messages = append([]*llm.Message{message}, messages...)
 	}
 	return messages, proj, nil
 }
@@ -478,13 +552,25 @@ func projectSurfaceEvents(event Event) ([]*llm.Message, error) {
 }
 
 type compactionSummaryPayload struct {
-	Generation    uint64   `json:"generation"`
-	TransactionID string   `json:"transaction_id"`
-	ThroughSeq    uint64   `json:"through_seq"`
-	ShadowedSeqs  []uint64 `json:"shadowed_seqs"`
-	SourceSeqs    []uint64 `json:"source_seqs"`
-	Summary       string   `json:"summary"`
-	Fingerprint   string   `json:"fingerprint"`
+	Generation    uint64         `json:"generation"`
+	TransactionID string         `json:"transaction_id"`
+	ThroughSeq    uint64         `json:"through_seq"`
+	ShadowedSeqs  []uint64       `json:"shadowed_seqs"`
+	SourceSeqs    []uint64       `json:"source_seqs"`
+	Summary       string         `json:"summary"`
+	Blocks        []ContentBlock `json:"blocks"`
+	Fingerprint   string         `json:"fingerprint"`
+}
+
+type surfaceReplacementPayload struct {
+	SurfaceOp     string         `json:"surface_op"`
+	SurfaceID     string         `json:"surface_id"`
+	Generation    uint64         `json:"generation"`
+	TransactionID string         `json:"transaction_id"`
+	SourceSeqs    []uint64       `json:"source_seqs"`
+	Summary       string         `json:"summary"`
+	Blocks        []ContentBlock `json:"blocks"`
+	Fingerprint   string         `json:"fingerprint"`
 }
 
 func decodeCompactionSummary(data json.RawMessage) (compactionSummaryPayload, error) {
@@ -493,6 +579,92 @@ func decodeCompactionSummary(data json.RawMessage) (compactionSummaryPayload, er
 		return payload, fmt.Errorf("decode payload: %w", err)
 	}
 	return payload, nil
+}
+
+func decodeSurfaceReplacement(data json.RawMessage) (surfaceReplacementPayload, bool, error) {
+	var payload surfaceReplacementPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return payload, false, err
+	}
+	if payload.SurfaceOp == "" {
+		return payload, false, nil
+	}
+	if payload.SurfaceOp != "replace" {
+		return payload, true, fmt.Errorf("unsupported surface operation %q", payload.SurfaceOp)
+	}
+	if payload.TransactionID == "" {
+		payload.TransactionID = payload.SurfaceID
+	}
+	if payload.SurfaceID == "" {
+		payload.SurfaceID = payload.TransactionID
+	}
+	if payload.TransactionID == "" {
+		return payload, true, fmt.Errorf("surface replacement requires transaction id")
+	}
+	if len(payload.Blocks) == 0 && payload.Summary != "" {
+		payload.Blocks = []ContentBlock{TextBlock(payload.Summary)}
+	}
+	return payload, true, nil
+}
+
+func summaryMessage(summary string, blocks []ContentBlock) (*llm.Message, error) {
+	if len(blocks) == 0 {
+		return llm.NewUserMessage(summary), nil
+	}
+	parts := make([]llm.Part, 0, len(blocks))
+	for _, block := range blocks {
+		if err := block.Validate(); err != nil {
+			return nil, err
+		}
+		switch block.Kind {
+		case BlockText:
+			parts = append(parts, llm.Part{Type: llm.PartText, Text: block.Text})
+		case BlockReasoning:
+			parts = append(parts, llm.Part{Type: llm.PartReasoning, Reasoning: block.Text})
+		case BlockMedia:
+			data, err := base64.StdEncoding.DecodeString(block.Media.Data)
+			if err != nil {
+				return nil, err
+			}
+			media := *block.Media
+			parts = append(parts, llm.Part{Type: llm.PartMedia, Media: &llm.MediaContent{MediaType: media.MediaType, URL: media.URL, Data: data}})
+		case BlockExtension:
+			encoded, err := json.Marshal(block)
+			if err != nil {
+				return nil, err
+			}
+			parts = append(parts, llm.Part{Type: llm.PartText, Custom: encoded})
+		default:
+			return nil, fmt.Errorf("summary block kind %q is not valid model content", block.Kind)
+		}
+	}
+	return &llm.Message{Role: llm.RoleUser, Parts: parts}, nil
+}
+
+func cloneContentBlocks(blocks []ContentBlock) []ContentBlock {
+	if blocks == nil {
+		return nil
+	}
+	out := make([]ContentBlock, len(blocks))
+	for i, block := range blocks {
+		out[i] = block
+		out[i].Payload = append(json.RawMessage(nil), block.Payload...)
+		if block.Media != nil {
+			media := *block.Media
+			out[i].Media = &media
+		}
+		if block.ToolCall != nil {
+			call := *block.ToolCall
+			call.Arguments = append(json.RawMessage(nil), block.ToolCall.Arguments...)
+			out[i].ToolCall = &call
+		}
+		if block.ToolResult != nil {
+			result := *block.ToolResult
+			result.Content = append(json.RawMessage(nil), block.ToolResult.Content...)
+			out[i].ToolResult = &result
+		}
+	}
+	return out
 }
 
 func validateCompactionSourceSeqs(seqs []uint64) error {
@@ -583,6 +755,19 @@ func regionSummary(region *CompactedRegion) string {
 		return ""
 	}
 	return region.Summary
+}
+
+func regionSummaryBlocks(region *CompactedRegion) []ContentBlock {
+	if region == nil {
+		return nil
+	}
+	if len(region.SummaryBlocks) > 0 {
+		return cloneContentBlocks(region.SummaryBlocks)
+	}
+	if region.Summary == "" {
+		return nil
+	}
+	return []ContentBlock{TextBlock(region.Summary)}
 }
 
 func regionFingerprint(region *CompactedRegion) string {

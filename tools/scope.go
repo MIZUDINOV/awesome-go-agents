@@ -29,53 +29,43 @@ type Catalog interface {
 }
 
 // Scope is an agent-local catalog. Local definitions shadow root definitions;
-// visibility restrictions affect both model schemas and execution resolution.
+// visibility restrictions apply to inherited tools while local registrations
+// remain available to their owning scope.
 type Scope struct {
-	// rootSnapshot freezes the root catalog and its execution middleware at
-	// scope creation. An agent therefore cannot observe a later global
-	// registration or policy mutation from another agent.
-	rootSnapshot *Registry
-	local        *Registry
-	approval     ApprovalService
-	parallel     int
-	mu           sync.RWMutex
-	allow        map[string]struct{}
-	deny         map[string]struct{}
+	// root stays live for inherited definitions and middleware. Local
+	// definitions are isolated and shadow root names only for this scope.
+	root        *Registry
+	local       *Registry
+	approval    ApprovalService
+	approvalSet bool
+	parallel    int
+	mu          sync.RWMutex
+	allow       map[string]struct{}
+	deny        map[string]struct{}
 }
 
 // NewScope creates an isolated catalog over a root registry.
 func (r *Registry) NewScope() *Scope {
-	r.mu.RLock()
-	opts := Options{DefaultTimeout: r.defaultTimeout, MaxParallel: r.maxParallel, Sandbox: r.sandbox, Approval: r.approval, Presentation: r.presentation, CodeRuntime: r.codeRuntime, CodeLanguage: r.codeLanguage, CodeSDKRenderer: r.codeSDKRenderer}
-	rootSnapshot := New(opts)
-	for name, definition := range r.definitions {
-		rootSnapshot.definitions[name] = cloneDefinition(definition)
+	snapshot := r.snapshot()
+	return &Scope{
+		root: r, local: New(Options{
+			DefaultTimeout:  snapshot.defaultTimeout,
+			MaxParallel:     snapshot.maxParallel,
+			Sandbox:         snapshot.sandbox,
+			Approval:        snapshot.approval,
+			Presentation:    snapshot.presentation,
+			CodeRuntime:     snapshot.codeRuntime,
+			CodeLanguage:    snapshot.codeLanguage,
+			CodeSDKRenderer: snapshot.codeSDKRenderer,
+		}),
+		parallel: snapshot.maxParallel,
 	}
-	rootSnapshot.preExecute = append([]Hook(nil), r.preExecute...)
-	rootSnapshot.postExecute = append([]PostHook(nil), r.postExecute...)
-	rootSnapshot.policies = append([]Policy(nil), r.policies...)
-	rootSnapshot.guards = append([]Guard(nil), r.guards...)
-	rootSnapshot.postPolicies = append([]PostPolicy(nil), r.postPolicies...)
-	rootSnapshot.observers = append([]Observer(nil), r.observers...)
-	local := New(opts)
-	local.preExecute = append([]Hook(nil), r.preExecute...)
-	local.postExecute = append([]PostHook(nil), r.postExecute...)
-	local.policies = append([]Policy(nil), r.policies...)
-	local.guards = append([]Guard(nil), r.guards...)
-	local.postPolicies = append([]PostPolicy(nil), r.postPolicies...)
-	local.observers = append([]Observer(nil), r.observers...)
-	parallel := r.maxParallel
-	r.mu.RUnlock()
-	return &Scope{rootSnapshot: rootSnapshot, local: local, approval: opts.Approval, parallel: parallel}
 }
 
 func (s *Scope) Register(def *Definition) error {
 	if err := s.local.Register(def); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	delete(s.deny, def.Name)
-	s.mu.Unlock()
 	return nil
 }
 
@@ -94,12 +84,6 @@ func (s *Scope) unregisterLocal(name string) error {
 	if err := s.local.Unregister(name); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	if s.deny == nil {
-		s.deny = make(map[string]struct{})
-	}
-	s.deny[name] = struct{}{}
-	s.mu.Unlock()
 	return nil
 }
 
@@ -108,6 +92,7 @@ func (s *Scope) Unregister(name string) error { return s.unregisterLocal(name) }
 func (s *Scope) SetApprovalService(service ApprovalService) {
 	s.mu.Lock()
 	s.approval = service
+	s.approvalSet = true
 	s.mu.Unlock()
 }
 
@@ -141,7 +126,7 @@ func (s *Scope) Deny(names ...string) {
 	}
 }
 
-func (s *Scope) visible(name string) bool {
+func (s *Scope) visibleInherited(name string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	if _, denied := s.deny[name]; denied {
@@ -156,22 +141,35 @@ func (s *Scope) visible(name string) bool {
 
 func (s *Scope) localDefinition(name string) (*Definition, bool) { return s.local.Get(name) }
 
+func (s *Scope) localNames() map[string]struct{} {
+	s.local.mu.RLock()
+	defer s.local.mu.RUnlock()
+	names := make(map[string]struct{}, len(s.local.definitions))
+	for name := range s.local.definitions {
+		names[name] = struct{}{}
+	}
+	return names
+}
+
+func (s *Scope) executionRegistry() *Registry {
+	registry := s.root.snapshot()
+	s.local.mu.RLock()
+	for name, definition := range s.local.definitions {
+		registry.definitions[name] = cloneDefinition(definition)
+	}
+	s.local.mu.RUnlock()
+	if approval, overridden := s.currentApproval(); overridden {
+		registry.SetApprovalService(approval)
+	}
+	return registry
+}
+
 func (s *Scope) ModelTools() []*llm.ToolDefinition {
-	root := s.rootSnapshot.ModelTools()
-	local := s.local.ModelTools()
-	visible := make(map[string]*llm.ToolDefinition, len(root)+len(local))
-	localNames := make(map[string]struct{}, len(local))
-	for _, tool := range local {
-		localNames[tool.Name] = struct{}{}
-	}
-	for _, tool := range root {
-		if _, ok := localNames[tool.Name]; ok || !s.visible(tool.Name) {
-			continue
-		}
-		visible[tool.Name] = tool
-	}
-	for _, tool := range local {
-		if s.visible(tool.Name) {
+	combined := s.executionRegistry()
+	localNames := s.localNames()
+	visible := make(map[string]*llm.ToolDefinition)
+	for _, tool := range combined.ModelTools() {
+		if _, local := localNames[tool.Name]; local || isReservedCodeModeTool(tool.Name) || s.visibleInherited(tool.Name) {
 			visible[tool.Name] = tool
 		}
 	}
@@ -184,21 +182,28 @@ func (s *Scope) ModelTools() []*llm.ToolDefinition {
 }
 
 func (s *Scope) Run(ctx context.Context, ec ExecContext, name, callID string, input json.RawMessage) (*Result, error) {
-	if !s.visible(name) {
-		return nil, ErrToolNotFound
-	}
 	if _, ok := s.localDefinition(name); ok {
 		ec.Runtime = s
-		return s.local.run(ctx, ec, name, callID, input, s.currentApproval())
+		return s.executionRegistry().run(ctx, ec, name, callID, input, s.currentApprovalValue())
+	}
+	if !isReservedCodeModeTool(name) && !s.visibleInherited(name) {
+		return nil, ErrToolNotFound
 	}
 	ec.Runtime = s
-	return s.rootSnapshot.run(ctx, ec, name, callID, input, s.currentApproval())
+	return s.root.run(ctx, ec, name, callID, input, s.currentApprovalValue())
 }
 
-func (s *Scope) currentApproval() ApprovalService {
+func (s *Scope) currentApproval() (ApprovalService, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.approval
+	return s.approval, s.approvalSet
+}
+
+func (s *Scope) currentApprovalValue() ApprovalService {
+	if approval, overridden := s.currentApproval(); overridden {
+		return approval
+	}
+	return nil
 }
 
 func (s *Scope) RunBatch(ctx context.Context, ec ExecContext, calls []Call) []Outcome {
@@ -229,14 +234,18 @@ func (s *Scope) RunBatch(ctx context.Context, ec ExecContext, calls []Call) []Ou
 }
 
 func (s *Scope) executionMode(name string, input json.RawMessage) bool {
-	if !s.visible(name) {
+	if _, ok := s.localDefinition(name); ok {
+		return s.executionRegistry().ExecutionMode(name, input)
+	}
+	if !isReservedCodeModeTool(name) && !s.visibleInherited(name) {
 		return false
 	}
-	if _, ok := s.localDefinition(name); ok {
-		return s.local.ExecutionMode(name, input)
-	}
-	return s.rootSnapshot.ExecutionMode(name, input)
+	return s.root.ExecutionMode(name, input)
 }
+
+// Code Mode is a transport boundary, not an inherited native tool. Scope
+// restrictions must not disable the reserved run_code bridge.
+func isReservedCodeModeTool(name string) bool { return name == "run_code" }
 
 func (s *Scope) maxParallel() int {
 	return s.parallel
@@ -245,9 +254,10 @@ func (s *Scope) maxParallel() int {
 // CodeGuidance renders guidance from the scoped visible catalog, never from
 // definitions hidden by the root scope restrictions.
 func (s *Scope) CodeGuidance() (string, error) {
-	renderer := s.rootSnapshot.codeSDKRenderer
-	presentation := s.rootSnapshot.presentation
-	codeRuntime := s.rootSnapshot.codeRuntime
+	root := s.root.snapshot()
+	renderer := root.codeSDKRenderer
+	presentation := root.presentation
+	codeRuntime := root.codeRuntime
 	if presentation == PresentationNative {
 		return "", nil
 	}

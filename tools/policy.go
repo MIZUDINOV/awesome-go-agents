@@ -43,6 +43,23 @@ type Guard func(Execution) (string, error)
 // new canonical value and is validated/rendered again before finalization.
 type PostPolicy func(context.Context, Execution, *Result) (PolicyDecision, any, string, error)
 
+// PostPolicyReplacement makes the replacement mode explicit while preserving
+// the legacy any return type of PostPolicy. A content replacement keeps the
+// canonical value and UI metadata; a value replacement is revalidated and
+// rendered from the new canonical value.
+type PostPolicyReplacement struct {
+	ContentOnly bool
+	Value       any
+}
+
+func ReplacePostPolicyValue(value any) PostPolicyReplacement {
+	return PostPolicyReplacement{Value: value}
+}
+
+func ReplacePostPolicyContent(content any) PostPolicyReplacement {
+	return PostPolicyReplacement{ContentOnly: true, Value: content}
+}
+
 // ApprovalRequest is provider-neutral. The host may render it in any UI.
 type ApprovalRequest struct {
 	SessionID string          `json:"session_id"`

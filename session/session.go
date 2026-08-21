@@ -122,11 +122,11 @@ func (s *Session) AppendCommitted(ctx context.Context, events []Event) (Committe
 	return CommittedBatch{Events: loaded}, nil
 }
 
-// CompactionSummary durably records a compaction transaction
-// (compaction/start + compaction/summary + compaction/surface + compaction/end) as one atomic
-// batch. generation increases monotonically; shadowedSeqs is the exact
-// shadowed list. The raw history is never deleted (H-COMPACT-001);
-// compaction only replaces the model-visible projection.
+// CompactionSummary durably records a compaction transaction. The start marker
+// is committed before the summary work; the summary, durable user/message
+// surface replacement and end marker are committed afterward. Recovery can
+// therefore observe an unfinished compaction while the raw history remains
+// unchanged.
 func (s *Session) CompactionSummary(ctx context.Context, generation uint64, transactionID string, throughSeq uint64, shadowedSeqs []uint64, summary, fingerprint string) (uint64, error) {
 	if transactionID == "" {
 		return 0, fmt.Errorf("session: compaction requires a transaction id")
@@ -144,16 +144,19 @@ func (s *Session) CompactionSummary(ctx context.Context, generation uint64, tran
 	sum.Data = CompactionSummaryPayload(generation, transactionID, throughSeq, shadowedSeqs, summary, fingerprint)
 	sum.SourceSeqs = append([]uint64(nil), shadowedSeqs...)
 
-	surface := common
-	surface.Type = EventCompactionSurface
-	surface.Data = CompactionSurfacePayload(generation, transactionID, shadowedSeqs, summary, fingerprint)
-	surface.SourceSeqs = append([]uint64(nil), shadowedSeqs...)
+	replacement := common
+	replacement.Type = EventUserMessage
+	replacement.Data = CompactionSurfaceReplacementPayload(generation, transactionID, shadowedSeqs, summary, []ContentBlock{TextBlock(summary)}, fingerprint)
+	replacement.SourceSeqs = append([]uint64(nil), shadowedSeqs...)
 
 	end := common
 	end.Type = EventCompactionEnd
 	end.Data = CompactionEndPayload(generation, transactionID)
 
-	return s.AppendAll(ctx, []Event{start, sum, surface, end})
+	if _, err := s.AppendAll(ctx, []Event{start}); err != nil {
+		return 0, err
+	}
+	return s.AppendAll(ctx, []Event{sum, replacement, end})
 }
 
 // Load returns all events younger than afterSeq (0 = from the beginning).

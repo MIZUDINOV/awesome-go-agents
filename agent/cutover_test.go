@@ -60,11 +60,8 @@ func TestDeferredToolCanResumeThroughAgentAPI(t *testing.T) {
 	registry := tools.New(tools.Options{})
 	registry.MustRegister(&tools.Definition{
 		Name: "deferred", Description: "deferred", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: tools.AnyOutputSchema,
-		FinalizeContent: func(result *tools.Result) error {
-			result.Continuation = tools.ToolDeferred
-			result.ResumeKey = "worker-result-1"
-			result.WaitingReason = "workspace"
-			return nil
+		ResolveContinuation: func(_ json.RawMessage, _ any) (tools.ToolContinuation, string, string, error) {
+			return tools.ToolDeferred, "worker-result-1", "workspace", nil
 		},
 		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
 			return map[string]any{"accepted": true}, nil
@@ -106,13 +103,11 @@ func TestDeferredToolResumesOriginalCallWithoutNewTurn(t *testing.T) {
 			executions++
 			return map[string]any{"execution": executions}, nil
 		},
-		FinalizeContent: func(result *tools.Result) error {
+		ResolveContinuation: func(_ json.RawMessage, _ any) (tools.ToolContinuation, string, string, error) {
 			if executions == 1 {
-				result.Continuation = tools.ToolDeferred
-				result.ResumeKey = "workspace:call-1"
-				result.WaitingReason = "workspace"
+				return tools.ToolDeferred, "workspace:call-1", "workspace", nil
 			}
-			return nil
+			return tools.ToolContinue, "", "", nil
 		},
 	})
 	chat := &scriptedProvider{steps: []scriptedStep{

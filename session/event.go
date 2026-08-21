@@ -115,8 +115,8 @@ func (t EventType) Extension() bool {
 // Surface reports whether an event type participates in the model-facing
 // projection. Chunks are flagged non-surface: they accumulate into the
 // following assistant/message. Tool calls live inside assistant/message parts
-// and are also non-surface. Compaction bookkeeping events are non-surface;
-// the summary is folded in as a synthetic message by the projector.
+// and are also non-surface. A compaction replacement is a durable user/message
+// surface operation; the projector applies it only after the transaction end.
 func (t EventType) Surface() bool {
 	switch t {
 	case EventUserMessage, EventSteeringMessage, EventInjectedContext, EventAssistantMessage, EventToolResult, EventContextSnapshot:
@@ -511,11 +511,38 @@ func ToolResultStructuredPayloadWithBlocksAndContexts(callID, name string, conte
 }
 
 func ToolResultStructuredPayloadWithOptions(callID, name string, content json.RawMessage, meta map[string]any, code string, isError bool, blocks []ContentBlock, contexts []llm.Message, concludesTurn bool) json.RawMessage {
-	return ToolResultStructuredPayloadWithOutput(callID, name, content, content, meta, code, isError, blocks, contexts, concludesTurn)
+	return ToolResultStructuredPayloadWithContent(callID, name, content, meta, code, isError, blocks, contexts, concludesTurn)
 }
 
-// ToolResultStructuredPayloadWithOutput keeps the canonical result separate
-// from the model-facing content. The two may differ after rendering.
+// ToolResultStructuredPayloadWithContent is the v2 durable tool-result
+// payload. Canonical execution values are intentionally absent; replay only
+// needs model-facing content, error state, metadata and lifecycle contexts.
+func ToolResultStructuredPayloadWithContent(callID, name string, content json.RawMessage, meta map[string]any, code string, isError bool, blocks []ContentBlock, contexts []llm.Message, concludesTurn bool) json.RawMessage {
+	payload := map[string]any{"call_id": callID, "name": name, "content": content, "is_error": isError}
+	if meta != nil {
+		payload["meta"] = meta
+	}
+	if code != "" {
+		payload["code"] = code
+	}
+	if len(blocks) > 0 {
+		if _, err := MarshalBlocks(blocks); err == nil {
+			payload["blocks"] = append([]ContentBlock(nil), blocks...)
+		}
+	}
+	if len(contexts) > 0 {
+		payload["additional_contexts"] = contexts
+	}
+	if concludesTurn {
+		payload["concludes_turn"] = true
+	}
+	return mustJSON(payload)
+}
+
+// ToolResultStructuredPayloadWithOutput is retained for reading/migration
+// helpers that must reproduce legacy rows. New loop writes must use
+// ToolResultStructuredPayloadWithContent so canonical values never enter the
+// durable event log.
 func ToolResultStructuredPayloadWithOutput(callID, name string, output, content json.RawMessage, meta map[string]any, code string, isError bool, blocks []ContentBlock, contexts []llm.Message, concludesTurn bool) json.RawMessage {
 	payload := map[string]any{"call_id": callID, "name": name, "output": output, "content": content, "is_error": isError}
 	if meta != nil {
@@ -612,20 +639,42 @@ func CompactionStartPayload(generation uint64, transactionID string, sourceSeqs 
 // EXACT list of event seqs replaced by Summary, and Fingerprint is a digest of
 // the source region used for drift detection.
 func CompactionSummaryPayload(generation uint64, transactionID string, throughSeq uint64, shadowedSeqs []uint64, summary, fingerprint string) json.RawMessage {
+	return CompactionSummaryPayloadWithBlocks(generation, transactionID, throughSeq, shadowedSeqs, summary, []ContentBlock{TextBlock(summary)}, fingerprint)
+}
+
+// CompactionSummaryPayloadWithBlocks records the DSH-style structured summary
+// while retaining summary text for legacy readers and checkpoint consumers.
+func CompactionSummaryPayloadWithBlocks(generation uint64, transactionID string, throughSeq uint64, shadowedSeqs []uint64, summary string, blocks []ContentBlock, fingerprint string) json.RawMessage {
 	return mustJSON(map[string]any{
 		"generation": generation, "transaction_id": transactionID,
 		"through_seq": throughSeq, "shadowed_seqs": shadowedSeqs, "source_seqs": shadowedSeqs,
-		"summary": summary, "fingerprint": fingerprint,
+		"summary": summary, "blocks": blocks, "fingerprint": fingerprint,
 	})
 }
 
 // CompactionSurfacePayload is the explicit model-surface replacement. It is
-// separate from the summary so replay can ignore an interrupted transaction:
-// only a complete start/summary/surface/end sequence changes the projection.
+// retained as a legacy v2 reader. New writes use a durable user/message with
+// surface_op=replace, matching DeepSeek Harness's surface replacement node.
 func CompactionSurfacePayload(generation uint64, transactionID string, sourceSeqs []uint64, summary, fingerprint string) json.RawMessage {
+	return CompactionSurfacePayloadWithBlocks(generation, transactionID, sourceSeqs, summary, []ContentBlock{TextBlock(summary)}, fingerprint)
+}
+
+func CompactionSurfacePayloadWithBlocks(generation uint64, transactionID string, sourceSeqs []uint64, summary string, blocks []ContentBlock, fingerprint string) json.RawMessage {
 	return mustJSON(map[string]any{
 		"generation": generation, "transaction_id": transactionID,
-		"source_seqs": sourceSeqs, "summary": summary, "fingerprint": fingerprint,
+		"source_seqs": sourceSeqs, "summary": summary, "blocks": blocks, "fingerprint": fingerprint,
+	})
+}
+
+// CompactionSurfaceReplacementPayload is a durable model-surface operation.
+// It is stored as a user/message event so the replacement itself has a normal
+// log identity and can be selected by a later compaction.
+func CompactionSurfaceReplacementPayload(generation uint64, transactionID string, sourceSeqs []uint64, summary string, blocks []ContentBlock, fingerprint string) json.RawMessage {
+	return mustJSON(map[string]any{
+		"surface_op": "replace", "surface_id": transactionID,
+		"generation": generation, "transaction_id": transactionID,
+		"source_seqs": sourceSeqs, "summary": summary, "blocks": blocks,
+		"fingerprint": fingerprint,
 	})
 }
 

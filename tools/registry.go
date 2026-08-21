@@ -759,9 +759,9 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 		return failAfterExecution(err)
 	}
 
-	result = &Result{Name: name, CallID: callID, Kind: OutcomeSuccess, Canonical: canonical, ModelFacing: canonical}
+	result = &Result{Name: name, CallID: callID, Kind: OutcomeSuccess, Canonical: canonical, ModelFacing: canonical, Continuation: ToolContinue}
 	if def.RenderModel != nil {
-		modelFacing, err := def.RenderModel(canonical)
+		modelFacing, err := renderModel(def, args, canonical)
 		if err != nil {
 			return failAfterExecution(err)
 		}
@@ -769,7 +769,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 	}
 	result.Content = renderedContent(result.ModelFacing)
 	if def.PresentUI != nil {
-		ui, err := def.PresentUI(canonical)
+		ui, err := presentUI(def, args, canonical)
 		if err != nil {
 			return failAfterExecution(err)
 		}
@@ -812,19 +812,29 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			return nil, fmt.Errorf("%w: unknown post-policy decision", ErrPolicyDenied)
 		}
 		if replacement != nil {
+			contentOnly := false
+			if typed, ok := replacement.(PostPolicyReplacement); ok {
+				contentOnly, replacement = typed.ContentOnly, typed.Value
+			}
+			if contentOnly {
+				if err := applyContentReplacement(result, replacement); err != nil {
+					return nil, err
+				}
+				continue
+			}
 			result.Canonical = replacement
 			if err := validateCanonicalOutput(def, replacement); err != nil {
 				return nil, err
 			}
 			result.ModelFacing = replacement
 			if def.RenderModel != nil {
-				result.ModelFacing, err = def.RenderModel(replacement)
+				result.ModelFacing, err = renderModel(def, args, replacement)
 				if err != nil {
 					return nil, err
 				}
 			}
 			if def.PresentUI != nil {
-				result.UI, err = def.PresentUI(replacement)
+				result.UI, err = presentUI(def, args, replacement)
 				if err != nil {
 					return nil, err
 				}
@@ -834,6 +844,16 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			result.Meta = result.UI
 			result.Content = renderedContent(result.ModelFacing)
 		}
+	}
+	if def.ResolveContinuation != nil {
+		continuation, resumeKey, waitingReason, resolveErr := def.ResolveContinuation(append(json.RawMessage(nil), args...), result.Canonical)
+		if resolveErr != nil {
+			return nil, fmt.Errorf("resolve tool continuation: %w", resolveErr)
+		}
+		result.Continuation = continuation
+		result.ResumeKey = resumeKey
+		result.WaitingReason = waitingReason
+		result.ConcludesTurn = continuation == ToolConclude
 	}
 	if pipelineCtx.Err() == context.DeadlineExceeded && parentCtx.Err() == nil {
 		return nil, ErrToolTimeout
@@ -849,19 +869,73 @@ func renderedContent(modelFacing any) []session.ContentBlock {
 	return []session.ContentBlock{session.TextBlock(text)}
 }
 
+// snapshot returns a point-in-time runtime copy. Scopes use it only for a
+// single local execution; inherited executions stay on the live root.
+func (r *Registry) snapshot() *Registry {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	copy := New(Options{
+		DefaultTimeout:  r.defaultTimeout,
+		MaxParallel:     r.maxParallel,
+		Sandbox:         r.sandbox,
+		Approval:        r.approval,
+		Presentation:    r.presentation,
+		CodeRuntime:     r.codeRuntime,
+		CodeLanguage:    r.codeLanguage,
+		CodeSDKRenderer: r.codeSDKRenderer,
+	})
+	for name, definition := range r.definitions {
+		copy.definitions[name] = cloneDefinition(definition)
+	}
+	copy.preExecute = append([]Hook(nil), r.preExecute...)
+	copy.postExecute = append([]PostHook(nil), r.postExecute...)
+	copy.policies = append([]Policy(nil), r.policies...)
+	copy.guards = append([]Guard(nil), r.guards...)
+	copy.postPolicies = append([]PostPolicy(nil), r.postPolicies...)
+	copy.observers = append([]Observer(nil), r.observers...)
+	return copy
+}
+
+func renderModel(def *Definition, args json.RawMessage, canonical any) (any, error) {
+	if def.RenderModel != nil {
+		return def.RenderModel(append(json.RawMessage(nil), args...), canonical)
+	}
+	return canonical, nil
+}
+
+func presentUI(def *Definition, args json.RawMessage, canonical any) (map[string]any, error) {
+	if def.PresentUI != nil {
+		return def.PresentUI(append(json.RawMessage(nil), args...), canonical)
+	}
+	return nil, nil
+}
+
+func applyContentReplacement(result *Result, content any) error {
+	result.ModelFacing = content
+	if blocks, ok := content.([]session.ContentBlock); ok {
+		encoded, err := session.MarshalBlocks(blocks)
+		if err != nil {
+			return fmt.Errorf("post-policy content: %w", err)
+		}
+		decoded, err := session.UnmarshalBlocks(encoded)
+		if err != nil {
+			return fmt.Errorf("post-policy content: %w", err)
+		}
+		result.Content = decoded
+		return nil
+	}
+	result.Content = renderedContent(content)
+	return nil
+}
+
 func restoreFinalizerState(result, before *Result) {
 	if result == nil || before == nil {
 		return
 	}
 	modelFacing, content := result.ModelFacing, result.Content
-	continuation, resumeKey, waitingReason, concludesTurn := result.Continuation, result.ResumeKey, result.WaitingReason, result.ConcludesTurn
 	*result = *before
 	result.ModelFacing = modelFacing
 	result.Content = content
-	result.Continuation = continuation
-	result.ResumeKey = resumeKey
-	result.WaitingReason = waitingReason
-	result.ConcludesTurn = concludesTurn
 }
 
 func bindApprovalLease(approval ApprovalService, ec ExecContext) {

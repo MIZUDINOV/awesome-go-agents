@@ -48,17 +48,23 @@ type ExecContext struct {
 // Executor runs a tool and returns the canonical structured result.
 type Executor func(ctx context.Context, ec ExecContext, input json.RawMessage) (any, error)
 
-// Renderer converts a canonical result into a model-facing textual or JSON
-// representation. If nil, the canonical value is JSON-marshalled.
-type Renderer func(canonical any) (any, error)
+// Renderer converts the original arguments and canonical result into a
+// model-facing textual or JSON representation. If nil, the canonical value is
+// JSON-marshalled. Raw args keep rendering deterministic without forcing the
+// registry to know a tool's input type.
+type Renderer func(args json.RawMessage, canonical any) (any, error)
 
-// Presenter converts a canonical result into UI presentation metadata.
-// If nil, no UI metadata is produced.
-type Presenter func(canonical any) (map[string]any, error)
+// Presenter converts the original arguments and canonical result into UI
+// presentation metadata. If nil, no UI metadata is produced.
+type Presenter func(args json.RawMessage, canonical any) (map[string]any, error)
 
 // Finalizer applies a definition-owned final content invariant after the
 // canonical outcome has been validated and rendered.
 type Finalizer func(*Result) error
+
+// ContinuationResolver derives lifecycle state from the validated canonical
+// result. Lifecycle is registry-owned; content finalizers cannot mutate it.
+type ContinuationResolver func(args json.RawMessage, canonical any) (ToolContinuation, string, string, error)
 
 // PresentationMode controls how the model receives the catalog.
 type PresentationMode string
@@ -101,8 +107,9 @@ type Definition struct {
 	// RenderModel optionally shapes what the model sees as the result.
 	RenderModel Renderer
 	// PresentUI optionally shapes what the UI sees.
-	PresentUI       Presenter
-	FinalizeContent Finalizer
+	PresentUI           Presenter
+	FinalizeContent     Finalizer
+	ResolveContinuation ContinuationResolver
 
 	// ConcurrencySafe marks the tool safe to run in parallel with other tools.
 	ConcurrencySafe bool
@@ -138,18 +145,21 @@ func (d *Definition) IsConcurrencySafe(input json.RawMessage) bool {
 // When a schema override is omitted, it is generated from the corresponding
 // Go type, keeping typed decoding and model validation on one source of truth.
 type DefineToolOptions[I any, O any] struct {
-	Name             string
-	Description      string
-	Version          string
-	InputSchema      json.RawMessage
-	OutputSchema     json.RawMessage
-	Timeout          time.Duration
-	MutatesWorkspace bool
-	ConcurrencySafe  func(I) bool
-	Execute          func(context.Context, ExecContext, I) (O, error)
-	RenderModel      func(O) (any, error)
-	PresentUI        func(O) (map[string]any, error)
-	FinalizeContent  func(*Result) error
+	Name                string
+	Description         string
+	Version             string
+	InputSchema         json.RawMessage
+	OutputSchema        json.RawMessage
+	Timeout             time.Duration
+	MutatesWorkspace    bool
+	ConcurrencySafe     func(I) bool
+	Execute             func(context.Context, ExecContext, I) (O, error)
+	RenderModel         func(O) (any, error)
+	PresentUI           func(O) (map[string]any, error)
+	RenderModelWithArgs func(I, O) (any, error)
+	PresentUIWithArgs   func(I, O) (map[string]any, error)
+	FinalizeContent     func(*Result) error
+	ResolveContinuation func(I, O) (ToolContinuation, string, string, error)
 }
 
 // DefineTool converts a typed definition into the runtime representation.
@@ -183,27 +193,57 @@ func DefineTool[I any, O any](opts DefineToolOptions[I, O]) *Definition {
 			}
 			return opts.Execute(ctx, ec, args)
 		},
-		RenderModel: func(canonical any) (any, error) {
-			if opts.RenderModel == nil {
-				return canonical, nil
-			}
-			value, ok := canonical.(O)
-			if !ok {
-				return nil, ErrInvalidOutput
-			}
+		FinalizeContent: opts.FinalizeContent,
+	}
+	definition.RenderModel = func(input json.RawMessage, canonical any) (any, error) {
+		var args I
+		if err := json.Unmarshal(input, &args); err != nil {
+			return nil, ErrInvalidArguments
+		}
+		value, ok := canonical.(O)
+		if !ok {
+			return nil, ErrInvalidOutput
+		}
+		if opts.RenderModelWithArgs != nil {
+			return opts.RenderModelWithArgs(args, value)
+		}
+		if opts.RenderModel != nil {
 			return opts.RenderModel(value)
-		},
-		PresentUI: func(canonical any) (map[string]any, error) {
-			if opts.PresentUI == nil {
+		}
+		return canonical, nil
+	}
+	if opts.PresentUI != nil || opts.PresentUIWithArgs != nil {
+		definition.PresentUI = func(input json.RawMessage, canonical any) (map[string]any, error) {
+			if opts.PresentUI == nil && opts.PresentUIWithArgs == nil {
 				return nil, nil
 			}
+			var args I
+			if err := json.Unmarshal(input, &args); err != nil {
+				return nil, ErrInvalidArguments
+			}
 			value, ok := canonical.(O)
 			if !ok {
 				return nil, ErrInvalidOutput
 			}
+			if opts.PresentUIWithArgs != nil {
+				return opts.PresentUIWithArgs(args, value)
+			}
 			return opts.PresentUI(value)
-		},
-		FinalizeContent: opts.FinalizeContent,
+		}
+	}
+	definition.ResolveContinuation = func(input json.RawMessage, canonical any) (ToolContinuation, string, string, error) {
+		if opts.ResolveContinuation == nil {
+			return ToolContinue, "", "", nil
+		}
+		var args I
+		if err := json.Unmarshal(input, &args); err != nil {
+			return ToolContinue, "", "", ErrInvalidArguments
+		}
+		value, ok := canonical.(O)
+		if !ok {
+			return ToolContinue, "", "", ErrInvalidOutput
+		}
+		return opts.ResolveContinuation(args, value)
 	}
 	definition.typedOutputSchema = expectedOutputSchema
 	return definition
@@ -218,7 +258,9 @@ func generatedSchema[T any]() json.RawMessage {
 }
 
 // Result is the three-part tool outcome per the DSH model:
-// Canonical (durable), ModelFacing (what goes to the model), UI (presentation).
+// Canonical (execution-local), ModelFacing (what goes to the model), UI
+// (presentation). Only the model-facing content, UI metadata and lifecycle
+// outcome cross the durable session boundary.
 type Result struct {
 	// Name/CallID bind the result to the originating model tool call.
 	Name   string      `json:"name"`

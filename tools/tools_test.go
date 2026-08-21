@@ -22,10 +22,10 @@ func TestRegistryExecutePipeline(t *testing.T) {
 			executed = true
 			return map[string]any{"content": "data"}, nil
 		},
-		RenderModel: func(canonical any) (any, error) {
+		RenderModel: func(_ json.RawMessage, canonical any) (any, error) {
 			return "The file was read.", nil
 		},
-		PresentUI: func(canonical any) (map[string]any, error) {
+		PresentUI: func(_ json.RawMessage, canonical any) (map[string]any, error) {
 			return map[string]any{"path": "a.ts"}, nil
 		},
 	})
@@ -44,6 +44,46 @@ func TestRegistryExecutePipeline(t *testing.T) {
 	}
 	if result.UI["path"] != "a.ts" {
 		t.Errorf("ui = %v", result.UI)
+	}
+}
+
+func TestRegistryArgsAwareProjectionAndContentOnlyPostPolicy(t *testing.T) {
+	registry := New(Options{})
+	if err := registry.Register(&Definition{
+		Name: "project", InputSchema: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`), OutputSchema: AnyOutputSchema,
+		Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) {
+			return map[string]any{"ok": true}, nil
+		},
+		RenderModel: func(args json.RawMessage, _ any) (any, error) {
+			var input struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(args, &input); err != nil {
+				return nil, err
+			}
+			return "rendered:" + input.Path, nil
+		},
+		PresentUI: func(args json.RawMessage, _ any) (map[string]any, error) {
+			var input struct {
+				Path string `json:"path"`
+			}
+			if err := json.Unmarshal(args, &input); err != nil {
+				return nil, err
+			}
+			return map[string]any{"path": input.Path}, nil
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	registry.AddPostPolicy(func(context.Context, Execution, *Result) (PolicyDecision, any, string, error) {
+		return PolicyAllow, ReplacePostPolicyContent("policy-content"), "", nil
+	})
+	result, err := registry.Run(context.Background(), ExecContext{}, "project", "call-1", []byte(`{"path":"a.ts"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ModelFacing != "policy-content" || result.Canonical.(map[string]any)["ok"] != true || result.UI["path"] != "a.ts" || result.Content[0].Text != "policy-content" {
+		t.Fatalf("projection replacement changed the wrong fields: %+v", result)
 	}
 }
 
@@ -398,6 +438,10 @@ func TestRegistryPolicyGuardApprovalAndFinalizer(t *testing.T) {
 			result.Canonical = map[string]any{"ok": false}
 			result.Code = "tampered"
 			result.Meta = map[string]any{"tampered": true}
+			result.Continuation = ToolDeferred
+			result.ResumeKey = "tampered-resume"
+			result.WaitingReason = "tampered-wait"
+			result.ConcludesTurn = true
 			result.ModelFacing = "finalized"
 			return nil
 		},
@@ -413,7 +457,7 @@ func TestRegistryPolicyGuardApprovalAndFinalizer(t *testing.T) {
 		t.Fatal(err)
 	}
 	canonical, _ := result.Canonical.(map[string]any)
-	if !executed || result.Name != "protected" || result.CallID != "c1" || result.Kind != OutcomeSuccess || result.Code != "" || canonical["ok"] != true || result.ModelFacing != "finalized" || result.Meta != nil {
+	if !executed || result.Name != "protected" || result.CallID != "c1" || result.Kind != OutcomeSuccess || result.Code != "" || canonical["ok"] != true || result.ModelFacing != "finalized" || result.Meta != nil || result.Continuation != ToolContinue || result.ResumeKey != "" || result.WaitingReason != "" || result.ConcludesTurn {
 		t.Fatalf("executed=%v result=%+v", executed, result)
 	}
 
@@ -565,6 +609,56 @@ func TestScopedRegistryShadowsAndRestricts(t *testing.T) {
 	}
 	if _, err := scope.Run(context.Background(), ExecContext{}, "write", "c2", []byte(`{}`)); !errors.Is(err, ErrToolNotFound) {
 		t.Fatalf("restricted tool error=%v", err)
+	}
+}
+
+func TestScopedRegistryKeepsInheritedCatalogLiveAndLocalToolsUnrestricted(t *testing.T) {
+	root := New(Options{})
+	register := func(name string) {
+		if err := root.Register(&Definition{Name: name, InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema, Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) { return name, nil }}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	register("read")
+	scope := root.NewScope()
+	scope.Deny("read")
+	if err := scope.Register(&Definition{Name: "local", InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema, Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) { return "local", nil }}); err != nil {
+		t.Fatal(err)
+	}
+	register("late")
+	tools := scope.ModelTools()
+	names := make(map[string]bool, len(tools))
+	for _, tool := range tools {
+		names[tool.Name] = true
+	}
+	if names["read"] || !names["late"] || !names["local"] {
+		t.Fatalf("scope visibility = %v, want late and local but not denied read", names)
+	}
+	if _, err := scope.Run(context.Background(), ExecContext{}, "local", "local-1", []byte(`{}`)); err != nil {
+		t.Fatalf("local tool was incorrectly filtered: %v", err)
+	}
+}
+
+type testCodeRuntime struct{}
+
+func (testCodeRuntime) ExecuteCode(context.Context, ExecContext, string, string) (any, error) {
+	return "ok", nil
+}
+
+func TestScopedRegistryKeepsCodeModeTransportVisible(t *testing.T) {
+	root := New(Options{Presentation: PresentationBoth, CodeRuntime: testCodeRuntime{}})
+	scope := root.NewScope()
+	scope.Deny("run_code")
+
+	found := false
+	for _, tool := range scope.ModelTools() {
+		found = found || tool.Name == "run_code"
+	}
+	if !found {
+		t.Fatal("scope restriction hid the reserved run_code transport")
+	}
+	if _, err := scope.Run(context.Background(), ExecContext{}, "run_code", "code-1", []byte(`{"code":"return 1"}`)); err != nil {
+		t.Fatalf("reserved run_code transport was denied: %v", err)
 	}
 }
 

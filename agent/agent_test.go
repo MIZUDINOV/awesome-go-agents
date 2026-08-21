@@ -468,7 +468,7 @@ func TestToolResultRoundTripAndReasoningMetadata(t *testing.T) {
 		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
 			return map[string]any{"ok": true}, nil
 		},
-		RenderModel: func(any) (any, error) { return "model-facing", nil },
+		RenderModel: func(_ json.RawMessage, _ any) (any, error) { return "model-facing", nil },
 	})
 	chat := &scriptedProvider{steps: []scriptedStep{
 		{calls: []llm.ToolCallRequest{{CallID: "call-1", Name: "roundtrip", Arguments: json.RawMessage(`{}`)}}, metadata: map[string]any{
@@ -516,12 +516,17 @@ func TestToolResultRoundTripAndReasoningMetadata(t *testing.T) {
 			Output  json.RawMessage `json:"output"`
 			Content json.RawMessage `json:"content"`
 		}
-		if json.Unmarshal(event.Data, &payload) == nil && string(payload.Output) == `{"ok":true}` && string(payload.Content) == `"model-facing"` {
-			foundCanonical = true
+		if json.Unmarshal(event.Data, &payload) == nil {
+			if len(payload.Output) != 0 {
+				t.Fatalf("canonical output leaked into durable tool result: %s", event.Data)
+			}
+			if string(payload.Content) == `"model-facing"` {
+				foundCanonical = true
+			}
 		}
 	}
 	if !foundCanonical {
-		t.Fatal("canonical and model-facing tool result projections were not persisted separately")
+		t.Fatal("model-facing tool result was not persisted")
 	}
 	if assistant.Metadata["provider"] == nil {
 		t.Fatalf("assistant metadata was not replayed: %+v", assistant.Metadata)
@@ -921,14 +926,21 @@ func TestCompactionOnOverflow(t *testing.T) {
 	}
 	events, err := store.Load(context.Background(), "s6", 0, 0)
 	check(t, err)
-	hasSummary := false
+	compactionOrder := make([]session.EventType, 0, 4)
 	for _, e := range events {
-		if e.Type == session.EventCompactionSummary {
-			hasSummary = true
+		switch e.Type {
+		case session.EventCompactionStart, session.EventCompactionSummary, session.EventUserMessage, session.EventCompactionEnd:
+			var payload struct {
+				SurfaceOp string `json:"surface_op"`
+			}
+			if e.Type == session.EventUserMessage && (json.Unmarshal(e.Data, &payload) != nil || payload.SurfaceOp != "replace") {
+				continue
+			}
+			compactionOrder = append(compactionOrder, e.Type)
 		}
 	}
-	if !hasSummary {
-		t.Fatal("expected a durable compaction/summary event")
+	if len(compactionOrder) < 4 || compactionOrder[0] != session.EventCompactionStart || compactionOrder[1] != session.EventCompactionSummary || compactionOrder[2] != session.EventUserMessage || compactionOrder[3] != session.EventCompactionEnd {
+		t.Fatalf("compaction event order = %v, want start/summary/user-replacement/end", compactionOrder)
 	}
 }
 

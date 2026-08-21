@@ -1446,13 +1446,6 @@ func (l *Loop) appendToolOutcome(ctx context.Context, lease session.Lease, em *e
 		}
 		return toolDeferred, nil
 	}
-	canonicalEncoded, err := json.Marshal(outcome.Result.Canonical)
-	if err != nil {
-		if appendErr := l.appendToolResultErr(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, fmt.Errorf("encode tool content: %w", err), turnID, stepID); appendErr != nil {
-			return toolContinue, appendErr
-		}
-		return toolContinue, nil
-	}
 	modelFacing := any(outcome.Result.Canonical)
 	if outcome.Result.ModelFacing != nil {
 		modelFacing = outcome.Result.ModelFacing
@@ -1467,7 +1460,7 @@ func (l *Loop) appendToolOutcome(ctx context.Context, lease session.Lease, em *e
 	if outcome.Result.Continuation == tools.ToolConclude || outcome.Result.ConcludesTurn {
 		continuation = toolConclude
 	}
-	if err := l.appendToolResult(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, canonicalEncoded, contentEncoded, outcome.Result.UI, outcome.Result.Code, outcome.Result.Content, outcome.Result.AdditionalContexts, outcome.Result.ConcludesTurn, turnID, stepID); err != nil {
+	if err := l.appendToolResult(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, contentEncoded, outcome.Result.UI, outcome.Result.Code, outcome.Result.Content, outcome.Result.AdditionalContexts, outcome.Result.ConcludesTurn, turnID, stepID); err != nil {
 		return toolContinue, err
 	}
 	return continuation, nil
@@ -1496,7 +1489,7 @@ func (l *Loop) appendToolFailureResult(ctx context.Context, lease session.Lease,
 			return fmt.Errorf("encode tool failure content: %w", err)
 		}
 	}
-	data := session.ToolResultStructuredPayloadWithOutput(result.CallID, result.Name, output, content, result.UI, code, true, result.Content, result.AdditionalContexts, false)
+	data := session.ToolResultStructuredPayloadWithContent(result.CallID, result.Name, content, result.UI, code, true, result.Content, result.AdditionalContexts, false)
 	ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: result.CallID,
 		Type: session.EventToolResult, Data: data, SourceSeqs: l.assistantSourceSeqs(result.CallID, turnID, stepID)}
 	return l.append(ctx, lease, ev)
@@ -1514,8 +1507,8 @@ func validateToolOutcomes(calls []tools.Call, outcomes []tools.Outcome) error {
 	return nil
 }
 
-func (l *Loop) appendToolResult(ctx context.Context, lease session.Lease, em *emitter, callID, name string, output, content json.RawMessage, meta map[string]any, code string, blocks []session.ContentBlock, contexts []llm.Message, concludesTurn bool, turnID, stepID string) error {
-	data := session.ToolResultStructuredPayloadWithOutput(callID, name, output, content, meta, code, false, blocks, contexts, concludesTurn)
+func (l *Loop) appendToolResult(ctx context.Context, lease session.Lease, em *emitter, callID, name string, content json.RawMessage, meta map[string]any, code string, blocks []session.ContentBlock, contexts []llm.Message, concludesTurn bool, turnID, stepID string) error {
+	data := session.ToolResultStructuredPayloadWithContent(callID, name, content, meta, code, false, blocks, contexts, concludesTurn)
 	ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: callID,
 		Type: session.EventToolResult, Data: data, SourceSeqs: l.assistantSourceSeqs(callID, turnID, stepID)}
 	return l.append(ctx, lease, ev)
@@ -1523,13 +1516,15 @@ func (l *Loop) appendToolResult(ctx context.Context, lease session.Lease, em *em
 
 func (l *Loop) appendToolResultErr(ctx context.Context, lease session.Lease, em *emitter, callID, name string, execErr error, turnID, stepID string) error {
 	code, recovery := toolFailure(execErr)
-	data, _ := json.Marshal(map[string]any{
+	data, err := json.Marshal(map[string]any{
 		"call_id": callID, "name": name, "is_error": true,
 		"error":   map[string]any{"code": code, "message": recovery},
-		"output":  map[string]any{"error": map[string]any{"code": code, "message": recovery}},
 		"content": map[string]any{"error": map[string]any{"code": code, "message": recovery}},
 		"code":    code,
 	})
+	if err != nil {
+		return fmt.Errorf("encode tool error result: %w", err)
+	}
 	ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: callID,
 		Type: session.EventToolResult, Data: data, SourceSeqs: l.assistantSourceSeqs(callID, turnID, stepID)}
 	return l.append(ctx, lease, ev)
@@ -1804,6 +1799,13 @@ func (l *Loop) compactFallback(ctx context.Context, lease session.Lease, msgs []
 	if len(shadowed) == 0 {
 		return 0, fmt.Errorf("agent: no compactable surface before retained tail")
 	}
+	transactionID := fmt.Sprintf("compact-%d", generation)
+	if err := l.append(ctx, lease, session.Event{
+		ID: l.emitterIDFor("compact-start", generation), SessionID: l.SessionID,
+		Type: session.EventCompactionStart, Data: session.CompactionStartPayload(generation, transactionID, shadowed),
+	}); err != nil {
+		return 0, err
+	}
 	pruned := make([]*llm.Message, 0, len(msgs))
 	for _, message := range msgs {
 		if message != nil {
@@ -1832,22 +1834,19 @@ func (l *Loop) compactFallback(ctx context.Context, lease session.Lease, msgs []
 		summary = "Earlier context was compacted; the recent tail is retained verbatim."
 	}
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(summary)))
-	transactionID := fmt.Sprintf("compact-%d", generation)
-	start := session.Event{ID: l.emitterIDFor("compact-start", generation), SessionID: l.SessionID, Type: session.EventCompactionStart, Data: session.CompactionStartPayload(generation, transactionID, shadowed)}
-	sum := session.Event{ID: l.emitterIDFor("compact-summary", generation), SessionID: l.SessionID, Type: session.EventCompactionSummary, Data: session.CompactionSummaryPayload(generation, transactionID, shadowed[len(shadowed)-1], shadowed, summary, fingerprint), SourceSeqs: append([]uint64(nil), shadowed...)}
-	surface := session.Event{ID: l.emitterIDFor("compact-surface", generation), SessionID: l.SessionID, Type: session.EventCompactionSurface, Data: session.CompactionSurfacePayload(generation, transactionID, shadowed, summary, fingerprint), SourceSeqs: append([]uint64(nil), shadowed...)}
-	end := session.Event{ID: l.emitterIDFor("compact-end", generation), SessionID: l.SessionID, Type: session.EventCompactionEnd, Data: session.CompactionEndPayload(generation, transactionID)}
-	if err := l.appendBatch(ctx, lease, []session.Event{start, sum, surface, end}); err != nil {
+	blocks := []session.ContentBlock{session.TextBlock(summary)}
+	if err := l.appendCompactionCommit(ctx, lease, generation, transactionID, shadowed, summary, blocks, fingerprint); err != nil {
 		return 0, err
 	}
-	if err := l.Store.SaveCompactionCheckpoint(ctx, lease, session.CompactionCheckpoint{SessionID: l.SessionID, Generation: generation, TransactionID: transactionID, ThroughSeq: shadowed[len(shadowed)-1], ShadowedSeqs: shadowed, Summary: summary, SummarySHA256: fingerprint, SourceFingerprint: fingerprint}); err != nil {
+	if err := l.Store.SaveCompactionCheckpoint(ctx, lease, session.CompactionCheckpoint{SessionID: l.SessionID, Generation: generation, TransactionID: transactionID, ThroughSeq: shadowed[len(shadowed)-1], ShadowedSeqs: shadowed, Summary: summary, SummaryBlocks: blocks, SummarySHA256: fingerprint, SourceFingerprint: fingerprint}); err != nil {
 		return 0, err
 	}
 	return l.cachedLast(), nil
 }
 
-// compact performs one durable compaction: ask the Compactor to summarize the
-// log, then append compaction/start|summary|surface|end and record the checkpoint.
+// compact performs one durable compaction: append the start marker, ask the
+// Compactor to summarize the log, then append the summary, durable surface
+// replacement and end marker.
 // Raw history is never deleted (H-COMPACT-001).
 func (l *Loop) compact(ctx context.Context, lease session.Lease) (uint64, error) {
 	if l.Config.Compactor == nil {
@@ -1874,28 +1873,39 @@ func (l *Loop) compact(ctx context.Context, lease session.Lease) (uint64, error)
 		}
 	}
 
+	transactionID := fmt.Sprintf("compact-%d", generation)
+	if err := l.append(ctx, lease, session.Event{
+		ID: l.emitterIDFor("compact-start", generation), SessionID: l.SessionID,
+		Type: session.EventCompactionStart, Data: session.CompactionStartPayload(generation, transactionID, shadowed),
+	}); err != nil {
+		return 0, err
+	}
 	summary, fingerprint, err := l.Config.Compactor.Compact(ctx, generation, region, append([]uint64(nil), shadowed...))
 	if err != nil {
 		return 0, err
 	}
-	transactionID := fmt.Sprintf("compact-%d", generation)
-	start := session.Event{ID: l.emitterIDFor("compact-start", generation), SessionID: l.SessionID, Type: session.EventCompactionStart, Data: session.CompactionStartPayload(generation, transactionID, shadowed)}
-	sum := session.Event{ID: l.emitterIDFor("compact-summary", generation), SessionID: l.SessionID, Type: session.EventCompactionSummary,
-		Data: session.CompactionSummaryPayload(generation, transactionID, shadowed[len(shadowed)-1], shadowed, summary, fingerprint), SourceSeqs: append([]uint64(nil), shadowed...)}
-	surface := session.Event{ID: l.emitterIDFor("compact-surface", generation), SessionID: l.SessionID, Type: session.EventCompactionSurface,
-		Data: session.CompactionSurfacePayload(generation, transactionID, shadowed, summary, fingerprint), SourceSeqs: append([]uint64(nil), shadowed...)}
-	end := session.Event{ID: l.emitterIDFor("compact-end", generation), SessionID: l.SessionID, Type: session.EventCompactionEnd, Data: session.CompactionEndPayload(generation, transactionID)}
-
-	if err := l.appendBatch(ctx, lease, []session.Event{start, sum, surface, end}); err != nil {
+	blocks := []session.ContentBlock{session.TextBlock(summary)}
+	if err := l.appendCompactionCommit(ctx, lease, generation, transactionID, shadowed, summary, blocks, fingerprint); err != nil {
 		return 0, err
 	}
 	if err := l.Store.SaveCompactionCheckpoint(ctx, lease, session.CompactionCheckpoint{
 		SessionID: l.SessionID, Generation: generation, TransactionID: transactionID,
-		ThroughSeq: shadowed[len(shadowed)-1], ShadowedSeqs: shadowed, Summary: summary, SummarySHA256: fingerprint, SourceFingerprint: fingerprint,
+		ThroughSeq: shadowed[len(shadowed)-1], ShadowedSeqs: shadowed, Summary: summary, SummaryBlocks: blocks, SummarySHA256: fingerprint, SourceFingerprint: fingerprint,
 	}); err != nil {
 		return 0, err
 	}
 	return l.cachedLast(), nil
+}
+
+func (l *Loop) appendCompactionCommit(ctx context.Context, lease session.Lease, generation uint64, transactionID string, shadowed []uint64, summary string, blocks []session.ContentBlock, fingerprint string) error {
+	seqs := append([]uint64(nil), shadowed...)
+	sum := session.Event{ID: l.emitterIDFor("compact-summary", generation), SessionID: l.SessionID,
+		Type: session.EventCompactionSummary, Data: session.CompactionSummaryPayloadWithBlocks(generation, transactionID, shadowed[len(shadowed)-1], seqs, summary, blocks, fingerprint), SourceSeqs: append([]uint64(nil), seqs...)}
+	replacement := session.Event{ID: l.emitterIDFor("compact-surface", generation), SessionID: l.SessionID,
+		Type: session.EventUserMessage, Data: session.CompactionSurfaceReplacementPayload(generation, transactionID, seqs, summary, blocks, fingerprint), SourceSeqs: append([]uint64(nil), seqs...)}
+	end := session.Event{ID: l.emitterIDFor("compact-end", generation), SessionID: l.SessionID,
+		Type: session.EventCompactionEnd, Data: session.CompactionEndPayload(generation, transactionID)}
+	return l.appendBatch(ctx, lease, []session.Event{sum, replacement, end})
 }
 
 func (l *Loop) append(ctx context.Context, lease session.Lease, ev session.Event) error {
