@@ -624,7 +624,16 @@ func RequestContextPayloadWithCapabilities(model string, contextWindow, maxOutpu
 // committed. It makes a failed step observable and replayable without
 // pretending that a model response was produced.
 func RequestErrorPayload(code, message string, streamStarted bool) json.RawMessage {
-	return mustJSON(map[string]any{"code": code, "message": message, "stream_started": streamStarted})
+	return RequestErrorPayloadWithRetryable(code, message, streamStarted, false)
+}
+
+// RequestErrorPayloadWithRetryable adds provider-neutral retryability without
+// exposing provider wire fields. The legacy helper remains available for
+// readers and callers that do not have a classified provider error.
+func RequestErrorPayloadWithRetryable(code, message string, streamStarted, retryable bool) json.RawMessage {
+	return mustJSON(map[string]any{
+		"code": code, "message": message, "stream_started": streamStarted, "retryable": retryable,
+	})
 }
 
 // CompactionStartPayload opens a compaction transaction. generation increases

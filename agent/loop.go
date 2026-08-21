@@ -1263,7 +1263,7 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 			}
 		}
 		code := modelErrorCode(err)
-		if appendErr := l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventRequestError, Data: session.RequestErrorPayload(code, err.Error(), streamStarted)}); appendErr != nil {
+		if appendErr := l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventRequestError, Data: session.RequestErrorPayloadWithRetryable(code, err.Error(), streamStarted, llm.IsRetryable(err))}); appendErr != nil {
 			return false, "", appendErr
 		}
 		return false, "", err
