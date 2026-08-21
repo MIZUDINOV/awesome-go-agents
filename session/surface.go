@@ -101,26 +101,128 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		ShadowedSeqs: sortedShadowed(shadowed),
 	}
 
-	// First pass: fold all durable compaction/summary events (in order) into
-	// the projection. Later checkpoints advance the generation and replace the
-	// summary text; shadowed sets accumulate.
+	// First pass: fold durable compaction transactions into the projection.
+	// Format v1 summaries are kept readable as legacy replacements. Format v2
+	// requires the explicit surface event and a sealed end event, so an
+	// interrupted transaction cannot change the model surface during replay.
+	type compactionTransaction struct {
+		generation    uint64
+		transactionID string
+		sourceSeqs    []uint64
+		summary       string
+		fingerprint   string
+		start         bool
+		summarySeen   bool
+		surfaceSeen   bool
+		end           bool
+	}
+	transactions := make(map[string]*compactionTransaction)
+	transactionOrder := make([]string, 0)
+	getTransaction := func(transactionID string) *compactionTransaction {
+		tx := transactions[transactionID]
+		if tx == nil {
+			tx = &compactionTransaction{transactionID: transactionID}
+			transactions[transactionID] = tx
+			transactionOrder = append(transactionOrder, transactionID)
+		}
+		return tx
+	}
+	apply := func(generation uint64, sourceSeqs []uint64, summary, fingerprint string, seq uint64) error {
+		if generation > 0 && generation < proj.Generation {
+			return fmt.Errorf("session: compaction generation regressed at seq %d (%d < %d)", seq, generation, proj.Generation)
+		}
+		for _, sourceSeq := range sourceSeqs {
+			if sourceSeq > 0 {
+				shadowed[sourceSeq] = true
+			}
+		}
+		if generation > 0 {
+			proj.Generation = generation
+		}
+		proj.Summary = summary
+		if fingerprint != "" {
+			proj.Fingerprint = fingerprint
+		}
+		return nil
+	}
 	for _, event := range events {
-		if event.Type == EventCompactionSummary {
+		switch event.Type {
+		case EventCompactionStart:
+			var payload struct {
+				Generation    uint64   `json:"generation"`
+				TransactionID string   `json:"transaction_id"`
+				SourceSeqs    []uint64 `json:"source_seqs"`
+			}
+			if err := json.Unmarshal(event.Data, &payload); err != nil {
+				return nil, nil, fmt.Errorf("session: decode compaction/start at seq %d: %w", event.Seq, err)
+			}
+			if payload.TransactionID != "" {
+				tx := getTransaction(payload.TransactionID)
+				tx.generation, tx.sourceSeqs, tx.start = payload.Generation, append([]uint64(nil), payload.SourceSeqs...), true
+			}
+		case EventCompactionSummary:
 			payload, err := decodeCompactionSummary(event.Data)
 			if err != nil {
 				return nil, nil, fmt.Errorf("session: decode compaction/summary at seq %d: %w", event.Seq, err)
 			}
-			if payload.Generation > 0 && payload.Generation < proj.Generation {
-				return nil, nil, fmt.Errorf("session: compaction generation regressed at seq %d (%d < %d)", event.Seq, payload.Generation, proj.Generation)
+			// A zero format version is how old hand-built events and legacy rows
+			// without an envelope version arrive. They must retain v1 read
+			// semantics even though Normalize now writes v2.
+			if event.FormatVersion == 0 || event.FormatVersion < 2 {
+				seqs := payload.ShadowedSeqs
+				if len(seqs) == 0 {
+					seqs = payload.SourceSeqs
+				}
+				if err := apply(payload.Generation, seqs, payload.Summary, payload.Fingerprint, event.Seq); err != nil {
+					return nil, nil, err
+				}
+				continue
 			}
-			for _, seq := range payload.ShadowedSeqs {
-				shadowed[seq] = true
+			if payload.TransactionID != "" {
+				tx := getTransaction(payload.TransactionID)
+				tx.generation, tx.sourceSeqs, tx.summary, tx.fingerprint, tx.summarySeen = payload.Generation, append([]uint64(nil), payload.SourceSeqs...), payload.Summary, payload.Fingerprint, true
+				if len(tx.sourceSeqs) == 0 {
+					tx.sourceSeqs = append([]uint64(nil), payload.ShadowedSeqs...)
+				}
 			}
-			proj.Generation = payload.Generation
-			proj.Summary = payload.Summary
-			if payload.Fingerprint != "" {
-				proj.Fingerprint = payload.Fingerprint
+		case EventCompactionSurface:
+			var payload struct {
+				Generation    uint64   `json:"generation"`
+				TransactionID string   `json:"transaction_id"`
+				SourceSeqs    []uint64 `json:"source_seqs"`
+				Summary       string   `json:"summary"`
+				Fingerprint   string   `json:"fingerprint"`
 			}
+			if err := json.Unmarshal(event.Data, &payload); err != nil {
+				return nil, nil, fmt.Errorf("session: decode compaction/surface at seq %d: %w", event.Seq, err)
+			}
+			if payload.TransactionID != "" {
+				tx := getTransaction(payload.TransactionID)
+				tx.generation, tx.summary, tx.fingerprint, tx.surfaceSeen = payload.Generation, payload.Summary, payload.Fingerprint, true
+				if len(payload.SourceSeqs) > 0 {
+					tx.sourceSeqs = append([]uint64(nil), payload.SourceSeqs...)
+				}
+			}
+		case EventCompactionEnd:
+			var payload struct {
+				Generation    uint64 `json:"generation"`
+				TransactionID string `json:"transaction_id"`
+			}
+			if err := json.Unmarshal(event.Data, &payload); err != nil {
+				return nil, nil, fmt.Errorf("session: decode compaction/end at seq %d: %w", event.Seq, err)
+			}
+			if tx := transactions[payload.TransactionID]; tx != nil {
+				tx.generation, tx.end = payload.Generation, true
+			}
+		}
+	}
+	for _, transactionID := range transactionOrder {
+		tx := transactions[transactionID]
+		if !tx.start || !tx.summarySeen || !tx.surfaceSeen || !tx.end {
+			continue
+		}
+		if err := apply(tx.generation, tx.sourceSeqs, tx.summary, tx.fingerprint, 0); err != nil {
+			return nil, nil, err
 		}
 	}
 	proj.ShadowedSeqs = sortedShadowed(shadowed)
@@ -291,6 +393,7 @@ type compactionSummaryPayload struct {
 	TransactionID string   `json:"transaction_id"`
 	ThroughSeq    uint64   `json:"through_seq"`
 	ShadowedSeqs  []uint64 `json:"shadowed_seqs"`
+	SourceSeqs    []uint64 `json:"source_seqs"`
 	Summary       string   `json:"summary"`
 	Fingerprint   string   `json:"fingerprint"`
 }

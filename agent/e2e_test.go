@@ -292,7 +292,7 @@ func TestE2E_ScenarioF_ProviderOverflow(t *testing.T) {
 	h := newHarness(t, ws, "F", []e2eStep{{text: "recovered"}, {text: "done"}}, Config{
 		Model: "m", Owner: "F", SystemPrompt: "sys", MaxContextRetries: 2,
 		ContextWindow: 60, MaxOutput: 10, CompactThresholdRatio: 0.80,
-		Compactor: &countingCompactor{f: func(generation uint64, events []session.Event, through uint64) (string, string, error) {
+		Compactor: &countingCompactor{f: func(generation uint64, events []session.Event, sourceSeqs []uint64) (string, string, error) {
 			return "[summary]", "fp-F", nil
 		}},
 	})

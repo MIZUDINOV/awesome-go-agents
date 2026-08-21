@@ -891,11 +891,11 @@ func TestCompactionOnOverflow(t *testing.T) {
 
 	var compactMu sync.Mutex
 	compactCalls := 0
-	compactor := &countingCompactor{f: func(generation uint64, events []session.Event, through uint64) (string, string, error) {
+	compactor := &countingCompactor{f: func(generation uint64, events []session.Event, sourceSeqs []uint64) (string, string, error) {
 		compactMu.Lock()
 		compactCalls++
 		compactMu.Unlock()
-		return "[summarized]", "fp-" + fmt.Sprint(generation), nil
+		return "[summarized]", "fp-" + fmt.Sprint(generation) + "-" + fmt.Sprint(len(sourceSeqs)), nil
 	}}
 
 	chat := &scriptedProvider{steps: []scriptedStep{{text: "ok", finish: llm.FinishReasonStop}}}
@@ -963,11 +963,11 @@ func TestCancellationStopsBeforeWork(t *testing.T) {
 }
 
 type countingCompactor struct {
-	f func(generation uint64, events []session.Event, through uint64) (string, string, error)
+	f func(generation uint64, events []session.Event, sourceSeqs []uint64) (string, string, error)
 }
 
-func (c *countingCompactor) Compact(_ context.Context, generation uint64, events []session.Event, throughSeq uint64) (string, string, error) {
-	return c.f(generation, events, throughSeq)
+func (c *countingCompactor) Compact(_ context.Context, generation uint64, events []session.Event, sourceSeqs []uint64) (string, string, error) {
+	return c.f(generation, events, sourceSeqs)
 }
 
 // ---------------------------------------------------------------------------

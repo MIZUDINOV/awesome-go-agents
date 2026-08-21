@@ -54,8 +54,8 @@ type RecoveryReport struct {
 
 // FencedStore extends Store with durable single-writer semantics: leases,
 // fences, idempotent fenced appends, recovery, and durable compaction
-// checkpoints. MemoryStore implements it with an in-memory lease; pgstore
-// implements it against PostgreSQL.
+// checkpoints. MemoryStore implements it with an in-memory lease; host
+// adapters provide durable leases and writes.
 type FencedStore interface {
 	Store
 
@@ -286,6 +286,10 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 	var recovery []Event
 	recovery = append(recovery, InterruptedDraftEvents(all, lease.SessionID)...)
 	stepEnds := InterruptedStepEndEvents(all, lease.SessionID)
+	deferredWaiting := len(pendingDeferredCallIDs(all)) > 0
+	if deferredWaiting {
+		stepEnds = nil
+	}
 	report.StepsClosed = len(stepEnds)
 	if openTurns > 0 {
 		report.TurnClosed = true
@@ -316,13 +320,20 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 	}
 	// Keep terminal events ordered: tool outcomes settle dispatch first, then
 	// the step, and only then the containing turn.
-	recovery = append(recovery, stepEnds...)
-	if openTurns > 0 {
-		recovery = append(recovery, Event{
-			ID: "recover:turn-end:" + openTurnID, RunID: openRunID, TurnID: openTurnID,
-			Type: EventTurnEnd, SessionID: lease.SessionID,
-			Data: mustJSON(map[string]any{"reason": "interrupted"}),
-		})
+	// A deferred call is an intentional wait, not an interrupted step. Keep
+	// its turn open so the host can resume the original call without creating
+	// a steering turn or losing the tool/result pairing.
+	if deferredWaiting {
+		report.TurnClosed = false
+	} else {
+		recovery = append(recovery, stepEnds...)
+		if openTurns > 0 {
+			recovery = append(recovery, Event{
+				ID: "recover:turn-end:" + openTurnID, RunID: openRunID, TurnID: openTurnID,
+				Type: EventTurnEnd, SessionID: lease.SessionID,
+				Data: mustJSON(map[string]any{"reason": "interrupted"}),
+			})
+		}
 	}
 	if len(recovery) > 0 {
 		if _, err := s.AppendFenced(ctx, lease, recovery); err != nil {
@@ -336,7 +347,7 @@ func (s *MemoryStore) Recover(ctx context.Context, lease Lease) (*RecoveryReport
 func dispatchedCallIDs(events []Event) map[string]bool {
 	ids := make(map[string]bool)
 	for _, event := range events {
-		if (event.Type == EventToolDispatched || event.Type == EventToolRunning) && event.CallID != "" {
+		if (event.Type == EventToolDispatched || event.Type == EventToolRunning || event.Type == EventToolResumeStarted) && event.CallID != "" {
 			ids[event.CallID] = true
 		}
 	}
@@ -399,12 +410,24 @@ func (s *MemoryStore) checkFence(lease Lease) error {
 }
 
 func danglingCallIDs(events []Event) []string {
-	resultIDs := make(map[string]bool)
-	pendingApproval := make(map[string]bool)
-	resolvedApproval := make(map[string]bool)
-	dispatched := make(map[string]bool)
+	const (
+		callPending = iota
+		callDispatched
+		callDeferred
+		callResuming
+		callResult
+		callApprovalPending
+		callApprovalResolved
+	)
+	state := make(map[string]int)
 	callIDs := make([]string, 0)
 	seen := make(map[string]bool)
+	remember := func(callID string) {
+		if callID != "" && !seen[callID] {
+			seen[callID] = true
+			callIDs = append(callIDs, callID)
+		}
+	}
 	for _, e := range events {
 		switch e.Type {
 		case EventToolCall:
@@ -412,13 +435,24 @@ func danglingCallIDs(events []Event) []string {
 				CallID string `json:"call_id"`
 			}
 			_ = decodeJSON(e.Data, &payload)
-			if payload.CallID != "" && !seen[payload.CallID] {
-				seen[payload.CallID] = true
-				callIDs = append(callIDs, payload.CallID)
+			remember(payload.CallID)
+			if payload.CallID != "" && state[payload.CallID] == 0 {
+				state[payload.CallID] = callPending
 			}
 		case EventToolDispatched, EventToolRunning:
 			if e.CallID != "" {
-				dispatched[e.CallID] = true
+				remember(e.CallID)
+				state[e.CallID] = callDispatched
+			}
+		case EventToolDeferred:
+			if e.CallID != "" {
+				remember(e.CallID)
+				state[e.CallID] = callDeferred
+			}
+		case EventToolResumeStarted:
+			if e.CallID != "" {
+				remember(e.CallID)
+				state[e.CallID] = callResuming
 			}
 		case EventAssistantMessage:
 			var payload struct {
@@ -426,9 +460,9 @@ func danglingCallIDs(events []Event) []string {
 			}
 			_ = decodeJSON(e.Data, &payload)
 			for _, call := range payload.ToolCalls {
-				if call.CallID != "" && !seen[call.CallID] {
-					seen[call.CallID] = true
-					callIDs = append(callIDs, call.CallID)
+				remember(call.CallID)
+				if call.CallID != "" && state[call.CallID] == 0 {
+					state[call.CallID] = callPending
 				}
 			}
 		case EventToolResult:
@@ -437,27 +471,60 @@ func danglingCallIDs(events []Event) []string {
 			}
 			_ = decodeJSON(e.Data, &payload)
 			if payload.CallID != "" {
-				resultIDs[payload.CallID] = true
+				remember(payload.CallID)
+				state[payload.CallID] = callResult
 			}
 		case EventApprovalRequested:
 			if e.CallID != "" {
-				pendingApproval[e.CallID] = true
+				remember(e.CallID)
+				state[e.CallID] = callApprovalPending
 			}
 		case EventApprovalResolved:
 			var payload ApprovalResolvedPayload
 			if decodeJSON(e.Data, &payload) == nil && payload.CallID != "" {
-				pendingApproval[payload.CallID] = false
-				resolvedApproval[payload.CallID] = true
+				remember(payload.CallID)
+				if state[payload.CallID] == callApprovalPending {
+					state[payload.CallID] = callApprovalResolved
+				}
 			}
 		}
 	}
 	var dangling []string
 	for _, id := range callIDs {
-		if !resultIDs[id] && !pendingApproval[id] && (!resolvedApproval[id] || dispatched[id]) {
+		switch state[id] {
+		case callDispatched, callResuming:
 			dangling = append(dangling, id)
 		}
 	}
 	return dangling
+}
+
+func pendingDeferredCallIDs(events []Event) []string {
+	state := make(map[string]bool)
+	order := make([]string, 0)
+	seen := make(map[string]bool)
+	for _, event := range events {
+		if event.CallID == "" {
+			continue
+		}
+		if !seen[event.CallID] {
+			seen[event.CallID] = true
+			order = append(order, event.CallID)
+		}
+		switch event.Type {
+		case EventToolDeferred:
+			state[event.CallID] = true
+		case EventToolResumeStarted, EventToolResult:
+			state[event.CallID] = false
+		}
+	}
+	pending := make([]string, 0)
+	for _, callID := range order {
+		if state[callID] {
+			pending = append(pending, callID)
+		}
+	}
+	return pending
 }
 
 func decodeJSON(data []byte, out any) error {

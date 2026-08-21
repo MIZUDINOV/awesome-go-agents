@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/MIZUDINOV/awesome-go-agents/llm"
 	"github.com/MIZUDINOV/awesome-go-agents/session"
@@ -91,6 +92,117 @@ func TestDeferredToolCanResumeThroughAgentAPI(t *testing.T) {
 	}
 	if !deferred || !result {
 		t.Fatalf("deferred=%v result=%v, want both durable events", deferred, result)
+	}
+}
+
+func TestDeferredToolResumesOriginalCallWithoutNewTurn(t *testing.T) {
+	store := session.NewMemoryStore()
+	registry := tools.New(tools.Options{})
+	executions := 0
+	registry.MustRegister(&tools.Definition{
+		Name: "lazy", Description: "lazy", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: tools.AnyOutputSchema,
+		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+			executions++
+			return map[string]any{"execution": executions}, nil
+		},
+		FinalizeContent: func(result *tools.Result) error {
+			if executions == 1 {
+				result.Continuation = tools.ToolDeferred
+				result.ResumeKey = "workspace:call-1"
+				result.WaitingReason = "workspace"
+			}
+			return nil
+		},
+	})
+	chat := &scriptedProvider{steps: []scriptedStep{
+		{calls: []llm.ToolCallRequest{{CallID: "call-1", Name: "lazy", Arguments: json.RawMessage(`{}`)}}, finish: llm.FinishReasonToolCalls},
+		{text: "done", finish: llm.FinishReasonStop},
+	}}
+	loop := NewLoop("deferred-resume-session", store, registry, chat, Config{Model: "m", Owner: "worker", SystemPrompt: "sys"})
+	if _, err := loop.Run(context.Background(), "start"); !errors.Is(err, ErrToolDeferred) {
+		t.Fatalf("Run() error = %v, want ErrToolDeferred", err)
+	}
+	if err := loop.ResumeDeferredTools(context.Background(), []DeferredToolResume{{CallID: "call-1", ResumeKey: "workspace:call-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if executions != 2 {
+		t.Fatalf("tool executions = %d, want 2", executions)
+	}
+	events, err := store.Load(context.Background(), "deferred-resume-session", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turnStarts, resumeStarts, results := 0, 0, 0
+	resumeIndex, resultIndex := -1, -1
+	for index, event := range events {
+		switch event.Type {
+		case session.EventTurnStart:
+			turnStarts++
+		case session.EventToolResumeStarted:
+			resumeStarts++
+			resumeIndex = index
+		case session.EventToolResult:
+			if event.CallID == "call-1" {
+				results++
+				resultIndex = index
+			}
+		}
+	}
+	if turnStarts != 1 || resumeStarts != 1 || results != 1 || resumeIndex < 0 || resultIndex <= resumeIndex {
+		t.Fatalf("resume lifecycle turns=%d resume_started=%d results=%d indexes=%d/%d", turnStarts, resumeStarts, results, resumeIndex, resultIndex)
+	}
+}
+
+func TestResumeStartedRecoveryDoesNotReexecuteTool(t *testing.T) {
+	store := session.NewMemoryStore()
+	ctx := context.Background()
+	lease, err := store.ClaimLease(ctx, "resume-crash-session", "seed", time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.AppendFenced(ctx, lease, []session.Event{
+		{RunID: "run-1", TurnID: "turn-1", Type: session.EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", Type: session.EventStepStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolCall, ID: "call-1", Data: session.ToolCallPayload("call-1", "side_effect", json.RawMessage(`{}`))},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolDeferred, Data: json.RawMessage(`{"name":"side_effect","resume_key":"workspace:call-1"}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolResumeStarted, Data: session.ToolResumeStartedPayload("call-1", "side_effect", "workspace:call-1")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	executions := 0
+	registry := tools.New(tools.Options{})
+	registry.MustRegister(&tools.Definition{
+		Name: "side_effect", Description: "side effect", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: tools.AnyOutputSchema,
+		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+			executions++
+			return map[string]any{"ok": true}, nil
+		},
+	})
+	loop := NewLoop("resume-crash-session", store, registry, &scriptedProvider{}, Config{Model: "m", Owner: "worker", SystemPrompt: "sys"})
+	if err := loop.ResumeDeferredTools(ctx, []DeferredToolResume{{CallID: "call-1", ResumeKey: "workspace:call-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if executions != 0 {
+		t.Fatalf("resumed tool executed %d times after crash barrier", executions)
+	}
+	all, _ := store.Load(ctx, "resume-crash-session", 0, 0)
+	unknown := false
+	for _, event := range all {
+		if event.Type != session.EventToolResult || event.CallID != "call-1" {
+			continue
+		}
+		var payload struct {
+			Code string `json:"code"`
+		}
+		_ = json.Unmarshal(event.Data, &payload)
+		unknown = unknown || payload.Code == "TOOL_OUTCOME_UNKNOWN"
+	}
+	if !unknown {
+		t.Fatal("missing unknown outcome after resume barrier crash")
 	}
 }
 

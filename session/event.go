@@ -23,7 +23,7 @@ import (
 // EventFormatVersion is the current event envelope format version. A reader
 // may replay events with format version <= this constant; a higher version is
 // an explicit migration error, never a silent decode.
-const EventFormatVersion = 1
+const EventFormatVersion = 2
 
 // EventType identifies the kind of a session event.
 type EventType string
@@ -59,6 +59,7 @@ const (
 	EventToolDispatched    EventType = "tool/dispatched"
 	EventToolRunning       EventType = "tool/running"
 	EventToolDeferred      EventType = "tool/deferred"
+	EventToolResumeStarted EventType = "tool/resume_started"
 	EventToolResult        EventType = "tool/result"
 	EventRequestError      EventType = "request/error"
 
@@ -72,6 +73,7 @@ const (
 	// model-visible projection.
 	EventCompactionStart   EventType = "compaction/start"
 	EventCompactionSummary EventType = "compaction/summary"
+	EventCompactionSurface EventType = "compaction/surface"
 	EventCompactionEnd     EventType = "compaction/end"
 )
 
@@ -86,10 +88,10 @@ var knownTypes = map[EventType]bool{
 	EventInboxQueued: true, EventInboxClaimed: true, EventInboxRequeued: true, EventInboxCompleted: true, EventInboxDiscarded: true,
 	EventApprovalRequested: true, EventApprovalResolved: true,
 	EventToolCall: true, EventToolResult: true,
-	EventToolAdmitted: true, EventToolDispatched: true, EventToolRunning: true, EventToolDeferred: true,
+	EventToolAdmitted: true, EventToolDispatched: true, EventToolRunning: true, EventToolDeferred: true, EventToolResumeStarted: true,
 	EventRequestError:    true,
 	EventContextSnapshot: true, EventUsage: true,
-	EventCompactionStart: true, EventCompactionSummary: true, EventCompactionEnd: true,
+	EventCompactionStart: true, EventCompactionSummary: true, EventCompactionSurface: true, EventCompactionEnd: true,
 }
 
 // Known reports whether t is part of the event vocabulary.
@@ -215,7 +217,7 @@ func (e Event) Validate() error {
 			return fmt.Errorf("session: extension envelope route does not match event type %q", e.Type)
 		}
 	}
-	if e.Type == EventToolCall || e.Type == EventToolAdmitted || e.Type == EventToolDispatched || e.Type == EventToolRunning || e.Type == EventToolDeferred || e.Type == EventToolResult || e.Type == EventApprovalRequested || e.Type == EventApprovalResolved {
+	if e.Type == EventToolCall || e.Type == EventToolAdmitted || e.Type == EventToolDispatched || e.Type == EventToolRunning || e.Type == EventToolDeferred || e.Type == EventToolResumeStarted || e.Type == EventToolResult || e.Type == EventApprovalRequested || e.Type == EventApprovalResolved {
 		if e.CallID == "" {
 			return fmt.Errorf("session: event %q requires call_id correlation", e.Type)
 		}
@@ -536,6 +538,16 @@ func ToolResultStructuredPayloadWithOutput(callID, name string, output, content 
 	return mustJSON(payload)
 }
 
+// ToolResumeStartedPayload is the durable barrier immediately before a
+// deferred tool is executed for the first time after its prerequisite is
+// ready. Recovery treats this as potentially side-effecting and never retries
+// it blindly.
+func ToolResumeStartedPayload(callID, name, resumeKey string) json.RawMessage {
+	return mustJSON(map[string]any{
+		"call_id": callID, "name": name, "resume_key": resumeKey,
+	})
+}
+
 // RequestHeaderPayload records the request header and an optional provider
 // snapshot. Adapters that expose their resolved wire payload populate the
 // snapshot; otherwise it remains the provider-neutral request. It is durable
@@ -571,6 +583,16 @@ func RequestContextPayload(model string, contextWindow, maxOutput int64) json.Ra
 	})
 }
 
+func RequestContextPayloadWithCapabilities(model string, contextWindow, maxOutput int64, capabilities *llm.Capabilities) json.RawMessage {
+	payload := map[string]any{
+		"model": model, "context_window": contextWindow, "max_output": maxOutput,
+	}
+	if capabilities != nil {
+		payload["capabilities"] = *capabilities
+	}
+	return mustJSON(payload)
+}
+
 // RequestErrorPayload records a provider failure after the request header was
 // committed. It makes a failed step observable and replayable without
 // pretending that a model response was produced.
@@ -592,8 +614,18 @@ func CompactionStartPayload(generation uint64, transactionID string, sourceSeqs 
 func CompactionSummaryPayload(generation uint64, transactionID string, throughSeq uint64, shadowedSeqs []uint64, summary, fingerprint string) json.RawMessage {
 	return mustJSON(map[string]any{
 		"generation": generation, "transaction_id": transactionID,
-		"through_seq": throughSeq, "shadowed_seqs": shadowedSeqs,
+		"through_seq": throughSeq, "shadowed_seqs": shadowedSeqs, "source_seqs": shadowedSeqs,
 		"summary": summary, "fingerprint": fingerprint,
+	})
+}
+
+// CompactionSurfacePayload is the explicit model-surface replacement. It is
+// separate from the summary so replay can ignore an interrupted transaction:
+// only a complete start/summary/surface/end sequence changes the projection.
+func CompactionSurfacePayload(generation uint64, transactionID string, sourceSeqs []uint64, summary, fingerprint string) json.RawMessage {
+	return mustJSON(map[string]any{
+		"generation": generation, "transaction_id": transactionID,
+		"source_seqs": sourceSeqs, "summary": summary, "fingerprint": fingerprint,
 	})
 }
 

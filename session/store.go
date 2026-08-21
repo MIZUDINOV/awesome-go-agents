@@ -22,8 +22,8 @@ type BatchStore interface {
 	AppendCommitted(ctx context.Context, sessionID string, events []Event) (CommittedBatch, error)
 }
 
-// Store persists the append-only event log. The real deployment uses
-// PGSessionStore (PostgreSQL); MemoryStore is used in tests and embedded runs.
+// Store persists the append-only event log. Hosts provide the durable backend;
+// MemoryStore is used in tests and embedded runs.
 //
 // Contract: Append atomically assigns strictly increasing per-session sequence
 // numbers to the batch (contiguous, no gaps within one batch) and returns the

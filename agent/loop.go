@@ -51,10 +51,11 @@ var (
 	// even after max-safe compaction.
 	ErrContextOverflow = errors.New("agent: context overflow after max-safe compaction")
 	// ErrStopped is returned when the run was cancelled mid-turn.
-	ErrStopped      = errors.New("agent: run stopped (cancelled)")
-	ErrToolLimit    = errors.New("agent: tool-call limit exceeded")
-	ErrTokenLimit   = errors.New("agent: token limit exceeded")
-	ErrToolDeferred = errors.New("agent: tool execution deferred")
+	ErrStopped                  = errors.New("agent: run stopped (cancelled)")
+	ErrToolLimit                = errors.New("agent: tool-call limit exceeded")
+	ErrTokenLimit               = errors.New("agent: token limit exceeded")
+	ErrToolDeferred             = errors.New("agent: tool execution deferred")
+	ErrDeferredExecutionStarted = errors.New("agent: deferred tool execution already started")
 )
 
 // Chat is the provider-neutral model seam.
@@ -84,11 +85,12 @@ type Store interface {
 	session.FencedStore
 }
 
-// Compactor produces the durable summary + fingerprint over a region of the
-// log during compaction. When nil, the loop uses a deterministic bounded
-// summary and still advances the durable surface.
+// Compactor produces the durable summary + fingerprint over the exact source
+// events selected for replacement. The list is intentionally not a prefix:
+// compaction must never shadow unrelated events that happen to fall between
+// two selected sequences.
 type Compactor interface {
-	Compact(ctx context.Context, generation uint64, events []session.Event, throughSeq uint64) (summary, fingerprint string, err error)
+	Compact(ctx context.Context, generation uint64, events []session.Event, sourceSeqs []uint64) (summary, fingerprint string, err error)
 }
 
 // Config controls the loop.
@@ -287,6 +289,15 @@ type ToolResume struct {
 	Err       error
 }
 
+// DeferredToolResume asks AgentKit to execute the original deferred tool
+// after its host-owned prerequisite is ready. The original call and argument
+// bytes are loaded from the durable event log; callers cannot substitute a
+// different tool body or input during continuation.
+type DeferredToolResume struct {
+	CallID    string `json:"call_id"`
+	ResumeKey string `json:"resume_key"`
+}
+
 // ResumeTool appends the result of a deferred tool and resumes the same model
 // turn. The host may supply ClaimedLease; otherwise the loop owns a temporary
 // lease exactly as it does for RunInputWithID.
@@ -322,13 +333,20 @@ func (l *Loop) ResumeTool(ctx context.Context, request ToolResume) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if _, err := l.recoverSession(ctx, lease); err != nil {
+		return err
+	}
 	if err := l.refresh(ctx); err != nil {
 		return err
 	}
 	var deferred session.Event
 	var toolName string
+	resumeStarted := false
 	for _, event := range l.snapshotEvents() {
 		if event.Type != session.EventToolDeferred || event.CallID != request.CallID {
+			if event.Type == session.EventToolResumeStarted && event.CallID == request.CallID {
+				resumeStarted = true
+			}
 			continue
 		}
 		var payload struct {
@@ -340,13 +358,16 @@ func (l *Loop) ResumeTool(ctx context.Context, request ToolResume) error {
 			toolName = payload.Name
 		}
 	}
-	if deferred.ID == "" {
+	if deferred.Type != session.EventToolDeferred {
 		return fmt.Errorf("agent: deferred tool %s was not found", request.CallID)
 	}
 	for _, event := range l.snapshotEvents() {
 		if event.Type == session.EventToolResult && event.CallID == request.CallID {
 			return nil
 		}
+	}
+	if resumeStarted {
+		return ErrDeferredExecutionStarted
 	}
 	result := request.Result
 	if result == nil {
@@ -368,11 +389,226 @@ func (l *Loop) ResumeTool(ctx context.Context, request ToolResume) error {
 	if err := l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: deferred.RunID, TurnID: deferred.TurnID, StepID: deferred.StepID, CallID: request.CallID, Type: session.EventStepEnd, Data: strJSON("deferred_resolved")}); err != nil {
 		return err
 	}
+	if continuation == toolDeferred {
+		return ErrToolDeferred
+	}
 	if continuation == toolConclude {
 		return l.appendTurnEnd(durableContext(ctx), lease, em, deferred.TurnID, "tool_concluded")
 	}
 	_, err = l.runTurnSteps(ctx, lease, stopHeartbeat, em, deferred.TurnID, &Result{}, nextStepIndex(deferred.StepID), nil)
 	return err
+}
+
+// ResumeDeferredTools executes deferred calls through the original registry
+// after a host-owned prerequisite becomes ready. All calls from the same
+// model tool batch are completed before the loop starts another model step.
+// This is the continuation path for lazy workspace tools; it does not create
+// a steering message or a second model turn.
+func (l *Loop) ResumeDeferredTools(ctx context.Context, requests []DeferredToolResume) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	for _, request := range requests {
+		if request.CallID == "" || request.ResumeKey == "" {
+			return fmt.Errorf("agent: deferred tool call and resume key are required")
+		}
+	}
+
+	var lease session.Lease
+	externalLease := l.Config.ClaimedLease != nil
+	stopHeartbeat := func() error { return nil }
+	if externalLease {
+		lease = *l.Config.ClaimedLease
+		if lease.SessionID != l.SessionID || lease.Token == "" || lease.Fence == 0 {
+			return ErrLeaseLost
+		}
+	} else {
+		claimed, err := l.Store.ClaimLease(ctx, l.SessionID, l.Config.Owner, l.Config.LeaseTTL, "")
+		if err != nil {
+			return err
+		}
+		lease = claimed
+		var loopCtx context.Context
+		loopCtx, stopHeartbeat = l.leaseHeartbeat(ctx, lease)
+		ctx = loopCtx
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		defer func() { _ = l.Store.ReleaseLease(cleanupCtx, lease) }()
+		defer func() { _ = stopHeartbeat() }()
+	}
+	if _, err := l.recoverSession(ctx, lease); err != nil {
+		return err
+	}
+	if err := l.refresh(ctx); err != nil {
+		return err
+	}
+	events := l.snapshotEvents()
+	if len(requests) == 0 {
+		requests = pendingDeferredToolResumes(events)
+	}
+	if len(requests) == 0 {
+		return nil
+	}
+	allSettled := true
+	for _, request := range requests {
+		_, _, resultExists, _ := deferredToolRecord(events, request)
+		if !resultExists {
+			allSettled = false
+			break
+		}
+	}
+	if allSettled {
+		return nil
+	}
+
+	var first session.Event
+	concludes := false
+	for _, request := range requests {
+		callEvent, deferred, resultExists, resumeStarted := deferredToolRecord(events, request)
+		if deferred.Type != session.EventToolDeferred {
+			return fmt.Errorf("agent: deferred tool %s was not found", request.CallID)
+		}
+		if first.Type == "" {
+			first = deferred
+		}
+		if resultExists {
+			continue
+		}
+		if resumeStarted {
+			return ErrDeferredExecutionStarted
+		}
+		var call session.ToolCall
+		if callEvent.Type == session.EventToolCall && json.Unmarshal(callEvent.Data, &call) != nil {
+			return fmt.Errorf("agent: deferred tool %s has invalid call payload", request.CallID)
+		}
+		if call.CallID == "" {
+			return fmt.Errorf("agent: deferred tool %s has no durable call", request.CallID)
+		}
+		em := &emitter{sessionID: l.SessionID, runID: deferred.RunID, n: l.eventCount()}
+		if err := l.append(durableContext(ctx), lease, session.Event{
+			ID: em.id(), SessionID: l.SessionID, RunID: deferred.RunID, TurnID: deferred.TurnID, StepID: deferred.StepID,
+			CallID: request.CallID, Type: session.EventToolResumeStarted,
+			Data: session.ToolResumeStartedPayload(request.CallID, call.Name, request.ResumeKey),
+		}); err != nil {
+			return err
+		}
+		outcomes := l.Tools.RunBatch(ctx, tools.ExecContext{
+			SessionID: l.SessionID, RunID: deferred.RunID, TurnID: deferred.TurnID, StepID: deferred.StepID,
+			CallID: request.CallID, Vars: mergeVars(l.Config.Vars), Sandbox: l.Config.Sandbox,
+			Artifacts: l.Config.Artifacts, Lease: &lease,
+			// tool/resume_started is the side-effect barrier. A second dispatch
+			// event would make recovery treat the same call as a new invocation.
+			OnDispatch: func(context.Context, string, string) error { return nil },
+		}, []tools.Call{{Name: call.Name, CallID: request.CallID, Input: call.Arguments}})
+		var result *tools.Result
+		var runErr error
+		if len(outcomes) == 1 {
+			result, runErr = outcomes[0].Result, outcomes[0].Err
+		} else {
+			runErr = fmt.Errorf("agent: deferred tool %s did not produce one outcome", request.CallID)
+		}
+		continuation, err := l.appendToolOutcome(durableContext(ctx), lease, em, tools.Outcome{
+			Call:   tools.Call{Name: call.Name, CallID: request.CallID, Input: append(json.RawMessage(nil), call.Arguments...)},
+			Result: result, Err: runErr,
+		}, deferred.TurnID, deferred.StepID)
+		if err != nil {
+			return err
+		}
+		concludes = concludes || continuation == toolConclude
+		events = l.snapshotEvents()
+	}
+
+	if first.Type == "" {
+		return nil
+	}
+	for _, pending := range pendingDeferredToolResumes(events) {
+		_, deferred, resultExists, _ := deferredToolRecord(events, pending)
+		if !resultExists && deferred.TurnID == first.TurnID && deferred.StepID == first.StepID {
+			return ErrToolDeferred
+		}
+	}
+	em := &emitter{sessionID: l.SessionID, runID: first.RunID, n: l.eventCount()}
+	if err := l.append(durableContext(ctx), lease, session.Event{
+		ID: em.id(), SessionID: l.SessionID, RunID: first.RunID, TurnID: first.TurnID, StepID: first.StepID,
+		Type: session.EventStepEnd, Data: strJSON("deferred_resolved"),
+	}); err != nil {
+		return err
+	}
+	if concludes {
+		return l.appendTurnEnd(durableContext(ctx), lease, em, first.TurnID, "tool_concluded")
+	}
+	_, err := l.runTurnSteps(ctx, lease, stopHeartbeat, em, first.TurnID, &Result{}, nextStepIndex(first.StepID), nil)
+	return err
+}
+
+func deferredToolRecord(events []session.Event, request DeferredToolResume) (call, deferred session.Event, resultExists, resumeStarted bool) {
+	for _, event := range events {
+		if event.CallID != request.CallID {
+			continue
+		}
+		switch event.Type {
+		case session.EventToolCall:
+			call = event
+		case session.EventToolDeferred:
+			var payload struct {
+				ResumeKey string `json:"resume_key"`
+			}
+			if json.Unmarshal(event.Data, &payload) == nil && payload.ResumeKey == request.ResumeKey {
+				deferred, resultExists, resumeStarted = event, false, false
+			}
+		case session.EventToolResumeStarted:
+			if deferred.Type == session.EventToolDeferred {
+				resumeStarted = true
+			}
+		case session.EventToolResult:
+			if deferred.Type == session.EventToolDeferred {
+				resultExists = true
+			}
+		}
+	}
+	return call, deferred, resultExists, resumeStarted
+}
+
+func pendingDeferredToolResumes(events []session.Event) []DeferredToolResume {
+	type state struct {
+		key     string
+		pending bool
+		started bool
+	}
+	states := make(map[string]state)
+	order := make([]string, 0)
+	for _, event := range events {
+		if event.CallID == "" {
+			continue
+		}
+		current, exists := states[event.CallID]
+		if !exists {
+			order = append(order, event.CallID)
+		}
+		switch event.Type {
+		case session.EventToolDeferred:
+			var payload struct {
+				ResumeKey string `json:"resume_key"`
+			}
+			if json.Unmarshal(event.Data, &payload) == nil && payload.ResumeKey != "" {
+				states[event.CallID] = state{key: payload.ResumeKey, pending: true}
+			}
+		case session.EventToolResumeStarted:
+			current.started = true
+			states[event.CallID] = current
+		case session.EventToolResult:
+			current.pending, current.started = false, false
+			states[event.CallID] = current
+		}
+	}
+	requests := make([]DeferredToolResume, 0)
+	for _, callID := range order {
+		current := states[callID]
+		if current.pending && !current.started {
+			requests = append(requests, DeferredToolResume{CallID: callID, ResumeKey: current.key})
+		}
+	}
+	return requests
 }
 
 // ResumeApprovedTool completes a durable approval that survived a worker
@@ -437,7 +673,7 @@ func (l *Loop) ResumeApprovedTool(ctx context.Context, request tools.ApprovalReq
 	if dispatched {
 		return fmt.Errorf("agent: approved tool %s was already dispatched", request.CallID)
 	}
-	if callEvent.ID == "" {
+	if callEvent.Type != session.EventToolCall {
 		return fmt.Errorf("agent: approval call %s was not found", request.CallID)
 	}
 	runID, turnID, stepID := callEvent.RunID, callEvent.TurnID, callEvent.StepID
@@ -507,6 +743,22 @@ func (l *Loop) ResumeApprovedTool(ctx context.Context, request tools.ApprovalReq
 	return runErr
 }
 
+func (l *Loop) recoverSession(ctx context.Context, lease session.Lease) (*session.RecoveryReport, error) {
+	recoveryAfter, sequenceErr := l.Store.Sequence(ctx, l.SessionID)
+	recovery, err := l.Store.Recover(ctx, lease)
+	if err != nil {
+		return nil, err
+	}
+	if sequenceErr == nil && recovery != nil && recovery.EventsAppended > 0 && l.Config.EventHub != nil {
+		if recovered, loadErr := l.Store.Load(ctx, l.SessionID, recoveryAfter, 0); loadErr == nil {
+			for _, event := range recovered {
+				l.Config.EventHub.Publish(event)
+			}
+		}
+	}
+	return recovery, nil
+}
+
 // RunInputWithID is the durable inbox-aware variant. inputID is used only as
 // a correlation key in the user payload; the event envelope still receives a
 // distinct id so fenced idempotency cannot confuse an inbox record with the
@@ -558,17 +810,8 @@ func (l *Loop) RunInputWithID(ctx context.Context, inputType session.EventType, 
 
 	// Recovery runs BEFORE any new work: close an orphaned turn from a crash
 	// and mark dangling tool calls TOOL_OUTCOME_UNKNOWN (never re-execute).
-	recoveryAfter, sequenceErr := l.Store.Sequence(loopCtx, l.SessionID)
-	recovery, err := l.Store.Recover(loopCtx, lease)
-	if err != nil {
+	if _, err := l.recoverSession(loopCtx, lease); err != nil {
 		return nil, err
-	}
-	if sequenceErr == nil && recovery != nil && recovery.EventsAppended > 0 && l.Config.EventHub != nil {
-		if recovered, loadErr := l.Store.Load(loopCtx, l.SessionID, recoveryAfter, 0); loadErr == nil {
-			for _, event := range recovered {
-				l.Config.EventHub.Publish(event)
-			}
-		}
 	}
 	if err := l.refresh(loopCtx); err != nil {
 		return nil, err
@@ -852,6 +1095,22 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 			return false, "", fmt.Errorf("agent: resolve provider capabilities: %w", capabilityErr)
 		}
 		resolvedCapabilities = &capabilities
+	}
+	contextWindow, maxOutput := cfg.ContextWindow, cfg.MaxOutput
+	if resolvedCapabilities != nil {
+		if resolvedCapabilities.ContextWindow > 0 {
+			contextWindow = resolvedCapabilities.ContextWindow
+		}
+		if resolvedCapabilities.MaxOutput > 0 {
+			maxOutput = resolvedCapabilities.MaxOutput
+		}
+	}
+	if err := l.append(ctx, lease, session.Event{
+		ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID,
+		Type: session.EventRequestContext,
+		Data: session.RequestContextPayloadWithCapabilities(cfg.Model, contextWindow, maxOutput, resolvedCapabilities),
+	}); err != nil {
+		return false, "", err
 	}
 	over, preflightErr := l.preflight(ctx, lease, compacted, resolvedCapabilities)
 	if preflightErr != nil {
@@ -1556,22 +1815,22 @@ func (l *Loop) compactFallback(ctx context.Context, lease session.Lease, msgs []
 		summary = "Earlier context was compacted; the recent tail is retained verbatim."
 	}
 	fingerprint := fmt.Sprintf("%x", sha256.Sum256([]byte(summary)))
-	throughSeq := shadowed[len(shadowed)-1]
 	transactionID := fmt.Sprintf("compact-%d", generation)
 	start := session.Event{ID: l.emitterIDFor("compact-start", generation), SessionID: l.SessionID, Type: session.EventCompactionStart, Data: session.CompactionStartPayload(generation, transactionID, shadowed)}
-	sum := session.Event{ID: l.emitterIDFor("compact-summary", generation), SessionID: l.SessionID, Type: session.EventCompactionSummary, Data: session.CompactionSummaryPayload(generation, transactionID, throughSeq, shadowed, summary, fingerprint), SourceSeqs: append([]uint64(nil), shadowed...)}
+	sum := session.Event{ID: l.emitterIDFor("compact-summary", generation), SessionID: l.SessionID, Type: session.EventCompactionSummary, Data: session.CompactionSummaryPayload(generation, transactionID, shadowed[len(shadowed)-1], shadowed, summary, fingerprint), SourceSeqs: append([]uint64(nil), shadowed...)}
+	surface := session.Event{ID: l.emitterIDFor("compact-surface", generation), SessionID: l.SessionID, Type: session.EventCompactionSurface, Data: session.CompactionSurfacePayload(generation, transactionID, shadowed, summary, fingerprint), SourceSeqs: append([]uint64(nil), shadowed...)}
 	end := session.Event{ID: l.emitterIDFor("compact-end", generation), SessionID: l.SessionID, Type: session.EventCompactionEnd, Data: session.CompactionEndPayload(generation, transactionID)}
-	if err := l.appendBatch(ctx, lease, []session.Event{start, sum, end}); err != nil {
+	if err := l.appendBatch(ctx, lease, []session.Event{start, sum, surface, end}); err != nil {
 		return 0, err
 	}
-	if err := l.Store.SaveCompactionCheckpoint(ctx, lease, session.CompactionCheckpoint{SessionID: l.SessionID, Generation: generation, TransactionID: transactionID, ThroughSeq: throughSeq, ShadowedSeqs: shadowed, Summary: summary, SummarySHA256: fingerprint}); err != nil {
+	if err := l.Store.SaveCompactionCheckpoint(ctx, lease, session.CompactionCheckpoint{SessionID: l.SessionID, Generation: generation, TransactionID: transactionID, ThroughSeq: shadowed[len(shadowed)-1], ShadowedSeqs: shadowed, Summary: summary, SummarySHA256: fingerprint, SourceFingerprint: fingerprint}); err != nil {
 		return 0, err
 	}
 	return l.cachedLast(), nil
 }
 
 // compact performs one durable compaction: ask the Compactor to summarize the
-// log, then append compaction/start|summary|end and record the checkpoint.
+// log, then append compaction/start|summary|surface|end and record the checkpoint.
 // Raw history is never deleted (H-COMPACT-001).
 func (l *Loop) compact(ctx context.Context, lease session.Lease) (uint64, error) {
 	if l.Config.Compactor == nil {
@@ -1583,30 +1842,35 @@ func (l *Loop) compact(ctx context.Context, lease session.Lease) (uint64, error)
 	if len(shadowed) == 0 {
 		return 0, fmt.Errorf("agent: no compactable surface before retained tail")
 	}
-	throughSeq := shadowed[len(shadowed)-1]
-	region := make([]session.Event, 0, len(events))
+	selected := make(map[uint64]bool, len(shadowed))
+	for _, seq := range shadowed {
+		selected[seq] = true
+	}
+	region := make([]session.Event, 0, len(shadowed))
 	for _, event := range events {
-		if event.Seq <= throughSeq {
+		if selected[event.Seq] {
 			region = append(region, event)
 		}
 	}
 
-	summary, fingerprint, err := l.Config.Compactor.Compact(ctx, generation, region, throughSeq)
+	summary, fingerprint, err := l.Config.Compactor.Compact(ctx, generation, region, append([]uint64(nil), shadowed...))
 	if err != nil {
 		return 0, err
 	}
 	transactionID := fmt.Sprintf("compact-%d", generation)
 	start := session.Event{ID: l.emitterIDFor("compact-start", generation), SessionID: l.SessionID, Type: session.EventCompactionStart, Data: session.CompactionStartPayload(generation, transactionID, shadowed)}
 	sum := session.Event{ID: l.emitterIDFor("compact-summary", generation), SessionID: l.SessionID, Type: session.EventCompactionSummary,
-		Data: session.CompactionSummaryPayload(generation, transactionID, throughSeq, shadowed, summary, fingerprint), SourceSeqs: append([]uint64(nil), shadowed...)}
+		Data: session.CompactionSummaryPayload(generation, transactionID, shadowed[len(shadowed)-1], shadowed, summary, fingerprint), SourceSeqs: append([]uint64(nil), shadowed...)}
+	surface := session.Event{ID: l.emitterIDFor("compact-surface", generation), SessionID: l.SessionID, Type: session.EventCompactionSurface,
+		Data: session.CompactionSurfacePayload(generation, transactionID, shadowed, summary, fingerprint), SourceSeqs: append([]uint64(nil), shadowed...)}
 	end := session.Event{ID: l.emitterIDFor("compact-end", generation), SessionID: l.SessionID, Type: session.EventCompactionEnd, Data: session.CompactionEndPayload(generation, transactionID)}
 
-	if err := l.appendBatch(ctx, lease, []session.Event{start, sum, end}); err != nil {
+	if err := l.appendBatch(ctx, lease, []session.Event{start, sum, surface, end}); err != nil {
 		return 0, err
 	}
 	if err := l.Store.SaveCompactionCheckpoint(ctx, lease, session.CompactionCheckpoint{
 		SessionID: l.SessionID, Generation: generation, TransactionID: transactionID,
-		ThroughSeq: throughSeq, ShadowedSeqs: shadowed, Summary: summary, SummarySHA256: fingerprint,
+		ThroughSeq: shadowed[len(shadowed)-1], ShadowedSeqs: shadowed, Summary: summary, SummarySHA256: fingerprint, SourceFingerprint: fingerprint,
 	}); err != nil {
 		return 0, err
 	}

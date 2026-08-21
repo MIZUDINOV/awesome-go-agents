@@ -498,6 +498,42 @@ func (h *Handle) ResumeTool(ctx context.Context, request ToolResume) error {
 	return h.loop.ResumeTool(runCtx, request)
 }
 
+// ResumeDeferredTools executes the durable deferred calls after their
+// host-owned prerequisite is ready. The handle keeps the same single-run
+// status guard as Submit and ResumeTool.
+func (h *Handle) ResumeDeferredTools(ctx context.Context, requests []DeferredToolResume) error {
+	h.mu.Lock()
+	if h.status == StatusDisposed {
+		h.mu.Unlock()
+		return ErrAgentDisposed
+	}
+	if h.status == StatusRunning {
+		h.mu.Unlock()
+		return ErrAgentBusy
+	}
+	h.status = StatusRunning
+	runCtx, cancel := context.WithCancel(ctx)
+	h.runCancel = cancel
+	h.signalChanged()
+	h.mu.Unlock()
+	h.emitStatus(StatusRunning)
+	defer func() {
+		cancel()
+		h.mu.Lock()
+		h.runCancel = nil
+		disposed := h.status == StatusDisposed
+		if !disposed {
+			h.status = StatusIdle
+		}
+		h.signalChanged()
+		h.mu.Unlock()
+		if !disposed {
+			h.emitStatus(StatusIdle)
+		}
+	}()
+	return h.loop.ResumeDeferredTools(runCtx, requests)
+}
+
 func (h *Handle) resumeApprovedTool(ctx context.Context, request tools.ApprovalRequest, approved bool) error {
 	h.mu.Lock()
 	if h.status == StatusDisposed {

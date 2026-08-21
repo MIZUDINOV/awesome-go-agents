@@ -39,7 +39,7 @@ func TestSurfaceProjectsOnlySurfaceEvents(t *testing.T) {
 // property (DB/worker restart): a FRESH Session over the same durable store
 // rebuilds a byte-identical model surface without any network or in-flight
 // state. This is the runnable (non-DB) demonstration of the gate; the
-// PostgreSQL-specific replay is covered by the env-gated pgstore integration.
+// Durable host-store replay is covered by the host adapter's integration tests.
 func TestSessionReplayIdenticalSurfaceAfterRestart(t *testing.T) {
 	store := NewMemoryStore()
 	s1 := NewSession("s-restart", store)
@@ -179,6 +179,7 @@ func TestEventSurfaceFlags(t *testing.T) {
 		{EventUsage, false},
 		{EventCompactionStart, false},
 		{EventCompactionSummary, false},
+		{EventCompactionSurface, false},
 		{EventCompactionEnd, false},
 		{EventRequestHeader, false},
 		{EventUserMessage, true},
@@ -278,6 +279,45 @@ func TestSurfaceRejectsBrokenPairingAcrossCompaction(t *testing.T) {
 	s := NewSurface(SurfaceSpec{})
 	if _, _, err := s.Project(events); err == nil {
 		t.Error("expected pairing violation to be rejected")
+	}
+}
+
+func TestSurfaceV2CompactionUsesExactSourceSeqs(t *testing.T) {
+	format := EventFormatVersion
+	events := []Event{
+		{Seq: 1, FormatVersion: format, Type: EventUserMessage, Data: UserText("old A")},
+		{Seq: 2, FormatVersion: format, Type: EventUserMessage, Data: UserText("keep")},
+		{Seq: 3, FormatVersion: format, Type: EventAssistantMessage, Data: AssistantContent("old B", "", nil)},
+		{Seq: 4, FormatVersion: format, Type: EventCompactionStart, Data: CompactionStartPayload(1, "tx-exact", []uint64{1, 3})},
+		{Seq: 5, FormatVersion: format, Type: EventCompactionSummary, Data: CompactionSummaryPayload(1, "tx-exact", 3, []uint64{1, 3}, "summary", "fp")},
+		{Seq: 6, FormatVersion: format, Type: EventCompactionSurface, Data: CompactionSurfacePayload(1, "tx-exact", []uint64{1, 3}, "summary", "fp")},
+		{Seq: 7, FormatVersion: format, Type: EventCompactionEnd, Data: CompactionEndPayload(1, "tx-exact")},
+	}
+	msgs, projection, err := NewSurface(SurfaceSpec{}).Project(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 || msgs[0].Text() != "summary" || msgs[1].Text() != "keep" {
+		t.Fatalf("exact compaction surface = %+v", msgs)
+	}
+	if got := projection.ShadowedSeqs; len(got) != 2 || got[0] != 1 || got[1] != 3 {
+		t.Fatalf("shadowed seqs = %v, want [1 3]", got)
+	}
+}
+
+func TestSurfaceV2InterruptedCompactionDoesNotChangeSurface(t *testing.T) {
+	format := EventFormatVersion
+	events := []Event{
+		{Seq: 1, FormatVersion: format, Type: EventUserMessage, Data: UserText("old")},
+		{Seq: 2, FormatVersion: format, Type: EventCompactionStart, Data: CompactionStartPayload(1, "tx-open", []uint64{1})},
+		{Seq: 3, FormatVersion: format, Type: EventCompactionSummary, Data: CompactionSummaryPayload(1, "tx-open", 1, []uint64{1}, "must not show", "fp")},
+	}
+	msgs, projection, err := NewSurface(SurfaceSpec{}).Project(events)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 || msgs[0].Text() != "old" || projection.Summary != "" {
+		t.Fatalf("interrupted compaction changed surface: messages=%+v projection=%+v", msgs, projection)
 	}
 }
 

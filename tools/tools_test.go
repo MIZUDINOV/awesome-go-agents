@@ -218,6 +218,18 @@ func TestValidateInput(t *testing.T) {
 	}
 }
 
+func TestValidateInputConstraints(t *testing.T) {
+	schema := json.RawMessage(`{"type":"object","properties":{"name":{"type":"string","maxLength":3},"count":{"type":"integer","minimum":1,"maximum":2},"tags":{"type":"array","minItems":1,"maxItems":2}},"required":["name","count"]}`)
+	if err := ValidateInput(schema, []byte(`{"name":"ok","count":1,"tags":["one"]}`)); err != nil {
+		t.Fatalf("valid constrained input rejected: %v", err)
+	}
+	for _, input := range []string{`{"name":"long","count":1}`, `{"name":"ok","count":0}`, `{"name":"ok","count":1,"tags":[]}`} {
+		if err := ValidateInput(schema, []byte(input)); err == nil {
+			t.Fatalf("invalid constrained input accepted: %s", input)
+		}
+	}
+}
+
 func TestFromStruct(t *testing.T) {
 	type args struct {
 		Path string `json:"path"`

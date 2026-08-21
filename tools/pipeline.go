@@ -3,6 +3,9 @@ package tools
 import (
 	"encoding/json"
 	"fmt"
+	"math"
+	"regexp"
+	"unicode/utf8"
 )
 
 // Supported schema subset this package validates. Constructs outside the
@@ -15,6 +18,7 @@ import (
 //	items         Schema
 //	enum          []value
 //	additionalProperties bool           (false = closed object)
+//	string/number/array/object constraints (min/max and pattern)
 //
 // Metadata keys ($schema/$id/$comment) are accepted and ignored. The explicit
 // DeepSeek-compatible subset supports exact-one oneOf.
@@ -24,7 +28,11 @@ var supportedSchemaKeywords = map[string]bool{
 	"oneOf":   true,
 	"$schema": true, "$id": true, "$comment": true,
 	"title": true, "description": true, "default": true, "examples": true,
-	"format": true,
+	"format":    true,
+	"minLength": true, "maxLength": true, "pattern": true,
+	"minimum": true, "maximum": true, "exclusiveMinimum": true, "exclusiveMaximum": true, "multipleOf": true,
+	"minItems": true, "maxItems": true, "uniqueItems": true,
+	"minProperties": true, "maxProperties": true,
 }
 
 // ErrUnsupportedSchema identifies a schema construct outside the validated
@@ -72,6 +80,39 @@ func validateSchemaNode(node any) error {
 		case "object", "array", "string", "number", "integer", "boolean", "null":
 		default:
 			return fmt.Errorf("%w: unsupported type %q", ErrUnsupportedSchema, typeName)
+		}
+	}
+	for _, key := range []string{"minimum", "maximum", "exclusiveMinimum", "exclusiveMaximum", "multipleOf"} {
+		if raw, ok := obj[key]; ok {
+			number, valid := raw.(float64)
+			if !valid || math.IsNaN(number) || math.IsInf(number, 0) {
+				return fmt.Errorf("%w: %s must be a finite number", ErrSchemaInvalid, key)
+			}
+			if key == "multipleOf" && number <= 0 {
+				return fmt.Errorf("%w: multipleOf must be greater than zero", ErrSchemaInvalid)
+			}
+		}
+	}
+	for _, key := range []string{"minLength", "maxLength", "minItems", "maxItems", "minProperties", "maxProperties"} {
+		if raw, ok := obj[key]; ok {
+			number, valid := raw.(float64)
+			if !valid || number < 0 || number != math.Trunc(number) {
+				return fmt.Errorf("%w: %s must be a non-negative integer", ErrSchemaInvalid, key)
+			}
+		}
+	}
+	if raw, ok := obj["pattern"]; ok {
+		pattern, valid := raw.(string)
+		if !valid {
+			return fmt.Errorf("%w: pattern must be a string", ErrSchemaInvalid)
+		}
+		if _, err := regexp.Compile(pattern); err != nil {
+			return fmt.Errorf("%w: pattern is invalid: %v", ErrSchemaInvalid, err)
+		}
+	}
+	if raw, ok := obj["uniqueItems"]; ok {
+		if _, valid := raw.(bool); !valid {
+			return fmt.Errorf("%w: uniqueItems must be a boolean", ErrSchemaInvalid)
 		}
 	}
 	if raw, ok := obj["additionalProperties"]; ok {
@@ -170,6 +211,38 @@ func validateNode(schema map[string]any, value any, path string) error {
 			return fmt.Errorf("%s: value not in enum", path)
 		}
 	}
+	if stringValue, ok := value.(string); ok {
+		length := utf8.RuneCountInString(stringValue)
+		if minimum, ok := schemaInteger(schema, "minLength"); ok && length < minimum {
+			return fmt.Errorf("%s: string is shorter than minLength", path)
+		}
+		if maximum, ok := schemaInteger(schema, "maxLength"); ok && length > maximum {
+			return fmt.Errorf("%s: string is longer than maxLength", path)
+		}
+		if pattern, ok := schema["pattern"].(string); ok {
+			matched, err := regexp.MatchString(pattern, stringValue)
+			if err == nil && !matched {
+				return fmt.Errorf("%s: string does not match pattern", path)
+			}
+		}
+	}
+	if number, ok := value.(float64); ok {
+		if minimum, ok := schemaNumber(schema, "minimum"); ok && number < minimum {
+			return fmt.Errorf("%s: number is less than minimum", path)
+		}
+		if maximum, ok := schemaNumber(schema, "maximum"); ok && number > maximum {
+			return fmt.Errorf("%s: number is greater than maximum", path)
+		}
+		if minimum, ok := schemaNumber(schema, "exclusiveMinimum"); ok && number <= minimum {
+			return fmt.Errorf("%s: number is not greater than exclusiveMinimum", path)
+		}
+		if maximum, ok := schemaNumber(schema, "exclusiveMaximum"); ok && number >= maximum {
+			return fmt.Errorf("%s: number is not less than exclusiveMaximum", path)
+		}
+		if multiple, ok := schemaNumber(schema, "multipleOf"); ok && math.Abs(number/multiple-math.Round(number/multiple)) > 1e-9 {
+			return fmt.Errorf("%s: number is not a multiple of multipleOf", path)
+		}
+	}
 	if obj, ok := value.(map[string]any); ok {
 		if required, ok := schema["required"].([]any); ok {
 			for _, name := range required {
@@ -201,8 +274,29 @@ func validateNode(schema map[string]any, value any, path string) error {
 		} else if closed, ok := schema["additionalProperties"].(bool); ok && closed && len(obj) > 0 {
 			return fmt.Errorf("%s: unexpected property in closed object", path)
 		}
+		if minimum, ok := schemaInteger(schema, "minProperties"); ok && len(obj) < minimum {
+			return fmt.Errorf("%s: object has fewer properties than minProperties", path)
+		}
+		if maximum, ok := schemaInteger(schema, "maxProperties"); ok && len(obj) > maximum {
+			return fmt.Errorf("%s: object has more properties than maxProperties", path)
+		}
 	}
 	if arr, ok := value.([]any); ok {
+		if minimum, ok := schemaInteger(schema, "minItems"); ok && len(arr) < minimum {
+			return fmt.Errorf("%s: array has fewer items than minItems", path)
+		}
+		if maximum, ok := schemaInteger(schema, "maxItems"); ok && len(arr) > maximum {
+			return fmt.Errorf("%s: array has more items than maxItems", path)
+		}
+		if unique, ok := schema["uniqueItems"].(bool); ok && unique {
+			for i := range arr {
+				for j := i + 1; j < len(arr); j++ {
+					if jsonDeepEqual(arr[i], arr[j]) {
+						return fmt.Errorf("%s: array items must be unique", path)
+					}
+				}
+			}
+		}
 		if items, ok := schema["items"].(map[string]any); ok {
 			for i, v := range arr {
 				if err := validateNode(items, v, fmt.Sprintf("%s[%d]", path, i)); err != nil {
@@ -212,6 +306,19 @@ func validateNode(schema map[string]any, value any, path string) error {
 		}
 	}
 	return nil
+}
+
+func schemaNumber(schema map[string]any, key string) (float64, bool) {
+	value, ok := schema[key].(float64)
+	return value, ok
+}
+
+func schemaInteger(schema map[string]any, key string) (int, bool) {
+	value, ok := schemaNumber(schema, key)
+	if !ok || value < 0 || value != math.Trunc(value) || value > float64(int(^uint(0)>>1)) {
+		return 0, false
+	}
+	return int(value), true
 }
 
 func typeMatches(declared string, value any) bool {

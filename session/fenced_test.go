@@ -186,6 +186,72 @@ func TestRecoverClosesOpenStep(t *testing.T) {
 	}
 }
 
+func TestRecoverKeepsDeferredToolWaiting(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	lease, _ := store.ClaimLease(ctx, "s-deferred", "w", time.Minute, "tenant-1")
+	if _, err := store.AppendFenced(ctx, lease, []Event{
+		{RunID: "run-1", TurnID: "turn-1", Type: EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", Type: EventStepStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: EventToolCall, ID: "call-1", Data: ToolCallPayload("call-1", "read", json.RawMessage(`{}`))},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: EventToolDeferred, Data: json.RawMessage(`{"name":"read","resume_key":"workspace:call-1"}`)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.ReleaseLease(ctx, lease)
+	lease, _ = store.ClaimLease(ctx, "s-deferred", "w2", time.Minute, "tenant-1")
+	report, err := store.Recover(ctx, lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.TurnClosed || report.StepsClosed != 0 || len(report.DanglingCalls) != 0 {
+		t.Fatalf("deferred recovery closed waiting lifecycle: %+v", report)
+	}
+	all, _ := store.Load(ctx, "s-deferred", 0, 0)
+	for _, event := range all {
+		if event.Type == EventToolResult || event.Type == EventTurnEnd || event.Type == EventStepEnd {
+			t.Fatalf("deferred recovery appended terminal event %s", event.Type)
+		}
+	}
+}
+
+func TestRecoverMarksResumeStartedAsUnknown(t *testing.T) {
+	store := NewMemoryStore()
+	ctx := context.Background()
+	lease, _ := store.ClaimLease(ctx, "s-resuming", "w", time.Minute, "tenant-1")
+	if _, err := store.AppendFenced(ctx, lease, []Event{
+		{RunID: "run-1", TurnID: "turn-1", Type: EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", Type: EventStepStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: EventToolCall, ID: "call-1", Data: ToolCallPayload("call-1", "write", json.RawMessage(`{}`))},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: EventToolDeferred, Data: json.RawMessage(`{"name":"write","resume_key":"workspace:call-1"}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: EventToolResumeStarted, Data: ToolResumeStartedPayload("call-1", "write", "workspace:call-1")},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	store.ReleaseLease(ctx, lease)
+	lease, _ = store.ClaimLease(ctx, "s-resuming", "w2", time.Minute, "tenant-1")
+	if _, err := store.Recover(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := store.Load(ctx, "s-resuming", 0, 0)
+	unknown := 0
+	for _, event := range all {
+		if event.Type != EventToolResult || event.CallID != "call-1" {
+			continue
+		}
+		var payload struct {
+			Code string `json:"code"`
+		}
+		_ = json.Unmarshal(event.Data, &payload)
+		if payload.Code == "TOOL_OUTCOME_UNKNOWN" {
+			unknown++
+		}
+	}
+	if unknown != 1 {
+		t.Fatalf("unknown outcomes = %d, want one", unknown)
+	}
+}
+
 func TestMemoryStoreConcurrentAppends(t *testing.T) {
 	store := NewMemoryStore()
 	ctx := context.Background()

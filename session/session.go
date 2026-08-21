@@ -123,7 +123,7 @@ func (s *Session) AppendCommitted(ctx context.Context, events []Event) (Committe
 }
 
 // CompactionSummary durably records a compaction transaction
-// (compaction/start + compaction/summary + compaction/end) as one atomic
+// (compaction/start + compaction/summary + compaction/surface + compaction/end) as one atomic
 // batch. generation increases monotonically; shadowedSeqs is the exact
 // shadowed list. The raw history is never deleted (H-COMPACT-001);
 // compaction only replaces the model-visible projection.
@@ -144,11 +144,16 @@ func (s *Session) CompactionSummary(ctx context.Context, generation uint64, tran
 	sum.Data = CompactionSummaryPayload(generation, transactionID, throughSeq, shadowedSeqs, summary, fingerprint)
 	sum.SourceSeqs = append([]uint64(nil), shadowedSeqs...)
 
+	surface := common
+	surface.Type = EventCompactionSurface
+	surface.Data = CompactionSurfacePayload(generation, transactionID, shadowedSeqs, summary, fingerprint)
+	surface.SourceSeqs = append([]uint64(nil), shadowedSeqs...)
+
 	end := common
 	end.Type = EventCompactionEnd
 	end.Data = CompactionEndPayload(generation, transactionID)
 
-	return s.AppendAll(ctx, []Event{start, sum, end})
+	return s.AppendAll(ctx, []Event{start, sum, surface, end})
 }
 
 // Load returns all events younger than afterSeq (0 = from the beginning).
