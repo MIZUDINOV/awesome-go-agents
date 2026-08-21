@@ -27,7 +27,7 @@ const (
 type Error struct {
 	Kind ErrorKind
 	// Code is a stable, provider-specific machine-readable error code from the
-	// provider's own taxonomy (e.g. the OpenRouter error type). It is the
+	// provider's own taxonomy. It is the
 	// canonical identifier for error mapping and does not change between
 	// releases; leave empty when the provider has no distinct code.
 	Code          string

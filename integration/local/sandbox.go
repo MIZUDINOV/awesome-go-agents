@@ -105,8 +105,8 @@ func (s *LocalSandbox) ResolvePath(ctx context.Context, owner, rawPath, cwd stri
 // command boundary. LocalSubprocess runs an unrestricted host shell, so
 // workspace-write fails closed instead of pretending that a checked workdir
 // contains paths used later by the shell. Explicit danger-full-access is the
-// opt-in for trusted local development; production should use E2B or another
-// OS-enforced sandbox.
+// opt-in for trusted local development; production should use an OS-enforced
+// sandbox.
 func (s *LocalSandbox) CheckCommand(_ context.Context, owner string, cmd integration.Command, access integration.Access) error {
 	if strings.TrimSpace(cmd.Workdir) == "" {
 		return integration.SandboxDenied("SANDBOX_DENIED_WORKDIR", "bash", cmd.Workdir, "a working directory is required")

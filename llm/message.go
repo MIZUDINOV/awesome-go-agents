@@ -1,7 +1,6 @@
 // Package llm defines the provider-agnostic conversation and generation
-// contract. Providers (OpenRouter, OpenAI-compatible endpoints, ...) implement
-// Provider and translate between these types and their wire format. The rest
-// of agentkit never imports a provider SDK.
+// contract. Providers implement Provider and translate between these types and
+// their wire format. The rest of agentkit never imports a provider SDK.
 package llm
 
 import (
@@ -10,9 +9,7 @@ import (
 	"strings"
 )
 
-// Role is the provider-neutral conversation role. Values deliberately mirror
-// the OpenRouter/OpenAI chat vocabulary because that is the de-facto canonical
-// wire format for most providers.
+// Role is the provider-neutral conversation role.
 type Role string
 
 const (
@@ -71,8 +68,7 @@ type Part struct {
 	ToolResult *ToolCallResult  `json:"tool_result,omitempty"`
 	Reasoning  string           `json:"reasoning,omitempty"`
 
-	// Custom carries provider-specific part enrichment (e.g. OpenRouter
-	// file parts, annotations) as opaque JSON.
+	// Custom carries provider-specific part enrichment as opaque JSON.
 	Custom json.RawMessage `json:"custom,omitempty"`
 }
 

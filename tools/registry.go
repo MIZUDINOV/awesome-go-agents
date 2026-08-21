@@ -483,6 +483,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrAbortedBeforeDispatch, err)
 	}
+	ec.CallID = callID
 	r.mu.RLock()
 	presentation, defaultApproval := r.presentation, r.approval
 	r.mu.RUnlock()
@@ -523,6 +524,9 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			result.Meta = nil
 			result.Content = nil
 			result.AdditionalContexts = nil
+			result.Continuation = ToolContinue
+			result.ResumeKey = ""
+			result.WaitingReason = ""
 			result.ConcludesTurn = false
 			result.Code = code
 			result.Failure = &Failure{Code: code, Message: failureMessage(retErr)}
@@ -556,6 +560,9 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			result.Meta = nil
 			result.Content = nil
 			result.AdditionalContexts = nil
+			result.Continuation = ToolContinue
+			result.ResumeKey = ""
+			result.WaitingReason = ""
 			result.ConcludesTurn = false
 			result.Code = code
 			result.Failure = &Failure{Code: code, Message: failureMessage(retErr)}
@@ -585,6 +592,9 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 				result.Canonical = nil
 				result.Meta = nil
 				result.AdditionalContexts = nil
+				result.Continuation = ToolContinue
+				result.ResumeKey = ""
+				result.WaitingReason = ""
 				result.ConcludesTurn = false
 				result.Code = "FINALIZE_FAILED"
 				result.Failure = &Failure{Code: result.Code, Message: failureMessage(finalizeErr)}
@@ -599,6 +609,9 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			result.Meta = nil
 			result.Content = nil
 			result.AdditionalContexts = nil
+			result.Continuation = ToolContinue
+			result.ResumeKey = ""
+			result.WaitingReason = ""
 			result.ConcludesTurn = false
 			result.Code = code
 			result.Failure = &Failure{Code: code, Message: failureMessage(retErr)}
@@ -623,6 +636,9 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 				result.Meta = nil
 				result.Content = nil
 				result.AdditionalContexts = nil
+				result.Continuation = ToolContinue
+				result.ResumeKey = ""
+				result.WaitingReason = ""
 				result.ConcludesTurn = false
 				result.Code = "TOOL_PANIC"
 				result.Failure = &Failure{Code: result.Code, Message: failureMessage(retErr)}
@@ -838,9 +854,14 @@ func restoreFinalizerState(result, before *Result) {
 		return
 	}
 	modelFacing, content := result.ModelFacing, result.Content
+	continuation, resumeKey, waitingReason, concludesTurn := result.Continuation, result.ResumeKey, result.WaitingReason, result.ConcludesTurn
 	*result = *before
 	result.ModelFacing = modelFacing
 	result.Content = content
+	result.Continuation = continuation
+	result.ResumeKey = resumeKey
+	result.WaitingReason = waitingReason
+	result.ConcludesTurn = concludesTurn
 }
 
 func bindApprovalLease(approval ApprovalService, ec ExecContext) {

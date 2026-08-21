@@ -11,7 +11,7 @@ type ToolDefinition struct {
 	// InputSchema is the JSON Schema (object type) for the tool arguments.
 	InputSchema json.RawMessage `json:"input_schema"`
 	// Strict requests strict JSON Schema adherence when the provider supports
-	// it (OpenRouter passes it through as tool.function.strict).
+	// it.
 	Strict bool `json:"strict,omitempty"`
 }
 

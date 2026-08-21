@@ -14,6 +14,16 @@ const (
 	OutcomeFailure OutcomeKind = "failure"
 )
 
+// ToolContinuation controls what the AgentKit loop does after a tool result.
+// Deferred is used when the execution world completes the call asynchronously.
+type ToolContinuation string
+
+const (
+	ToolContinue ToolContinuation = "continue"
+	ToolConclude ToolContinuation = "conclude"
+	ToolDeferred ToolContinuation = "deferred"
+)
+
 // ToolExecutionResult is the explicit public name for Result.
 type ToolExecutionResult = Result
 

@@ -51,9 +51,10 @@ var (
 	// even after max-safe compaction.
 	ErrContextOverflow = errors.New("agent: context overflow after max-safe compaction")
 	// ErrStopped is returned when the run was cancelled mid-turn.
-	ErrStopped    = errors.New("agent: run stopped (cancelled)")
-	ErrToolLimit  = errors.New("agent: tool-call limit exceeded")
-	ErrTokenLimit = errors.New("agent: token limit exceeded")
+	ErrStopped      = errors.New("agent: run stopped (cancelled)")
+	ErrToolLimit    = errors.New("agent: tool-call limit exceeded")
+	ErrTokenLimit   = errors.New("agent: token limit exceeded")
+	ErrToolDeferred = errors.New("agent: tool execution deferred")
 )
 
 // Chat is the provider-neutral model seam.
@@ -61,6 +62,14 @@ type Chat interface {
 	Generate(ctx context.Context, req *llm.Request, cb llm.StreamCallback) (*llm.Response, error)
 	Name() string
 }
+
+type toolContinuation uint8
+
+const (
+	toolContinue toolContinuation = iota
+	toolConclude
+	toolDeferred
+)
 
 type capabilityChat interface {
 	Capabilities(context.Context, string) (llm.Capabilities, error)
@@ -114,6 +123,7 @@ type Config struct {
 	// must preserve verbatim, including the current user/steering input.
 	RetainTailEvents int
 	Compactor        Compactor
+	Policy           RunPolicy
 
 	// Vars are merged into every tool ExecContext (host bindings such as the
 	// sandbox working directory under "cwd").
@@ -268,6 +278,103 @@ func (l *Loop) RunInput(ctx context.Context, inputType session.EventType, input 
 	return l.RunInputWithID(ctx, inputType, "", input)
 }
 
+// ToolResume completes a deferred tool execution. Result is validated against
+// the durable call identity before it can be appended to the session.
+type ToolResume struct {
+	CallID    string
+	ResumeKey string
+	Result    *tools.Result
+	Err       error
+}
+
+// ResumeTool appends the result of a deferred tool and resumes the same model
+// turn. The host may supply ClaimedLease; otherwise the loop owns a temporary
+// lease exactly as it does for RunInputWithID.
+func (l *Loop) ResumeTool(ctx context.Context, request ToolResume) error {
+	if request.CallID == "" || request.ResumeKey == "" {
+		return fmt.Errorf("agent: deferred tool call and resume key are required")
+	}
+	if request.Result != nil && request.Result.CallID != "" && request.Result.CallID != request.CallID {
+		return fmt.Errorf("agent: deferred tool result call id mismatch")
+	}
+	var lease session.Lease
+	externalLease := l.Config.ClaimedLease != nil
+	stopHeartbeat := func() error { return nil }
+	if externalLease {
+		lease = *l.Config.ClaimedLease
+		if lease.SessionID != l.SessionID || lease.Token == "" || lease.Fence == 0 {
+			return ErrLeaseLost
+		}
+	} else {
+		claimed, err := l.Store.ClaimLease(ctx, l.SessionID, l.Config.Owner, l.Config.LeaseTTL, "")
+		if err != nil {
+			return err
+		}
+		lease = claimed
+		var loopCtx context.Context
+		loopCtx, stopHeartbeat = l.leaseHeartbeat(ctx, lease)
+		ctx = loopCtx
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		defer func() { _ = l.Store.ReleaseLease(cleanupCtx, lease) }()
+		defer func() { _ = stopHeartbeat() }()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := l.refresh(ctx); err != nil {
+		return err
+	}
+	var deferred session.Event
+	var toolName string
+	for _, event := range l.snapshotEvents() {
+		if event.Type != session.EventToolDeferred || event.CallID != request.CallID {
+			continue
+		}
+		var payload struct {
+			Name      string `json:"name"`
+			ResumeKey string `json:"resume_key"`
+		}
+		if json.Unmarshal(event.Data, &payload) == nil && payload.ResumeKey == request.ResumeKey {
+			deferred = event
+			toolName = payload.Name
+		}
+	}
+	if deferred.ID == "" {
+		return fmt.Errorf("agent: deferred tool %s was not found", request.CallID)
+	}
+	for _, event := range l.snapshotEvents() {
+		if event.Type == session.EventToolResult && event.CallID == request.CallID {
+			return nil
+		}
+	}
+	result := request.Result
+	if result == nil {
+		result = &tools.Result{Name: toolName, CallID: request.CallID}
+	}
+	if result.CallID == "" {
+		result.CallID = request.CallID
+	}
+	if result.Name == "" {
+		result.Name = toolName
+	}
+	em := &emitter{sessionID: l.SessionID, runID: deferred.RunID, n: l.eventCount()}
+	continuation, err := l.appendToolOutcome(durableContext(ctx), lease, em, tools.Outcome{
+		Call: tools.Call{Name: result.Name, CallID: request.CallID}, Result: result, Err: request.Err,
+	}, deferred.TurnID, deferred.StepID)
+	if err != nil {
+		return err
+	}
+	if err := l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: deferred.RunID, TurnID: deferred.TurnID, StepID: deferred.StepID, CallID: request.CallID, Type: session.EventStepEnd, Data: strJSON("deferred_resolved")}); err != nil {
+		return err
+	}
+	if continuation == toolConclude {
+		return l.appendTurnEnd(durableContext(ctx), lease, em, deferred.TurnID, "tool_concluded")
+	}
+	_, err = l.runTurnSteps(ctx, lease, stopHeartbeat, em, deferred.TurnID, &Result{}, nextStepIndex(deferred.StepID), nil)
+	return err
+}
+
 // ResumeApprovedTool completes a durable approval that survived a worker
 // restart. It is deliberately limited to calls without a dispatch barrier;
 // once dispatch was durable, recovery must classify the outcome as unknown
@@ -354,9 +461,9 @@ func (l *Loop) ResumeApprovedTool(ctx context.Context, request tools.ApprovalReq
 	if turnEnded {
 		return fmt.Errorf("agent: approval result belongs to an already closed turn")
 	}
-	em := &emitter{sessionID: l.SessionID, runID: runID}
+	em := &emitter{sessionID: l.SessionID, runID: runID, n: l.eventCount()}
 	persistCtx := durableContext(resumeCtx)
-	concludesTurn := false
+	continuation := toolContinue
 	if !approved {
 		if !resultExists {
 			if err := l.appendToolResultErr(persistCtx, lease, em, request.CallID, request.ToolName, tools.ErrApprovalDenied, turnID, stepID); err != nil {
@@ -376,7 +483,7 @@ func (l *Loop) ResumeApprovedTool(ctx context.Context, request tools.ApprovalReq
 			return err
 		}
 		var err error
-		concludesTurn, err = l.appendToolOutcome(persistCtx, lease, em, outcomes[0], turnID, stepID)
+		continuation, err = l.appendToolOutcome(persistCtx, lease, em, outcomes[0], turnID, stepID)
 		if err != nil {
 			return err
 		}
@@ -386,7 +493,10 @@ func (l *Loop) ResumeApprovedTool(ctx context.Context, request tools.ApprovalReq
 			return err
 		}
 	}
-	if concludesTurn {
+	if continuation == toolDeferred {
+		return ErrToolDeferred
+	}
+	if continuation == toolConclude {
 		if err := l.appendTurnEnd(persistCtx, lease, em, turnID, "tool_concluded"); err != nil {
 			return err
 		}
@@ -492,6 +602,7 @@ func (l *Loop) runTurnSteps(ctx context.Context, lease session.Lease, stopHeartb
 	overflowRetries := 0
 	toolCallCount := 0
 	totalTokens := int64(0)
+	startedAt := time.Now()
 	for step := startStep; step < cfg.MaxStepsPerTurn; step++ {
 		if err := ctx.Err(); err != nil {
 			if heartbeatErr := stopHeartbeat(); heartbeatErr != nil {
@@ -511,6 +622,35 @@ func (l *Loop) runTurnSteps(ctx context.Context, lease session.Lease, stopHeartb
 		var done bool
 		var reason string
 		var err error
+		if cfg.Policy != nil {
+			decision, policyErr := cfg.Policy.BeforeStep(ctx, StepSnapshot{
+				SessionID:     l.SessionID,
+				RunID:         em.runID,
+				TurnID:        turnID,
+				Model:         cfg.Model,
+				StepIndex:     step,
+				ToolCallCount: toolCallCount,
+				TotalTokens:   totalTokens,
+				Elapsed:       time.Since(startedAt),
+			})
+			if policyErr != nil {
+				_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "policy_error")
+				return nil, policyErr
+			}
+			switch decision {
+			case StepContinue:
+			case StepStop:
+				if endErr := l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "policy_stop"); endErr != nil {
+					return nil, endErr
+				}
+				l.finish(result, "policy_stop")
+				return result, ErrPolicyStopped
+			case StepWait:
+				return nil, ErrPolicyWaiting
+			default:
+				return nil, fmt.Errorf("agent: unknown run policy decision %d", decision)
+			}
+		}
 		for {
 			done, reason, err = l.step(ctx, lease, em, turnID, step, stepAttempt, initialInput, inputs, &compacted, &toolCallCount, &totalTokens)
 			initialInput = nil
@@ -551,6 +691,11 @@ func (l *Loop) runTurnSteps(ctx context.Context, lease session.Lease, stopHeartb
 					_ = l.appendTurnEnd(durableContext(ctx), lease, em, turnID, "context_overflow")
 					return nil, ErrContextOverflow
 				}
+			} else if errors.Is(err, ErrToolDeferred) {
+				return nil, err
+			} else if errors.Is(err, ErrPolicyWaiting) {
+				_ = l.appendTurnEnd(context.Background(), lease, em, turnID, "policy_wait")
+				return nil, err
 			} else if errors.Is(err, ErrStopped) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				_ = l.appendTurnEnd(context.Background(), lease, em, turnID, "cancelled")
 				l.finish(result, "interrupted")
@@ -724,7 +869,7 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 
 	var reqValue llm.Request
 	if cfg.ContextBuilder != nil {
-		snapshot, buildErr := cfg.ContextBuilder.Build(memctx.BuildInput{Model: cfg.Model, System: []memctx.Section{{Title: "system", Content: systemPrompt}}, Instructions: cfg.Instructions, ToolGuidance: cfg.ToolGuidance, Runtime: cfg.RuntimeContext, Workspace: cfg.WorkspaceContext, Tools: l.Tools.ModelTools(), Messages: msgs, MaxTokens: cfg.MaxTokens, Config: cfg.ProviderConfig, Stream: cfg.Stream, Capabilities: resolvedCapabilities, ParallelTools: true})
+		snapshot, buildErr := cfg.ContextBuilder.Build(memctx.BuildInput{Model: cfg.Model, System: []memctx.Section{{Title: "system", Content: systemPrompt}}, Instructions: cfg.Instructions, ToolGuidance: cfg.ToolGuidance, Runtime: cfg.RuntimeContext, Workspace: cfg.WorkspaceContext, Tools: l.Tools.ModelTools(), Messages: msgs, MaxTokens: cfg.MaxTokens, Config: cfg.ProviderConfig, Stream: cfg.Stream, Capabilities: resolvedCapabilities, ParallelTools: resolvedCapabilities != nil && resolvedCapabilities.SupportsParallelToolCalls})
 		if buildErr != nil {
 			return false, "", buildErr
 		}
@@ -962,54 +1107,79 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 	// must be committed with a context that is no longer cancelled; otherwise a
 	// started side effect would be left as an indistinguishable dangling call.
 	persistCtx := durableContext(ctx)
-	concludesTurn := false
+	continuation := toolContinue
 	for _, outcome := range outcomes {
 		concludes, appendErr := l.appendToolOutcome(persistCtx, lease, em, outcome, turnID, stepID)
 		if appendErr != nil {
 			return false, "", appendErr
 		}
-		concludesTurn = concludesTurn || concludes
+		if concludes == toolDeferred {
+			continuation = toolDeferred
+		} else if concludes == toolConclude && continuation == toolContinue {
+			continuation = toolConclude
+		}
 	}
 	if err := l.append(persistCtx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventStepEnd, Data: strJSON("tools_done")}); err != nil {
 		return false, "", err
 	}
 	stepEnded = true
+	if continuation == toolDeferred {
+		return false, "tool_deferred", ErrToolDeferred
+	}
 	if ctx.Err() != nil {
 		return false, "", ErrStopped
 	}
-	if concludesTurn {
+	if continuation == toolConclude {
 		return true, "tool_concluded", nil
 	}
 	// Turn continues (another model call next iteration).
 	return false, "tool_calls", nil
 }
 
-func (l *Loop) appendToolOutcome(ctx context.Context, lease session.Lease, em *emitter, outcome tools.Outcome, turnID, stepID string) (bool, error) {
+func (l *Loop) appendToolOutcome(ctx context.Context, lease session.Lease, em *emitter, outcome tools.Outcome, turnID, stepID string) (toolContinuation, error) {
 	if outcome.Err != nil {
 		if outcome.Result != nil {
 			if err := l.appendToolFailureResult(ctx, lease, em, outcome.Result, outcome.Err, turnID, stepID); err != nil {
-				return false, err
+				return toolContinue, err
 			}
-			return false, nil
+			return toolContinue, nil
 		}
 		if err := l.appendToolResultErr(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, outcome.Err, turnID, stepID); err != nil {
-			return false, err
+			return toolContinue, err
 		}
-		return false, nil
+		return toolContinue, nil
 	}
 	if outcome.Result == nil {
 		err := fmt.Errorf("tool %s returned no result", outcome.Call.Name)
 		if appendErr := l.appendToolResultErr(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, err, turnID, stepID); appendErr != nil {
-			return false, appendErr
+			return toolContinue, appendErr
 		}
-		return false, nil
+		return toolContinue, nil
+	}
+	continuation := toolContinue
+	if outcome.Result.Continuation == tools.ToolDeferred {
+		if outcome.Result.ResumeKey == "" {
+			return toolContinue, fmt.Errorf("agent: deferred tool %s requires resume key", outcome.Call.CallID)
+		}
+		data, err := json.Marshal(map[string]any{
+			"name":           outcome.Call.Name,
+			"resume_key":     outcome.Result.ResumeKey,
+			"waiting_reason": outcome.Result.WaitingReason,
+		})
+		if err != nil {
+			return toolContinue, err
+		}
+		if err := l.append(ctx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: outcome.Call.CallID, Type: session.EventToolDeferred, Data: data}); err != nil {
+			return toolContinue, err
+		}
+		return toolDeferred, nil
 	}
 	canonicalEncoded, err := json.Marshal(outcome.Result.Canonical)
 	if err != nil {
 		if appendErr := l.appendToolResultErr(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, fmt.Errorf("encode tool content: %w", err), turnID, stepID); appendErr != nil {
-			return false, appendErr
+			return toolContinue, appendErr
 		}
-		return false, nil
+		return toolContinue, nil
 	}
 	modelFacing := any(outcome.Result.Canonical)
 	if outcome.Result.ModelFacing != nil {
@@ -1018,14 +1188,17 @@ func (l *Loop) appendToolOutcome(ctx context.Context, lease session.Lease, em *e
 	contentEncoded, err := json.Marshal(modelFacing)
 	if err != nil {
 		if appendErr := l.appendToolResultErr(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, fmt.Errorf("encode tool content: %w", err), turnID, stepID); appendErr != nil {
-			return false, appendErr
+			return toolContinue, appendErr
 		}
-		return false, nil
+		return toolContinue, nil
+	}
+	if outcome.Result.Continuation == tools.ToolConclude || outcome.Result.ConcludesTurn {
+		continuation = toolConclude
 	}
 	if err := l.appendToolResult(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, canonicalEncoded, contentEncoded, outcome.Result.UI, outcome.Result.Code, outcome.Result.Content, outcome.Result.AdditionalContexts, outcome.Result.ConcludesTurn, turnID, stepID); err != nil {
-		return false, err
+		return toolContinue, err
 	}
-	return outcome.Result.ConcludesTurn, nil
+	return continuation, nil
 }
 
 func (l *Loop) appendToolFailureResult(ctx context.Context, lease session.Lease, em *emitter, result *tools.Result, fallback error, turnID, stepID string) error {
@@ -1269,7 +1442,11 @@ func (l *Loop) appendUsage(ctx context.Context, lease session.Lease, em *emitter
 	}
 	data := mustMarshal(map[string]any{
 		"input_tokens": resp.Usage.InputTokens, "output_tokens": resp.Usage.OutputTokens,
-		"total_tokens": resp.Usage.TotalTokens(),
+		"cached_tokens": resp.Usage.CachedTokens, "cache_write_tokens": resp.Usage.CacheWriteTokens,
+		"total_tokens": resp.Usage.TotalTokens(), "cost_usd": resp.Usage.CostUSD,
+		"model": resp.Model, "provider": resp.Provider,
+		"provider_response_id": resp.ProviderResponseID, "request_id": resp.RequestID,
+		"latency_ms": resp.Latency.Milliseconds(),
 	})
 	ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventUsage, Data: data}
 	return l.append(ctx, lease, ev)
@@ -1299,7 +1476,7 @@ func (l *Loop) preflight(ctx context.Context, lease session.Lease, compacted *in
 			Instructions: cfg.Instructions, ToolGuidance: cfg.ToolGuidance, Runtime: cfg.RuntimeContext,
 			Workspace: cfg.WorkspaceContext, Tools: l.Tools.ModelTools(), Messages: msgs,
 			MaxTokens: cfg.MaxTokens, Config: cfg.ProviderConfig, Stream: cfg.Stream,
-			Capabilities: capabilities, ParallelTools: true,
+			Capabilities: capabilities, ParallelTools: capabilities != nil && capabilities.SupportsParallelToolCalls,
 		})
 		if buildErr != nil {
 			return false, buildErr

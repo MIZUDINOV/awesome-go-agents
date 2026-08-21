@@ -64,7 +64,7 @@ go test ./internal/agents/... ./internal/ai/...
 - **core tools have typed schemas and contract tests** — `tools/core` input and
   output schemas are generated from the typed `DefineTool[I,O]` contracts and
   exercised by `tools/core/core_test.go` and the parity suite
-  `integration/e2b/e2b_test.go`.
+  `wzhooh-back/internal/agentkitruntime/e2b/e2b_test.go`.
 - **DB replay rebuilds identical surface** — `session/pgstore/integration_test.go`
   loads the log on a fresh store and rebuilds the projection (scenarios H, G).
 - **fake provider runs the full Agent Loop without network** — `agent/agent_test.go`

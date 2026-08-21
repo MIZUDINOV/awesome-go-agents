@@ -58,6 +58,7 @@ const (
 	EventToolAdmitted      EventType = "tool/admitted"
 	EventToolDispatched    EventType = "tool/dispatched"
 	EventToolRunning       EventType = "tool/running"
+	EventToolDeferred      EventType = "tool/deferred"
 	EventToolResult        EventType = "tool/result"
 	EventRequestError      EventType = "request/error"
 
@@ -85,7 +86,7 @@ var knownTypes = map[EventType]bool{
 	EventInboxQueued: true, EventInboxClaimed: true, EventInboxRequeued: true, EventInboxCompleted: true, EventInboxDiscarded: true,
 	EventApprovalRequested: true, EventApprovalResolved: true,
 	EventToolCall: true, EventToolResult: true,
-	EventToolAdmitted: true, EventToolDispatched: true, EventToolRunning: true,
+	EventToolAdmitted: true, EventToolDispatched: true, EventToolRunning: true, EventToolDeferred: true,
 	EventRequestError:    true,
 	EventContextSnapshot: true, EventUsage: true,
 	EventCompactionStart: true, EventCompactionSummary: true, EventCompactionEnd: true,
@@ -214,7 +215,7 @@ func (e Event) Validate() error {
 			return fmt.Errorf("session: extension envelope route does not match event type %q", e.Type)
 		}
 	}
-	if e.Type == EventToolCall || e.Type == EventToolAdmitted || e.Type == EventToolDispatched || e.Type == EventToolRunning || e.Type == EventToolResult || e.Type == EventApprovalRequested || e.Type == EventApprovalResolved {
+	if e.Type == EventToolCall || e.Type == EventToolAdmitted || e.Type == EventToolDispatched || e.Type == EventToolRunning || e.Type == EventToolDeferred || e.Type == EventToolResult || e.Type == EventApprovalRequested || e.Type == EventApprovalResolved {
 		if e.CallID == "" {
 			return fmt.Errorf("session: event %q requires call_id correlation", e.Type)
 		}

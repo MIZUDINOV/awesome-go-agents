@@ -24,6 +24,7 @@ type ExecContext struct {
 	RunID     string
 	TurnID    string
 	StepID    string
+	CallID    string
 	// Vars carries arbitrary host-provided bindings (tool-agnostic).
 	Vars map[string]any
 	// Sandbox is the runtime authority boundary. Registry admission happens
@@ -232,7 +233,12 @@ type Result struct {
 	Meta               map[string]any         `json:"meta,omitempty"`
 	Content            []session.ContentBlock `json:"content,omitempty"`
 	AdditionalContexts []llm.Message          `json:"additional_contexts,omitempty"`
-	ConcludesTurn      bool                   `json:"concludes_turn,omitempty"`
+	Continuation       ToolContinuation       `json:"continuation,omitempty"`
+	ResumeKey          string                 `json:"resume_key,omitempty"`
+	WaitingReason      string                 `json:"waiting_reason,omitempty"`
+	// ConcludesTurn is retained for source compatibility while hosts migrate
+	// to Continuation=ToolConclude. The AgentKit loop normalizes both forms.
+	ConcludesTurn bool `json:"concludes_turn,omitempty"`
 	// Code is a stable non-empty outcome code for failed tool calls.
 	Code    string   `json:"code,omitempty"`
 	Failure *Failure `json:"failure,omitempty"`

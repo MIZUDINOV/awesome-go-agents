@@ -472,7 +472,7 @@ func TestToolResultRoundTripAndReasoningMetadata(t *testing.T) {
 	})
 	chat := &scriptedProvider{steps: []scriptedStep{
 		{calls: []llm.ToolCallRequest{{CallID: "call-1", Name: "roundtrip", Arguments: json.RawMessage(`{}`)}}, metadata: map[string]any{
-			"openrouter": map[string]any{"reasoning_details": []any{map[string]any{"type": "reasoning.text"}}},
+			"provider": map[string]any{"reasoning_details": []any{map[string]any{"type": "reasoning.text"}}},
 		}},
 		{text: "done"},
 	}}
@@ -523,7 +523,7 @@ func TestToolResultRoundTripAndReasoningMetadata(t *testing.T) {
 	if !foundCanonical {
 		t.Fatal("canonical and model-facing tool result projections were not persisted separately")
 	}
-	if assistant.Metadata["openrouter"] == nil {
+	if assistant.Metadata["provider"] == nil {
 		t.Fatalf("assistant metadata was not replayed: %+v", assistant.Metadata)
 	}
 }

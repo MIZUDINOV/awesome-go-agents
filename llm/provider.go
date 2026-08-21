@@ -34,8 +34,7 @@ type Request struct {
 	ParallelToolCalls *bool `json:"parallel_tool_calls,omitempty"`
 	// MaxTokens bounds the completion. Zero means provider default.
 	MaxTokens int64 `json:"max_tokens,omitempty"`
-	// Config is provider-specific configuration (e.g. GenerateConfig for
-	// OpenRouter) encoded as JSON.
+	// Config is provider-specific configuration encoded as JSON.
 	Config json.RawMessage `json:"config,omitempty"`
 	// Stream requests streaming transport when true.
 	Stream bool `json:"stream,omitempty"`
@@ -75,7 +74,7 @@ type Response struct {
 	RequestID          string
 	// Latency is the total wall time of the call.
 	Latency time.Duration
-	// Raw is the provider-specific envelope (OpenRouter metadata, usage, id).
+	// Raw is the provider-specific envelope retained for debugging and replay.
 	Raw json.RawMessage
 }
 

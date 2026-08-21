@@ -1,7 +1,7 @@
 // Package integration defines provider-neutral capability seams used by
 // agent tools (filesystem, subprocess, web). The agent core depends only on
-// these interfaces; concrete bound environments (local host, E2B sandbox,
-// remote execution) implement them outside the core.
+// these interfaces; concrete bound environments (local host or remote
+// execution) implement them outside the core.
 package integration
 
 import (
@@ -63,7 +63,7 @@ type EditResult struct {
 	NewString string
 }
 
-// FileSystem is the provider-neutral filesystem seam. Local and sandbox (E2B)
+// FileSystem is the provider-neutral filesystem seam. Local and remote
 // implementations satisfy it; tools never know which is active.
 type FileSystem interface {
 	// Resolve binds a raw path against cwd and returns a sandbox-safe Target.

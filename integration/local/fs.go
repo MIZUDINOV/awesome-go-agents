@@ -1,7 +1,7 @@
 // Package local provides concrete local-host implementations of the
 // provider-neutral seams (FileSystem, Subprocess, JobManager, Sandbox). They
-// enforce the same containment, observation and CAS contracts that the E2B
-// adapter enforces, so tools behave identically across execution worlds.
+// enforce the same containment, observation and CAS contracts that remote
+// adapters enforce, so tools behave identically across execution worlds.
 package local
 
 import (

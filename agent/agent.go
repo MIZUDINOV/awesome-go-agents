@@ -46,11 +46,13 @@ type Agent interface {
 	Send(ctx context.Context, text string) error
 	Steer(ctx context.Context, text string) error
 	Inject(ctx context.Context, text string) error
+	Submit(ctx context.Context, input Input) (*Result, error)
 	Cancel(ctx context.Context, opts CancelOptions) error
 	WhenIdle(ctx context.Context) error
 	DecideApproval(ctx context.Context, callID string, approved bool) error
 	Approve(ctx context.Context, callID string) error
 	Reject(ctx context.Context, callID string) error
+	ResumeTool(ctx context.Context, request ToolResume) error
 	Subscribe(ctx context.Context, after uint64, filter EventFilter) (*Subscription, error)
 	SubscribeNotifications(ctx context.Context) *NotificationSubscription
 	Run(ctx context.Context, input string) (*Result, error)
@@ -116,6 +118,14 @@ type inboxItem struct {
 	id   string
 	kind inboxKind
 	text string
+}
+
+// Input is the host-safe durable input boundary. It preserves the caller's
+// idempotency identity and distinguishes user, steering, and injected context.
+type Input struct {
+	ID   string
+	Type session.EventType
+	Text string
 }
 
 // Handle is the default in-process Agent implementation. The durable session
@@ -310,6 +320,48 @@ func (h *Handle) Inject(ctx context.Context, text string) error {
 	return h.enqueue(ctx, inboxInject, text, false)
 }
 
+// Submit runs a host-owned durable input under the loop's claimed lease. It
+// deliberately bypasses the in-process inbox, whose convenience methods are
+// intended for interactive callers and use lease-less queue projections.
+func (h *Handle) Submit(ctx context.Context, input Input) (*Result, error) {
+	if input.Text == "" || input.ID == "" {
+		return nil, fmt.Errorf("agent: input id and text are required")
+	}
+	if input.Type != session.EventUserMessage && input.Type != session.EventSteeringMessage && input.Type != session.EventInjectedContext {
+		return nil, fmt.Errorf("agent: unsupported input event type %q", input.Type)
+	}
+	h.mu.Lock()
+	if h.status == StatusDisposed {
+		h.mu.Unlock()
+		return nil, ErrAgentDisposed
+	}
+	if h.status == StatusRunning {
+		h.mu.Unlock()
+		return nil, ErrAgentBusy
+	}
+	h.status = StatusRunning
+	runCtx, cancel := context.WithCancel(ctx)
+	h.runCancel = cancel
+	h.signalChanged()
+	h.mu.Unlock()
+	h.emitStatus(StatusRunning)
+	defer func() {
+		cancel()
+		h.mu.Lock()
+		h.runCancel = nil
+		disposed := h.status == StatusDisposed
+		if !disposed {
+			h.status = StatusIdle
+		}
+		h.signalChanged()
+		h.mu.Unlock()
+		if !disposed {
+			h.emitStatus(StatusIdle)
+		}
+	}()
+	return h.loop.RunInputWithID(runCtx, input.Type, input.ID, input.Text)
+}
+
 func (h *Handle) enqueue(ctx context.Context, kind inboxKind, text string, wake bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -410,6 +462,40 @@ func (h *Handle) Approve(ctx context.Context, callID string) error {
 
 func (h *Handle) Reject(ctx context.Context, callID string) error {
 	return h.DecideApproval(ctx, callID, false)
+}
+
+// ResumeTool completes a deferred tool under the loop's claimed lease.
+func (h *Handle) ResumeTool(ctx context.Context, request ToolResume) error {
+	h.mu.Lock()
+	if h.status == StatusDisposed {
+		h.mu.Unlock()
+		return ErrAgentDisposed
+	}
+	if h.status == StatusRunning {
+		h.mu.Unlock()
+		return ErrAgentBusy
+	}
+	h.status = StatusRunning
+	runCtx, cancel := context.WithCancel(ctx)
+	h.runCancel = cancel
+	h.signalChanged()
+	h.mu.Unlock()
+	h.emitStatus(StatusRunning)
+	defer func() {
+		cancel()
+		h.mu.Lock()
+		h.runCancel = nil
+		disposed := h.status == StatusDisposed
+		if !disposed {
+			h.status = StatusIdle
+		}
+		h.signalChanged()
+		h.mu.Unlock()
+		if !disposed {
+			h.emitStatus(StatusIdle)
+		}
+	}()
+	return h.loop.ResumeTool(runCtx, request)
 }
 
 func (h *Handle) resumeApprovedTool(ctx context.Context, request tools.ApprovalRequest, approved bool) error {
