@@ -17,7 +17,7 @@ const (
 // BeforeExecuteHook runs after admission and before OnDispatch or the
 // definition executor. It is intentionally explicit: a non-nil Result is not
 // implicitly treated as a short-circuit.
-type BeforeExecuteHook func(context.Context, ExecContext, Execution) (BeforeExecuteDecision, *Result, error)
+type BeforeExecuteHook func(context.Context, ToolRunContext, Execution) (BeforeExecuteDecision, *Result, error)
 
 var ErrInvalidBeforeExecuteResult = errors.New("invalid before-execute result")
 

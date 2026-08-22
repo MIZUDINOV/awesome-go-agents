@@ -115,6 +115,29 @@ var OrObjectSchema = json.RawMessage(`{"type":"object"}`)
 // output is intentionally unconstrained.
 var AnyOutputSchema = json.RawMessage(`{}`)
 
+// ValidateObjectRoot rejects scalar and array root schemas at the tool
+// boundary. An unconstrained schema (`{}`) is allowed only for the explicit
+// legacy output sentinel; tool inputs must always declare an object root.
+func ValidateObjectRoot(schema []byte) error {
+	if schemaAbsent(schema) {
+		return ErrSchemaInvalid
+	}
+	var node map[string]any
+	if err := json.Unmarshal(schema, &node); err != nil {
+		return fmt.Errorf("%w: %v", ErrSchemaInvalid, err)
+	}
+	if len(node) == 0 {
+		return nil
+	}
+	if root, ok := node["type"].(string); ok {
+		if root != "object" {
+			return fmt.Errorf("%w: tool schema root must be object, got %q", ErrUnsupportedSchema, root)
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: tool schema must declare an object root", ErrUnsupportedSchema)
+}
+
 func schemaAbsent(schema []byte) bool {
 	trimmed := bytes.TrimSpace(schema)
 	return len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null"))

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reflect"
+	"sync"
 	"time"
 
 	"github.com/MIZUDINOV/awesome-go-agents/integration"
@@ -16,15 +17,19 @@ import (
 	"github.com/MIZUDINOV/awesome-go-agents/session"
 )
 
-// ExecContext carries request-scoped context a tool may need beyond the raw
-// arguments. Host apps populate it (run id, workspace, sandbox binding).
-type ExecContext struct {
+// ToolRunContext carries the call identity and host-owned execution ports a
+// tool may need beyond its decoded arguments. Signal mirrors the cancellation
+// source for channel-oriented integrations.
+type ToolRunContext struct {
 	// SessionID / RunID are durable correlation identifiers.
-	SessionID string
-	RunID     string
-	TurnID    string
-	StepID    string
-	CallID    string
+	SessionID    string
+	RunID        string
+	TurnID       string
+	StepID       string
+	RootCallID   string
+	ParentCallID string
+	CallID       string
+	Signal       <-chan struct{}
 	// Vars carries arbitrary host-provided bindings (tool-agnostic).
 	Vars map[string]any
 	// Sandbox is the runtime authority boundary. Registry admission happens
@@ -43,10 +48,51 @@ type ExecContext struct {
 	// OnDispatch is invoked after policy/approval/guards and immediately before
 	// the executor can cause an external side effect.
 	OnDispatch func(context.Context, string, string) error
+	control    *toolRunControl
+}
+
+type toolRunControl struct {
+	mu            sync.Mutex
+	continuation  ToolContinuation
+	resumeKey     string
+	waitingReason string
+	concluded     bool
+}
+
+// DeferContext marks the current call as waiting for a host-resumed operation.
+func (c ToolRunContext) DeferContext(resumeKey, waitingReason string) {
+	if c.control == nil {
+		return
+	}
+	c.control.mu.Lock()
+	c.control.continuation = ToolDeferred
+	c.control.resumeKey = resumeKey
+	c.control.waitingReason = waitingReason
+	c.control.mu.Unlock()
+}
+
+// ConcludeTurn marks the current call as the terminal tool call for this turn.
+func (c ToolRunContext) ConcludeTurn() {
+	if c.control == nil {
+		return
+	}
+	c.control.mu.Lock()
+	c.control.concluded = true
+	c.control.continuation = ToolConclude
+	c.control.mu.Unlock()
+}
+
+func (c ToolRunContext) directive() (ToolContinuation, string, string, bool) {
+	if c.control == nil {
+		return ToolContinue, "", "", false
+	}
+	c.control.mu.Lock()
+	defer c.control.mu.Unlock()
+	return c.control.continuation, c.control.resumeKey, c.control.waitingReason, c.control.concluded
 }
 
 // Executor runs a tool and returns the canonical structured result.
-type Executor func(ctx context.Context, ec ExecContext, input json.RawMessage) (any, error)
+type Executor func(ctx context.Context, ec ToolRunContext, input json.RawMessage) (any, error)
 
 // Renderer converts the original arguments and canonical result into a
 // model-facing textual or JSON representation. If nil, the canonical value is
@@ -58,13 +104,25 @@ type Renderer func(args json.RawMessage, canonical any) (any, error)
 // presentation metadata. If nil, no UI metadata is produced.
 type Presenter func(args json.RawMessage, canonical any) (map[string]any, error)
 
-// Finalizer applies a definition-owned final content invariant after the
-// canonical outcome has been validated and rendered.
-type Finalizer func(*Result) error
+// ContentRenderer emits provider-neutral content blocks for model output.
+type ContentRenderer func(args json.RawMessage, canonical any) ([]session.ContentBlock, error)
+
+// ContentFinalizer derives final model content from validated canonical output.
+// It is pure and cannot mutate Result or lifecycle state.
+type ContentFinalizer func(args json.RawMessage, canonical any) ([]session.ContentBlock, error)
+
+// CallPresenter derives compact metadata for a tool call before execution.
+type CallPresenter func(args json.RawMessage) (map[string]any, error)
 
 // ContinuationResolver derives lifecycle state from the validated canonical
 // result. Lifecycle is registry-owned; content finalizers cannot mutate it.
 type ContinuationResolver func(args json.RawMessage, canonical any) (ToolContinuation, string, string, error)
+
+// PromptSection is tool-owned guidance kept separate from the model catalog.
+type PromptSection struct {
+	Title   string
+	Content string
+}
 
 // PresentationMode controls how the model receives the catalog.
 type PresentationMode string
@@ -78,7 +136,7 @@ const (
 // CodeRuntime is the only execution seam for generated Code Mode programs.
 // Implementations must route SDK calls back through the owning Registry.
 type CodeRuntime interface {
-	ExecuteCode(context.Context, ExecContext, string, string) (any, error)
+	ExecuteCode(context.Context, ToolRunContext, string, string) (any, error)
 }
 
 // StaticInputSchema is a convenience for tools whose input schema is a fixed
@@ -91,6 +149,7 @@ type Definition struct {
 	Name        string
 	Description string
 	Version     string
+	Guidance    []PromptSection
 
 	// InputSchema is the JSON Schema object the model sees for arguments.
 	InputSchema json.RawMessage
@@ -106,9 +165,11 @@ type Definition struct {
 	Execute Executor
 	// RenderModel optionally shapes what the model sees as the result.
 	RenderModel Renderer
-	// PresentUI optionally shapes what the UI sees.
-	PresentUI           Presenter
-	FinalizeContent     Finalizer
+	// RenderContent optionally emits provider-neutral content blocks.
+	RenderContent       ContentRenderer
+	PresentCall         CallPresenter
+	PresentResult       Presenter
+	FinalizeContent     ContentFinalizer
 	ResolveContinuation ContinuationResolver
 
 	// ConcurrencySafe marks the tool safe to run in parallel with other tools.
@@ -145,21 +206,25 @@ func (d *Definition) IsConcurrencySafe(input json.RawMessage) bool {
 // When a schema override is omitted, it is generated from the corresponding
 // Go type, keeping typed decoding and model validation on one source of truth.
 type DefineToolOptions[I any, O any] struct {
-	Name                string
-	Description         string
-	Version             string
-	InputSchema         json.RawMessage
-	OutputSchema        json.RawMessage
-	Timeout             time.Duration
-	MutatesWorkspace    bool
-	ConcurrencySafe     func(I) bool
-	Execute             func(context.Context, ExecContext, I) (O, error)
-	RenderModel         func(O) (any, error)
-	PresentUI           func(O) (map[string]any, error)
-	RenderModelWithArgs func(I, O) (any, error)
-	PresentUIWithArgs   func(I, O) (map[string]any, error)
-	FinalizeContent     func(*Result) error
-	ResolveContinuation func(I, O) (ToolContinuation, string, string, error)
+	Name                  string
+	Description           string
+	Version               string
+	Guidance              []PromptSection
+	InputSchema           json.RawMessage
+	OutputSchema          json.RawMessage
+	Timeout               time.Duration
+	MutatesWorkspace      bool
+	ConcurrencySafe       func(I) bool
+	Execute               func(context.Context, ToolRunContext, I) (O, error)
+	RenderModel           func(O) (any, error)
+	RenderModelWithArgs   func(I, O) (any, error)
+	RenderContent         func(O) ([]session.ContentBlock, error)
+	RenderContentWithArgs func(I, O) ([]session.ContentBlock, error)
+	PresentCall           func(I) (map[string]any, error)
+	PresentResult         func(O) (map[string]any, error)
+	PresentResultWithArgs func(I, O) (map[string]any, error)
+	FinalizeContent       func(O) ([]session.ContentBlock, error)
+	ResolveContinuation   func(I, O) (ToolContinuation, string, string, error)
 }
 
 // DefineTool converts a typed definition into the runtime representation.
@@ -176,6 +241,7 @@ func DefineTool[I any, O any](opts DefineToolOptions[I, O]) *Definition {
 	}
 	definition := &Definition{
 		Name: opts.Name, Description: opts.Description, Version: opts.Version,
+		Guidance:    append([]PromptSection(nil), opts.Guidance...),
 		InputSchema: inputSchema, OutputSchema: outputSchema,
 		typedInputSchema: expectedInputSchema,
 		Timeout:          opts.Timeout, MutatesWorkspace: opts.MutatesWorkspace,
@@ -183,7 +249,7 @@ func DefineTool[I any, O any](opts DefineToolOptions[I, O]) *Definition {
 			var args I
 			return opts.ConcurrencySafe != nil && json.Unmarshal(input, &args) == nil && opts.ConcurrencySafe(args)
 		},
-		Execute: func(ctx context.Context, ec ExecContext, input json.RawMessage) (any, error) {
+		Execute: func(ctx context.Context, ec ToolRunContext, input json.RawMessage) (any, error) {
 			if opts.Execute == nil {
 				return nil, ErrInvalidArguments
 			}
@@ -193,7 +259,6 @@ func DefineTool[I any, O any](opts DefineToolOptions[I, O]) *Definition {
 			}
 			return opts.Execute(ctx, ec, args)
 		},
-		FinalizeContent: opts.FinalizeContent,
 	}
 	definition.RenderModel = func(input json.RawMessage, canonical any) (any, error) {
 		var args I
@@ -212,11 +277,8 @@ func DefineTool[I any, O any](opts DefineToolOptions[I, O]) *Definition {
 		}
 		return canonical, nil
 	}
-	if opts.PresentUI != nil || opts.PresentUIWithArgs != nil {
-		definition.PresentUI = func(input json.RawMessage, canonical any) (map[string]any, error) {
-			if opts.PresentUI == nil && opts.PresentUIWithArgs == nil {
-				return nil, nil
-			}
+	if opts.RenderContent != nil || opts.RenderContentWithArgs != nil {
+		definition.RenderContent = func(input json.RawMessage, canonical any) ([]session.ContentBlock, error) {
 			var args I
 			if err := json.Unmarshal(input, &args); err != nil {
 				return nil, ErrInvalidArguments
@@ -225,10 +287,48 @@ func DefineTool[I any, O any](opts DefineToolOptions[I, O]) *Definition {
 			if !ok {
 				return nil, ErrInvalidOutput
 			}
-			if opts.PresentUIWithArgs != nil {
-				return opts.PresentUIWithArgs(args, value)
+			if opts.RenderContentWithArgs != nil {
+				return opts.RenderContentWithArgs(args, value)
 			}
-			return opts.PresentUI(value)
+			return opts.RenderContent(value)
+		}
+	}
+	if opts.FinalizeContent != nil {
+		definition.FinalizeContent = func(input json.RawMessage, canonical any) ([]session.ContentBlock, error) {
+			var args I
+			if err := json.Unmarshal(input, &args); err != nil {
+				return nil, ErrInvalidArguments
+			}
+			value, ok := canonical.(O)
+			if !ok {
+				return nil, ErrInvalidOutput
+			}
+			return opts.FinalizeContent(value)
+		}
+	}
+	if opts.PresentCall != nil {
+		definition.PresentCall = func(input json.RawMessage) (map[string]any, error) {
+			var args I
+			if err := json.Unmarshal(input, &args); err != nil {
+				return nil, ErrInvalidArguments
+			}
+			return opts.PresentCall(args)
+		}
+	}
+	if opts.PresentResult != nil || opts.PresentResultWithArgs != nil {
+		definition.PresentResult = func(input json.RawMessage, canonical any) (map[string]any, error) {
+			var args I
+			if err := json.Unmarshal(input, &args); err != nil {
+				return nil, ErrInvalidArguments
+			}
+			value, ok := canonical.(O)
+			if !ok {
+				return nil, ErrInvalidOutput
+			}
+			if opts.PresentResultWithArgs != nil {
+				return opts.PresentResultWithArgs(args, value)
+			}
+			return opts.PresentResult(value)
 		}
 	}
 	definition.ResolveContinuation = func(input json.RawMessage, canonical any) (ToolContinuation, string, string, error) {
@@ -273,7 +373,10 @@ type Result struct {
 	// ModelFacing is what the model sees (text or structured).
 	ModelFacing any `json:"model_facing,omitempty"`
 	// UI is presentation metadata (diffs, paths).
-	UI                 map[string]any         `json:"ui,omitempty"`
+	UI map[string]any `json:"ui,omitempty"`
+	// CallPresentation is compact metadata derived from arguments before
+	// execution; UI is reserved for the completed result.
+	CallPresentation   map[string]any         `json:"call_presentation,omitempty"`
 	Meta               map[string]any         `json:"meta,omitempty"`
 	Content            []session.ContentBlock `json:"content,omitempty"`
 	AdditionalContexts []llm.Message          `json:"additional_contexts,omitempty"`
@@ -297,6 +400,12 @@ func (r *Result) Freeze() *Result {
 	}
 	out := *r
 	out.Frozen = true
+	if r.CallPresentation != nil {
+		out.CallPresentation = make(map[string]any, len(r.CallPresentation))
+		for key, value := range r.CallPresentation {
+			out.CallPresentation[key] = cloneResultValue(value)
+		}
+	}
 	out.Canonical = cloneResultValue(r.Canonical)
 	out.ModelFacing = cloneResultValue(r.ModelFacing)
 	if r.UI != nil {

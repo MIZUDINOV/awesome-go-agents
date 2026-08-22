@@ -32,6 +32,14 @@ policy. It does not own a product database, queue, UI, or sandbox lifecycle.
   validate input, policy/guard, sandbox, timeout/cancellation, execution,
   canonical output validation, model/UI rendering, post-policy replacement,
   finalization, freeze, and observation.
+- Tool schemas are object-rooted and typed definitions are the source of
+  truth. Tool-owned `Guidance` is separate from the model-facing description;
+  `ToolRunContext` carries call/root/parent identity and a cancellation signal,
+  while `DeferContext` and `ConcludeTurn` report turn lifecycle explicitly.
+- `PresentCall`, `PresentResult`, and content renderers are pure projections:
+  canonical output stays runtime-owned, model content uses AgentKit blocks, and
+  UI metadata remains compact. Registrations, restrictions, policies, and
+  guards can be disposed through scoped handles.
 - Canonical values, model-facing blocks, and UI metadata are separate. The
   durable block vocabulary is text, reasoning, media, tool-call, tool-result,
   and namespaced extension blocks; streamed chunks are committed before they
@@ -49,8 +57,9 @@ AgentKit contains no product tool implementations. Hosts define concrete
 typed tools with `DefineTool[I,O]`, provide their adapters and side effects,
 and register those definitions in a `Registry`. AgentKit owns only the
 provider-neutral schema, validation, policy, execution pipeline, continuation,
-and observation machinery. Reference or test adapters belong outside the
-library's production tool surface.
+and observation machinery. The only built-in exception is the `run_code`
+transport bridge used by Code Mode; it is not a product tool. Reference or
+test adapters belong outside the library's production tool surface.
 
 ## Acceptance
 

@@ -65,7 +65,7 @@ func registerProbe(t *testing.T, registry *tools.Registry, name string, failAfte
 		Name: name, Description: "probe",
 		InputSchema:  jsonRaw(`{"type":"object","properties":{"count":{"type":"integer"}},"additionalProperties":false}`),
 		OutputSchema: tools.AnyOutputSchema,
-		Execute: func(ctx context.Context, ec tools.ExecContext, input json.RawMessage) (any, error) {
+		Execute: func(ctx context.Context, ec tools.ToolRunContext, input json.RawMessage) (any, error) {
 			if counter != nil {
 				*counter++
 			}
@@ -232,7 +232,7 @@ func TestToolCallIDIsNormalizedBeforeAssistantMessage(t *testing.T) {
 	registry := tools.New(tools.Options{})
 	registry.MustRegister(&tools.Definition{
 		Name: "probe", InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
-		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) { return "ok", nil },
+		Execute: func(context.Context, tools.ToolRunContext, json.RawMessage) (any, error) { return "ok", nil },
 	})
 	chat := &scriptedProvider{steps: []scriptedStep{
 		{calls: []llm.ToolCallRequest{{Name: "probe", Arguments: json.RawMessage(`{}`)}}},
@@ -321,12 +321,11 @@ func TestFinalizerFailurePreservesModelFacingToolResult(t *testing.T) {
 	registry := tools.New(tools.Options{})
 	registry.MustRegister(&tools.Definition{
 		Name: "finalize_fail", InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
-		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+		Execute: func(context.Context, tools.ToolRunContext, json.RawMessage) (any, error) {
 			return map[string]any{"canonical": true}, nil
 		},
-		FinalizeContent: func(result *tools.Result) error {
-			result.ModelFacing = "partial output"
-			return errors.New("finalizer failed")
+		FinalizeContent: func(json.RawMessage, any) ([]session.ContentBlock, error) {
+			return nil, errors.New("finalizer failed")
 		},
 	})
 	chat := &scriptedProvider{steps: []scriptedStep{
@@ -345,7 +344,7 @@ func TestFinalizerFailurePreservesModelFacingToolResult(t *testing.T) {
 			resultData = event.Data
 		}
 	}
-	if !strings.Contains(string(resultData), "partial output") || !strings.Contains(string(resultData), "FINALIZE_FAILED") {
+	if !strings.Contains(string(resultData), "FINALIZE_FAILED") {
 		t.Fatalf("durable finalizer result=%s", resultData)
 	}
 }
@@ -465,7 +464,7 @@ func TestToolResultRoundTripAndReasoningMetadata(t *testing.T) {
 	registry := tools.New(tools.Options{})
 	registry.MustRegister(&tools.Definition{
 		Name: "roundtrip", InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
-		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+		Execute: func(context.Context, tools.ToolRunContext, json.RawMessage) (any, error) {
 			return map[string]any{"ok": true}, nil
 		},
 		RenderModel: func(_ json.RawMessage, _ any) (any, error) { return "model-facing", nil },
@@ -541,7 +540,7 @@ func TestCancellationBeforeDispatchPersistsAbortedToolResult(t *testing.T) {
 	executed := 0
 	registry.MustRegister(&tools.Definition{
 		Name: "cancel_probe", InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
-		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+		Execute: func(context.Context, tools.ToolRunContext, json.RawMessage) (any, error) {
 			executed++
 			return "unexpected", nil
 		},
@@ -650,7 +649,7 @@ func TestPendingApprovalResumesAfterAgentRestart(t *testing.T) {
 	executed := 0
 	registry.MustRegister(&tools.Definition{
 		Name: request.ToolName, InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
-		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+		Execute: func(context.Context, tools.ToolRunContext, json.RawMessage) (any, error) {
 			executed++
 			return map[string]any{"ok": true}, nil
 		},
@@ -735,7 +734,7 @@ func TestResumedApprovalHonorsHandleCancel(t *testing.T) {
 	registry := tools.New(tools.Options{})
 	registry.MustRegister(&tools.Definition{
 		Name: request.ToolName, InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
-		Execute: func(ctx context.Context, _ tools.ExecContext, _ json.RawMessage) (any, error) {
+		Execute: func(ctx context.Context, _ tools.ToolRunContext, _ json.RawMessage) (any, error) {
 			close(started)
 			<-ctx.Done()
 			return nil, ctx.Err()

@@ -22,14 +22,16 @@ var (
 
 // Execution is the immutable view supplied to guards and policy.
 type Execution struct {
-	SessionID string          `json:"session_id"`
-	RunID     string          `json:"run_id"`
-	TurnID    string          `json:"turn_id"`
-	StepID    string          `json:"step_id"`
-	CallID    string          `json:"call_id"`
-	Name      string          `json:"name"`
-	Arguments json.RawMessage `json:"arguments"`
-	Mutates   bool            `json:"mutates"`
+	SessionID    string          `json:"session_id"`
+	RunID        string          `json:"run_id"`
+	TurnID       string          `json:"turn_id"`
+	StepID       string          `json:"step_id"`
+	RootCallID   string          `json:"root_call_id"`
+	ParentCallID string          `json:"parent_call_id"`
+	CallID       string          `json:"call_id"`
+	Name         string          `json:"name"`
+	Arguments    json.RawMessage `json:"arguments"`
+	Mutates      bool            `json:"mutates"`
 }
 
 // Policy may allow, deny or ask for an approval. Ask fails closed when no

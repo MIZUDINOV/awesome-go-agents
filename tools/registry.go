@@ -47,24 +47,27 @@ type Options struct {
 
 // Registry holds tool definitions and the execution pipeline.
 type Registry struct {
-	mu              sync.RWMutex
-	definitions     map[string]*Definition
-	preExecute      []Hook
-	beforeExecute   []BeforeExecuteHook
-	postExecute     []PostHook
-	defaultTimeout  time.Duration
-	sem             chan struct{}
-	sandbox         integration.Sandbox
-	approval        ApprovalService
-	maxParallel     int
-	policies        []Policy
-	guards          []Guard
-	postPolicies    []PostPolicy
-	observers       []Observer
-	presentation    PresentationMode
-	codeRuntime     CodeRuntime
-	codeLanguage    string
-	codeSDKRenderer func([]*llm.ToolDefinition) (string, error)
+	mu                 sync.RWMutex
+	definitions        map[string]*Definition
+	preExecute         []Hook
+	beforeExecute      []BeforeExecuteHook
+	postExecute        []PostHook
+	defaultTimeout     time.Duration
+	sem                chan struct{}
+	sandbox            integration.Sandbox
+	approval           ApprovalService
+	maxParallel        int
+	policies           []Policy
+	policyIDs          []uint64
+	guards             []Guard
+	guardIDs           []uint64
+	nextRegistrationID uint64
+	postPolicies       []PostPolicy
+	observers          []Observer
+	presentation       PresentationMode
+	codeRuntime        CodeRuntime
+	codeLanguage       string
+	codeSDKRenderer    func([]*llm.ToolDefinition) (string, error)
 }
 
 // New returns an empty Registry.
@@ -107,6 +110,33 @@ func (r *Registry) AddPolicy(policy Policy) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.policies = append(r.policies, policy)
+	r.nextRegistrationID++
+	r.policyIDs = append(r.policyIDs, r.nextRegistrationID)
+}
+
+// AddPolicyHandle appends a policy and returns an idempotent disposer.
+func (r *Registry) AddPolicyHandle(policy Policy) *Registration {
+	if policy == nil {
+		return newRegistration(func() error { return nil })
+	}
+	r.mu.Lock()
+	r.nextRegistrationID++
+	id := r.nextRegistrationID
+	r.policies = append(r.policies, policy)
+	r.policyIDs = append(r.policyIDs, id)
+	r.mu.Unlock()
+	return newRegistration(func() error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for i, candidateID := range r.policyIDs {
+			if candidateID == id {
+				r.policies = append(r.policies[:i], r.policies[i+1:]...)
+				r.policyIDs = append(r.policyIDs[:i], r.policyIDs[i+1:]...)
+				return nil
+			}
+		}
+		return nil
+	})
 }
 
 // AddGuard appends a monotonic guard evaluated after policy decisions.
@@ -117,6 +147,33 @@ func (r *Registry) AddGuard(guard Guard) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.guards = append(r.guards, guard)
+	r.nextRegistrationID++
+	r.guardIDs = append(r.guardIDs, r.nextRegistrationID)
+}
+
+// AddGuardHandle appends a guard and returns an idempotent disposer.
+func (r *Registry) AddGuardHandle(guard Guard) *Registration {
+	if guard == nil {
+		return newRegistration(func() error { return nil })
+	}
+	r.mu.Lock()
+	r.nextRegistrationID++
+	id := r.nextRegistrationID
+	r.guards = append(r.guards, guard)
+	r.guardIDs = append(r.guardIDs, id)
+	r.mu.Unlock()
+	return newRegistration(func() error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		for i, candidateID := range r.guardIDs {
+			if candidateID == id {
+				r.guards = append(r.guards[:i], r.guards[i+1:]...)
+				r.guardIDs = append(r.guardIDs[:i], r.guardIDs[i+1:]...)
+				return nil
+			}
+		}
+		return nil
+	})
 }
 
 func (r *Registry) AddPostPolicy(policy PostPolicy) {
@@ -208,56 +265,84 @@ func (r *Registry) ExecutionMode(name string, input json.RawMessage) bool {
 	return def.IsConcurrencySafe(input)
 }
 
-// RunBatch executes consecutive parallel-safe calls in bounded pools and
-// treats every exclusive call as a barrier. It returns results in model order;
-// callers must commit that order to the durable surface.
-func (r *Registry) RunBatch(ctx context.Context, ec ExecContext, calls []Call) []Outcome {
-	outcomes := make([]Outcome, len(calls))
-	for i, call := range calls {
-		outcomes[i].Call = call
-	}
-	for start := 0; start < len(calls); {
-		if !r.ExecutionMode(calls[start].Name, calls[start].Input) {
-			outcomes[start].Result, outcomes[start].Err = r.Run(ctx, ec, calls[start].Name, calls[start].CallID, calls[start].Input)
-			start++
-			continue
-		}
-		end := start + 1
-		for end < len(calls) && r.ExecutionMode(calls[end].Name, calls[end].Input) {
-			end++
-		}
-		runBatchPool(r.maxParallel, end-start, func(offset int) {
-			index := start + offset
-			outcomes[index].Result, outcomes[index].Err = r.Run(ctx, ec, calls[index].Name, calls[index].CallID, calls[index].Input)
-		})
-		start = end
-	}
-	return outcomes
+// RunBatch uses a rolling bounded pool. Exclusive calls are barriers: all
+// already-started safe calls drain before the exclusive call starts. Calls
+// that are not started after cancellation are never dispatched.
+func (r *Registry) RunBatch(ctx context.Context, ec ToolRunContext, calls []Call) []Outcome {
+	return runRollingBatch(ctx, r.maxParallel, calls,
+		func(call Call) bool { return r.ExecutionMode(call.Name, call.Input) },
+		func(call Call) (*Result, error) { return r.Run(ctx, ec, call.Name, call.CallID, call.Input) })
 }
 
-func runBatchPool(limit, size int, run func(int)) {
-	if size == 0 {
-		return
+func runRollingBatch(ctx context.Context, limit int, calls []Call, executionMode func(Call) bool, run func(Call) (*Result, error)) []Outcome {
+	outcomes := make([]Outcome, len(calls))
+	for index, call := range calls {
+		outcomes[index].Call = call
 	}
-	if limit <= 0 || limit > size {
-		limit = size
+	if len(calls) == 0 {
+		return outcomes
 	}
-	jobs := make(chan int)
-	var wg sync.WaitGroup
-	for worker := 0; worker < limit; worker++ {
-		wg.Add(1)
+	type completed struct {
+		index  int
+		result *Result
+		err    error
+	}
+	done := make(chan completed, len(calls))
+	active, next := 0, 0
+	if limit <= 0 || limit > len(calls) {
+		limit = len(calls)
+	}
+	launch := func(index int) {
+		active++
 		go func() {
-			defer wg.Done()
-			for index := range jobs {
-				run(index)
-			}
+			result, err := run(calls[index])
+			done <- completed{index: index, result: result, err: err}
 		}()
 	}
-	for index := 0; index < size; index++ {
-		jobs <- index
+	drainOne := func() {
+		item := <-done
+		outcomes[item.index].Result = item.result
+		outcomes[item.index].Err = item.err
+		active--
 	}
-	close(jobs)
-	wg.Wait()
+	markUnstarted := func() {
+		if ctx.Err() == nil {
+			return
+		}
+		for next < len(calls) {
+			outcomes[next].Err = fmt.Errorf("%w: %v", ErrAbortedBeforeDispatch, ctx.Err())
+			next++
+		}
+	}
+	for next < len(calls) || active > 0 {
+		if ctx.Err() != nil {
+			markUnstarted()
+			for active > 0 {
+				drainOne()
+			}
+			break
+		}
+		for next < len(calls) && active < limit && executionMode(calls[next]) {
+			launch(next)
+			next++
+		}
+		if next < len(calls) && !executionMode(calls[next]) {
+			for active > 0 {
+				drainOne()
+			}
+			if ctx.Err() != nil {
+				markUnstarted()
+				break
+			}
+			outcomes[next].Result, outcomes[next].Err = run(calls[next])
+			next++
+			continue
+		}
+		if active > 0 {
+			drainOne()
+		}
+	}
+	return outcomes
 }
 
 // Register adds a tool. It returns an error (rather than panicking) on a
@@ -279,6 +364,9 @@ func (r *Registry) Register(def *Definition) error {
 	if err := ValidateSchema(def.InputSchema); err != nil {
 		return fmt.Errorf("%w: tool %q input schema: %v", ErrInvalidArguments, def.Name, err)
 	}
+	if err := ValidateObjectRoot(def.InputSchema); err != nil {
+		return fmt.Errorf("%w: tool %q input schema: %v", ErrInvalidArguments, def.Name, err)
+	}
 	if len(def.typedInputSchema) > 0 && !schemasEquivalent(def.InputSchema, def.typedInputSchema) {
 		return fmt.Errorf("%w: tool %q input schema does not match its typed input contract", ErrInvalidArguments, def.Name)
 	}
@@ -287,6 +375,11 @@ func (r *Registry) Register(def *Definition) error {
 	}
 	if err := ValidateSchema(def.OutputSchema); err != nil {
 		return fmt.Errorf("%w: tool %q output schema: %v", ErrInvalidArguments, def.Name, err)
+	}
+	if !schemasEquivalent(def.OutputSchema, AnyOutputSchema) {
+		if err := ValidateObjectRoot(def.OutputSchema); err != nil {
+			return fmt.Errorf("%w: tool %q output schema: %v", ErrInvalidArguments, def.Name, err)
+		}
 	}
 	if len(def.typedOutputSchema) > 0 && !schemasEquivalent(def.OutputSchema, def.typedOutputSchema) {
 		return fmt.Errorf("%w: tool %q output schema does not match its typed output contract", ErrInvalidArguments, def.Name)
@@ -395,6 +488,29 @@ func (r *Registry) Names() []string {
 	return names
 }
 
+// GuidanceSections returns tool-owned prompt sections in deterministic tool
+// order. Descriptions remain in ModelTools; guidance never enters provider
+// tool schemas.
+func (r *Registry) GuidanceSections() []PromptSection {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	names := make([]string, 0, len(r.definitions))
+	for name := range r.definitions {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	sections := make([]PromptSection, 0)
+	for _, name := range names {
+		for _, section := range r.definitions[name].Guidance {
+			if section.Title == "" || section.Content == "" {
+				continue
+			}
+			sections = append(sections, section)
+		}
+	}
+	return sections
+}
+
 // ModelTools returns the provider-neutral, model-facing tool schema slice in
 // deterministic (sorted) order. This is exactly what is sent to the LLM;
 // runtime fields are stripped and the ordering no longer depends on Go map
@@ -444,7 +560,7 @@ func (r *Registry) runCodeDefinition() (*Definition, bool) {
 		Name: "run_code", Description: "Execute generated code through the scoped tool SDK.",
 		InputSchema:  runCodeToolDefinition().InputSchema,
 		OutputSchema: AnyOutputSchema,
-		Execute: func(ctx context.Context, ec ExecContext, input json.RawMessage) (any, error) {
+		Execute: func(ctx context.Context, ec ToolRunContext, input json.RawMessage) (any, error) {
 			var args struct {
 				Code     string `json:"code"`
 				Language string `json:"language,omitempty"`
@@ -496,15 +612,18 @@ func (r *Registry) CodeGuidance() (string, error) {
 //
 // The executor is never invoked for invalid arguments (H-RUNTIME-001) or with
 // a mutating Input schema.
-func (r *Registry) Run(ctx context.Context, ec ExecContext, name, callID string, input []byte) (result *Result, retErr error) {
+func (r *Registry) Run(ctx context.Context, ec ToolRunContext, name, callID string, input []byte) (result *Result, retErr error) {
 	return r.run(ctx, ec, name, callID, input, nil)
 }
 
-func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string, input []byte, approvalOverride ApprovalService) (result *Result, retErr error) {
+func (r *Registry) run(ctx context.Context, ec ToolRunContext, name, callID string, input []byte, approvalOverride ApprovalService) (result *Result, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrAbortedBeforeDispatch, err)
 	}
 	ec.CallID = callID
+	if ec.RootCallID == "" {
+		ec.RootCallID = callID
+	}
 	r.mu.RLock()
 	presentation, defaultApproval := r.presentation, r.approval
 	r.mu.RUnlock()
@@ -534,6 +653,8 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 	}
 	pipelineCtx, pipelineCancel := context.WithTimeout(parentCtx, timeout)
 	ctx = pipelineCtx
+	ec.Signal = pipelineCtx.Done()
+	ec.control = &toolRunControl{continuation: ToolContinue}
 	defer pipelineCancel()
 	observers := r.snapshotObservers()
 	defer func() {
@@ -569,31 +690,12 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 		}
 		result = frozen
 	}()
+	var args []byte
 	defer func() {
-		if shortCircuited || def.FinalizeContent == nil {
+		if shortCircuited || def.FinalizeContent == nil || result == nil || result.Kind != OutcomeSuccess {
 			return
 		}
-		if retErr != nil && result != nil && result.Kind != OutcomeFailure {
-			code := toolErrorCode(retErr)
-			result.Kind = OutcomeFailure
-			result.Canonical = nil
-			result.ModelFacing = nil
-			result.UI = nil
-			result.Meta = nil
-			result.Content = nil
-			result.AdditionalContexts = nil
-			result.Continuation = ToolContinue
-			result.ResumeKey = ""
-			result.WaitingReason = ""
-			result.ConcludesTurn = false
-			result.Code = code
-			result.Failure = failureFor(retErr)
-		}
-		if result == nil {
-			code := toolErrorCode(retErr)
-			result = &Result{Name: name, CallID: callID, Kind: OutcomeFailure, Code: code, Failure: failureFor(retErr)}
-		}
-		beforeFinalize := result.Freeze()
+		var blocks []session.ContentBlock
 		var finalizeErr error
 		func() {
 			defer func() {
@@ -601,42 +703,27 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 					finalizeErr = fmt.Errorf("finalizer panic: %v", recovered)
 				}
 			}()
-			finalizeErr = def.FinalizeContent(result)
+			blocks, finalizeErr = def.FinalizeContent(args, result.Canonical)
 		}()
-		restoreFinalizerState(result, beforeFinalize)
 		if parentCtx.Err() == nil && errors.Is(pipelineCtx.Err(), context.DeadlineExceeded) {
 			retErr = ErrToolTimeout
 		}
 		if finalizeErr != nil {
-			if retErr == nil {
-				retErr = fmt.Errorf("finalize tool content: %w", finalizeErr)
-				result.Kind = OutcomeFailure
-				result.Canonical = nil
-				result.Meta = nil
-				result.AdditionalContexts = nil
-				result.Continuation = ToolContinue
-				result.ResumeKey = ""
-				result.WaitingReason = ""
-				result.ConcludesTurn = false
-				result.Code = "FINALIZE_FAILED"
-				result.Failure = &Failure{Code: result.Code, Message: failureMessage(finalizeErr)}
-			}
-		}
-		if retErr != nil && result.Kind != OutcomeFailure {
-			code := toolErrorCode(retErr)
+			retErr = fmt.Errorf("finalize tool content: %w", finalizeErr)
 			result.Kind = OutcomeFailure
 			result.Canonical = nil
 			result.ModelFacing = nil
 			result.UI = nil
 			result.Meta = nil
 			result.Content = nil
-			result.AdditionalContexts = nil
 			result.Continuation = ToolContinue
 			result.ResumeKey = ""
 			result.WaitingReason = ""
 			result.ConcludesTurn = false
-			result.Code = code
-			result.Failure = failureFor(retErr)
+			result.Code = "FINALIZE_FAILED"
+			result.Failure = &Failure{Code: result.Code, Message: failureMessage(finalizeErr)}
+		} else {
+			result.Content = blocks
 		}
 		result = result.Freeze()
 	}()
@@ -678,7 +765,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 
 	// Freeze arguments: never hand callers' mutable backing array to the
 	// executor or the model.
-	args := make([]byte, len(input))
+	args = make([]byte, len(input))
 	copy(args, input)
 
 	if r.sem != nil {
@@ -694,10 +781,18 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 	if err := ValidateInput(def.InputSchema, args); err != nil {
 		return nil, err
 	}
-	execution := Execution{SessionID: ec.SessionID, RunID: ec.RunID, TurnID: ec.TurnID, StepID: ec.StepID, CallID: callID, Name: name, Arguments: append(json.RawMessage(nil), args...), Mutates: def.MutatesWorkspace}
+	execution := Execution{SessionID: ec.SessionID, RunID: ec.RunID, TurnID: ec.TurnID, StepID: ec.StepID, RootCallID: ec.RootCallID, ParentCallID: ec.ParentCallID, CallID: callID, Name: name, Arguments: append(json.RawMessage(nil), args...), Mutates: def.MutatesWorkspace}
+	var callPresentation map[string]any
+	var err error
+	if def.PresentCall != nil {
+		callPresentation, err = def.PresentCall(append(json.RawMessage(nil), args...))
+		if err != nil {
+			return nil, fmt.Errorf("present tool call: %w", err)
+		}
+	}
 	failAfterExecution := func(execErr error) (*Result, error) {
 		code := toolErrorCode(execErr)
-		result = &Result{Name: name, CallID: callID, Kind: OutcomeFailure, Code: code, Failure: failureFor(execErr)}
+		result = &Result{Name: name, CallID: callID, CallPresentation: callPresentation, Kind: OutcomeFailure, Code: code, Failure: failureFor(execErr)}
 		for _, hook := range postHooks {
 			if hookErr := hook(ctx, execution, result); hookErr != nil {
 				return result, fmt.Errorf("tool post-execute: %w", hookErr)
@@ -802,7 +897,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 		return failAfterExecution(err)
 	}
 
-	result = &Result{Name: name, CallID: callID, Kind: OutcomeSuccess, Canonical: canonical, ModelFacing: canonical, Continuation: ToolContinue}
+	result = &Result{Name: name, CallID: callID, CallPresentation: callPresentation, Kind: OutcomeSuccess, Canonical: canonical, ModelFacing: canonical, Continuation: ToolContinue}
 	if def.RenderModel != nil {
 		modelFacing, err := renderModel(def, args, canonical)
 		if err != nil {
@@ -811,8 +906,15 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 		result.ModelFacing = modelFacing
 	}
 	result.Content = renderedContent(result.ModelFacing)
-	if def.PresentUI != nil {
-		ui, err := presentUI(def, args, canonical)
+	if def.RenderContent != nil {
+		result.Content, err = def.RenderContent(append(json.RawMessage(nil), args...), canonical)
+		if err != nil {
+			return failAfterExecution(err)
+		}
+	}
+	presentResult := def.PresentResult
+	if presentResult != nil {
+		ui, err := presentResult(append(json.RawMessage(nil), args...), canonical)
 		if err != nil {
 			return failAfterExecution(err)
 		}
@@ -876,8 +978,9 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 					return nil, err
 				}
 			}
-			if def.PresentUI != nil {
-				result.UI, err = presentUI(def, args, replacement)
+			presentResult := def.PresentResult
+			if presentResult != nil {
+				result.UI, err = presentResult(append(json.RawMessage(nil), args...), replacement)
 				if err != nil {
 					return nil, err
 				}
@@ -886,6 +989,12 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			}
 			result.Meta = result.UI
 			result.Content = renderedContent(result.ModelFacing)
+			if def.RenderContent != nil {
+				result.Content, err = def.RenderContent(append(json.RawMessage(nil), args...), replacement)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 	}
 	if def.ResolveContinuation != nil {
@@ -897,6 +1006,12 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 		result.ResumeKey = resumeKey
 		result.WaitingReason = waitingReason
 		result.ConcludesTurn = continuation == ToolConclude
+	}
+	if continuation, resumeKey, waitingReason, concludes := ec.directive(); concludes || continuation != ToolContinue {
+		result.Continuation = continuation
+		result.ResumeKey = resumeKey
+		result.WaitingReason = waitingReason
+		result.ConcludesTurn = concludes || continuation == ToolConclude
 	}
 	if pipelineCtx.Err() == context.DeadlineExceeded && parentCtx.Err() == nil {
 		return nil, ErrToolTimeout
@@ -934,7 +1049,10 @@ func (r *Registry) snapshot() *Registry {
 	copy.beforeExecute = append([]BeforeExecuteHook(nil), r.beforeExecute...)
 	copy.postExecute = append([]PostHook(nil), r.postExecute...)
 	copy.policies = append([]Policy(nil), r.policies...)
+	copy.policyIDs = append([]uint64(nil), r.policyIDs...)
 	copy.guards = append([]Guard(nil), r.guards...)
+	copy.guardIDs = append([]uint64(nil), r.guardIDs...)
+	copy.nextRegistrationID = r.nextRegistrationID
 	copy.postPolicies = append([]PostPolicy(nil), r.postPolicies...)
 	copy.observers = append([]Observer(nil), r.observers...)
 	return copy
@@ -945,13 +1063,6 @@ func renderModel(def *Definition, args json.RawMessage, canonical any) (any, err
 		return def.RenderModel(append(json.RawMessage(nil), args...), canonical)
 	}
 	return canonical, nil
-}
-
-func presentUI(def *Definition, args json.RawMessage, canonical any) (map[string]any, error) {
-	if def.PresentUI != nil {
-		return def.PresentUI(append(json.RawMessage(nil), args...), canonical)
-	}
-	return nil, nil
 }
 
 func applyContentReplacement(result *Result, content any) error {
@@ -982,7 +1093,7 @@ func restoreFinalizerState(result, before *Result) {
 	result.Content = content
 }
 
-func bindApprovalLease(approval ApprovalService, ec ExecContext) {
+func bindApprovalLease(approval ApprovalService, ec ToolRunContext) {
 	if ec.Lease == nil {
 		return
 	}
@@ -1010,6 +1121,7 @@ func cloneDefinition(def *Definition) *Definition {
 		return nil
 	}
 	clone := *def
+	clone.Guidance = append([]PromptSection(nil), def.Guidance...)
 	clone.InputSchema = canonicalSchema(def.InputSchema)
 	clone.OutputSchema = canonicalSchema(def.OutputSchema)
 	clone.typedInputSchema = canonicalSchema(def.typedInputSchema)

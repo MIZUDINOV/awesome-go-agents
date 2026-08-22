@@ -14,7 +14,7 @@ import (
 // implement it, so an Agent can receive an isolated visible tool view.
 type Runtime interface {
 	ModelTools() []*llm.ToolDefinition
-	RunBatch(context.Context, ExecContext, []Call) []Outcome
+	RunBatch(context.Context, ToolRunContext, []Call) []Outcome
 }
 
 // Catalog is the consumer-facing scoped authoring seam.
@@ -115,6 +115,26 @@ func (s *Scope) Restrict(names []string) error {
 	return nil
 }
 
+// RestrictHandle installs an allow mask and restores the previous mask when
+// the returned handle is disposed.
+func (s *Scope) RestrictHandle(names []string) (*Registration, error) {
+	s.mu.RLock()
+	previous := make(map[string]struct{}, len(s.allow))
+	for name := range s.allow {
+		previous[name] = struct{}{}
+	}
+	s.mu.RUnlock()
+	if err := s.Restrict(names); err != nil {
+		return nil, err
+	}
+	return newRegistration(func() error {
+		s.mu.Lock()
+		s.allow = previous
+		s.mu.Unlock()
+		return nil
+	}), nil
+}
+
 func (s *Scope) Deny(names ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -124,6 +144,23 @@ func (s *Scope) Deny(names ...string) {
 	for _, name := range names {
 		s.deny[name] = struct{}{}
 	}
+}
+
+// DenyHandle adds a deny mask and restores the previous mask on disposal.
+func (s *Scope) DenyHandle(names ...string) *Registration {
+	s.mu.RLock()
+	previous := make(map[string]struct{}, len(s.deny))
+	for name := range s.deny {
+		previous[name] = struct{}{}
+	}
+	s.mu.RUnlock()
+	s.Deny(names...)
+	return newRegistration(func() error {
+		s.mu.Lock()
+		s.deny = previous
+		s.mu.Unlock()
+		return nil
+	})
 }
 
 func (s *Scope) visibleInherited(name string) bool {
@@ -181,7 +218,35 @@ func (s *Scope) ModelTools() []*llm.ToolDefinition {
 	return out
 }
 
-func (s *Scope) Run(ctx context.Context, ec ExecContext, name, callID string, input json.RawMessage) (*Result, error) {
+// GuidanceSections returns guidance only for the currently visible catalog.
+func (s *Scope) GuidanceSections() []PromptSection {
+	combined := s.executionRegistry()
+	localNames := s.localNames()
+	visible := make(map[string]struct{})
+	for _, tool := range s.ModelTools() {
+		visible[tool.Name] = struct{}{}
+	}
+	sections := make([]PromptSection, 0)
+	for name := range visible {
+		definition, ok := combined.Get(name)
+		if !ok {
+			continue
+		}
+		if _, local := localNames[name]; !local && !isReservedCodeModeTool(name) && !s.visibleInherited(name) {
+			continue
+		}
+		sections = append(sections, definition.Guidance...)
+	}
+	sort.SliceStable(sections, func(i, j int) bool {
+		if sections[i].Title == sections[j].Title {
+			return sections[i].Content < sections[j].Content
+		}
+		return sections[i].Title < sections[j].Title
+	})
+	return sections
+}
+
+func (s *Scope) Run(ctx context.Context, ec ToolRunContext, name, callID string, input json.RawMessage) (*Result, error) {
 	if _, ok := s.localDefinition(name); ok {
 		ec.Runtime = s
 		return s.executionRegistry().run(ctx, ec, name, callID, input, s.currentApprovalValue())
@@ -206,31 +271,10 @@ func (s *Scope) currentApprovalValue() ApprovalService {
 	return nil
 }
 
-func (s *Scope) RunBatch(ctx context.Context, ec ExecContext, calls []Call) []Outcome {
-	out := make([]Outcome, len(calls))
-	for i, call := range calls {
-		out[i].Call = call
-	}
-	// Keep the same barrier semantics as the root registry. A scoped call is
-	// parallel-safe only when its currently visible definition explicitly opts
-	// in; an exclusive call fences both neighbouring parallel batches.
-	for start := 0; start < len(calls); {
-		if !s.executionMode(calls[start].Name, calls[start].Input) {
-			out[start].Result, out[start].Err = s.Run(ctx, ec, calls[start].Name, calls[start].CallID, calls[start].Input)
-			start++
-			continue
-		}
-		end := start + 1
-		for end < len(calls) && s.executionMode(calls[end].Name, calls[end].Input) {
-			end++
-		}
-		runBatchPool(s.maxParallel(), end-start, func(offset int) {
-			index := start + offset
-			out[index].Result, out[index].Err = s.Run(ctx, ec, calls[index].Name, calls[index].CallID, calls[index].Input)
-		})
-		start = end
-	}
-	return out
+func (s *Scope) RunBatch(ctx context.Context, ec ToolRunContext, calls []Call) []Outcome {
+	return runRollingBatch(ctx, s.maxParallel(), calls,
+		func(call Call) bool { return s.executionMode(call.Name, call.Input) },
+		func(call Call) (*Result, error) { return s.Run(ctx, ec, call.Name, call.CallID, call.Input) })
 }
 
 func (s *Scope) executionMode(name string, input json.RawMessage) bool {

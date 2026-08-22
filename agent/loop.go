@@ -128,7 +128,7 @@ type Config struct {
 	Compactor        Compactor
 	Policy           RunPolicy
 
-	// Vars are merged into every tool ExecContext (host bindings such as the
+	// Vars are merged into every tool ToolRunContext (host bindings such as the
 	// sandbox working directory under "cwd").
 	Vars map[string]any
 	// Sandbox is the host-bound admission authority for this claimed run.
@@ -503,7 +503,7 @@ func (l *Loop) ResumeDeferredTools(ctx context.Context, requests []DeferredToolR
 		}); err != nil {
 			return err
 		}
-		outcomes := l.Tools.RunBatch(ctx, tools.ExecContext{
+		outcomes := l.Tools.RunBatch(ctx, tools.ToolRunContext{
 			SessionID: l.SessionID, RunID: deferred.RunID, TurnID: deferred.TurnID, StepID: deferred.StepID,
 			CallID: request.CallID, Vars: mergeVars(l.Config.Vars), Sandbox: l.Config.Sandbox,
 			Artifacts: l.Config.Artifacts, Lease: &lease,
@@ -725,7 +725,7 @@ func (l *Loop) ResumeApprovedTool(ctx context.Context, request tools.ApprovalReq
 			return l.append(dispatchCtx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: runID, TurnID: turnID, StepID: stepID, CallID: callID, Type: session.EventToolRunning, Data: strJSON("running")})
 		}
 		calls := []tools.Call{{Name: request.ToolName, CallID: request.CallID, Input: append(json.RawMessage(nil), request.Arguments...)}}
-		outcomes := l.Tools.RunBatch(resumeCtx, tools.ExecContext{SessionID: l.SessionID, RunID: runID, TurnID: turnID, StepID: stepID, Vars: mergeVars(l.Config.Vars), Sandbox: l.Config.Sandbox, Artifacts: l.Config.Artifacts, Lease: &lease, OnDispatch: onDispatch}, calls)
+		outcomes := l.Tools.RunBatch(resumeCtx, tools.ToolRunContext{SessionID: l.SessionID, RunID: runID, TurnID: turnID, StepID: stepID, Vars: mergeVars(l.Config.Vars), Sandbox: l.Config.Sandbox, Artifacts: l.Config.Artifacts, Lease: &lease, OnDispatch: onDispatch}, calls)
 		if err := validateToolOutcomes(calls, outcomes); err != nil {
 			return err
 		}
@@ -1375,7 +1375,7 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 		}
 		return l.append(dispatchCtx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: callID, Type: session.EventToolRunning, Data: strJSON("running")})
 	}
-	outcomes := l.Tools.RunBatch(ctx, tools.ExecContext{SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Vars: ecVars, Sandbox: cfg.Sandbox, Artifacts: cfg.Artifacts, Lease: &lease, OnDispatch: onDispatch}, batch)
+	outcomes := l.Tools.RunBatch(ctx, tools.ToolRunContext{SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Vars: ecVars, Sandbox: cfg.Sandbox, Artifacts: cfg.Artifacts, Lease: &lease, OnDispatch: onDispatch}, batch)
 	if err := validateToolOutcomes(batch, outcomes); err != nil {
 		return false, "", err
 	}

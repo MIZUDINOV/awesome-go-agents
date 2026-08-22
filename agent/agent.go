@@ -40,7 +40,7 @@ type Agent interface {
 	Session() SessionView
 	ToolScope() tools.Runtime
 	ToolCatalog() tools.Catalog
-	ScopedContext() tools.ExecContext
+	ScopedContext() tools.ToolRunContext
 	Status() AgentStatus
 	FollowUp(ctx context.Context, text string) error
 	Send(ctx context.Context, text string) error
@@ -280,8 +280,8 @@ func (h *Handle) ToolCatalog() tools.Catalog {
 	}
 	return nil
 }
-func (h *Handle) ScopedContext() tools.ExecContext {
-	return tools.ExecContext{SessionID: h.ID(), Vars: cloneVars(h.loop.Config.Vars), Sandbox: h.loop.Config.Sandbox, Artifacts: h.loop.Config.Artifacts, Runtime: h.loop.Tools}
+func (h *Handle) ScopedContext() tools.ToolRunContext {
+	return tools.ToolRunContext{SessionID: h.ID(), Vars: cloneVars(h.loop.Config.Vars), Sandbox: h.loop.Config.Sandbox, Artifacts: h.loop.Config.Artifacts, Runtime: h.loop.Tools}
 }
 
 func cloneVars(vars map[string]any) map[string]any {

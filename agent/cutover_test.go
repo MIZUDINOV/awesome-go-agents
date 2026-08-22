@@ -63,7 +63,7 @@ func TestDeferredToolCanResumeThroughAgentAPI(t *testing.T) {
 		ResolveContinuation: func(_ json.RawMessage, _ any) (tools.ToolContinuation, string, string, error) {
 			return tools.ToolDeferred, "worker-result-1", "workspace", nil
 		},
-		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+		Execute: func(context.Context, tools.ToolRunContext, json.RawMessage) (any, error) {
 			return map[string]any{"accepted": true}, nil
 		},
 	})
@@ -99,7 +99,7 @@ func TestDeferredToolResumesOriginalCallWithoutNewTurn(t *testing.T) {
 	executions := 0
 	registry.MustRegister(&tools.Definition{
 		Name: "lazy", Description: "lazy", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: tools.AnyOutputSchema,
-		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+		Execute: func(context.Context, tools.ToolRunContext, json.RawMessage) (any, error) {
 			executions++
 			return map[string]any{"execution": executions}, nil
 		},
@@ -183,7 +183,7 @@ func TestResumeStartedRecoveryDoesNotReexecuteTool(t *testing.T) {
 	registry := tools.New(tools.Options{})
 	registry.MustRegister(&tools.Definition{
 		Name: "side_effect", Description: "side effect", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: tools.AnyOutputSchema,
-		Execute: func(context.Context, tools.ExecContext, json.RawMessage) (any, error) {
+		Execute: func(context.Context, tools.ToolRunContext, json.RawMessage) (any, error) {
 			executions++
 			return map[string]any{"ok": true}, nil
 		},
