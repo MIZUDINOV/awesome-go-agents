@@ -27,6 +27,25 @@ const (
 // ToolExecutionResult is the explicit public name for Result.
 type ToolExecutionResult = Result
 
+// NewDeferredResult creates an explicit host-owned continuation without
+// pretending that the registered tool body produced its canonical output.
+// The registry validates the identity and lifecycle fields before returning it.
+func NewDeferredResult(name, callID string, modelFacing any, ui map[string]any, resumeKey, waitingReason string) *Result {
+	return &Result{
+		Name:          name,
+		CallID:        callID,
+		Kind:          OutcomeSuccess,
+		ModelFacing:   modelFacing,
+		UI:            ui,
+		Meta:          ui,
+		Content:       renderedContent(modelFacing),
+		Continuation:  ToolDeferred,
+		ResumeKey:     resumeKey,
+		WaitingReason: waitingReason,
+		ConcludesTurn: false,
+	}
+}
+
 // Sentinel errors returned by the registry / pipeline.
 var (
 	ErrToolNotFound      = errors.New("tool not found")
@@ -49,9 +68,69 @@ type Failure struct {
 	Meta    map[string]any `json:"meta,omitempty"`
 }
 
+// FailureError lets a host preserve a safe, structured tool failure while
+// keeping the executor free to return an ordinary error. The registry copies
+// the metadata into the immutable Result.Failure value.
+type FailureError struct {
+	Code    string
+	Message string
+	Meta    map[string]any
+}
+
+func (e *FailureError) Error() string {
+	if e == nil || e.Message == "" {
+		return "tool failed"
+	}
+	return e.Message
+}
+
+// NewFailureError creates a host-facing structured failure error. Metadata is
+// copied so the caller cannot mutate a result after returning it.
+func NewFailureError(code, message string, meta map[string]any) error {
+	copyMeta := make(map[string]any, len(meta))
+	for key, value := range meta {
+		copyMeta[key] = value
+	}
+	return &FailureError{Code: code, Message: message, Meta: copyMeta}
+}
+
+func failureFor(err error) *Failure {
+	if structured := structuredFailure(err); structured != nil {
+		meta := make(map[string]any, len(structured.Meta))
+		for key, value := range structured.Meta {
+			meta[key] = value
+		}
+		code := structured.Code
+		if code == "" {
+			code = toolErrorCode(err)
+		}
+		message := structured.Message
+		if message == "" {
+			message = failureMessage(err)
+		}
+		return &Failure{Code: code, Message: message, Meta: meta}
+	}
+	code := toolErrorCode(err)
+	return &Failure{Code: code, Message: failureMessage(err)}
+}
+
+func structuredFailure(err error) *FailureError {
+	if err == nil {
+		return nil
+	}
+	var structured *FailureError
+	if errors.As(err, &structured) {
+		return structured
+	}
+	return nil
+}
+
 func toolErrorCode(err error) string {
 	if err == nil {
 		return ""
+	}
+	if structured := structuredFailure(err); structured != nil && structured.Code != "" {
+		return structured.Code
 	}
 	var denial *integration.Denial
 	if errors.As(err, &denial) && denial.Code != "" {

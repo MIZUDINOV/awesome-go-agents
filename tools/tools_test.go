@@ -492,6 +492,71 @@ func TestPostExecuteReceivesFailureOutcome(t *testing.T) {
 	}
 }
 
+func TestBeforeExecuteShortCircuitPreservesDefinition(t *testing.T) {
+	registry := New(Options{})
+	executed, dispatched, finalized, observed := false, false, false, false
+	definition := &Definition{
+		Name: "workspace_read", InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema,
+		Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) {
+			executed = true
+			return map[string]any{"ok": true}, nil
+		},
+		FinalizeContent: func(*Result) error { finalized = true; return nil },
+	}
+	inputSchema := append(json.RawMessage(nil), definition.InputSchema...)
+	outputSchema := append(json.RawMessage(nil), definition.OutputSchema...)
+	if err := registry.Register(definition); err != nil {
+		t.Fatal(err)
+	}
+	registry.AddBeforeExecute(func(_ context.Context, ec ExecContext, execution Execution) (BeforeExecuteDecision, *Result, error) {
+		if ec.CallID != "call-1" || execution.CallID != "call-1" {
+			t.Fatalf("call identity not propagated: ec=%+v execution=%+v", ec, execution)
+		}
+		return BeforeExecuteShortCircuit, NewDeferredResult(
+			execution.Name, execution.CallID, "Workspace is activating", map[string]any{"status": "waiting"}, "resume-1", "workspace_activation",
+		), nil
+	})
+	registry.AddObserver(func(_ context.Context, result *Result) { observed = result.Frozen })
+	result, err := registry.Run(context.Background(), ExecContext{OnDispatch: func(context.Context, string, string) error { dispatched = true; return nil }}, "workspace_read", "call-1", []byte(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executed || dispatched || finalized || !observed {
+		t.Fatalf("short-circuit side effects executed=%v dispatched=%v finalized=%v observed=%v", executed, dispatched, finalized, observed)
+	}
+	if result.Name != "workspace_read" || result.CallID != "call-1" || result.Continuation != ToolDeferred || result.ResumeKey != "resume-1" || result.Canonical != nil || !result.Frozen {
+		t.Fatalf("unexpected deferred result: %+v", result)
+	}
+	registered, ok := registry.Get("workspace_read")
+	if !ok || string(registered.InputSchema) != string(inputSchema) || string(registered.OutputSchema) != string(outputSchema) {
+		t.Fatalf("definition schemas changed: %+v", registered)
+	}
+}
+
+func TestBeforeExecuteContinueRunsDefinitionAndScopeCopiesHook(t *testing.T) {
+	root := New(Options{})
+	before := 0
+	root.AddBeforeExecute(func(_ context.Context, _ ExecContext, _ Execution) (BeforeExecuteDecision, *Result, error) {
+		before++
+		return BeforeExecuteContinue, nil, nil
+	})
+	root.MustRegister(&Definition{
+		Name: "root_tool", InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema,
+		Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) { return "root", nil },
+	})
+	scope := root.NewScope()
+	if err := scope.Register(&Definition{
+		Name: "local_tool", InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema,
+		Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) { return "local", nil },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := scope.Run(context.Background(), ExecContext{}, "local_tool", "call-2", []byte(`{}`))
+	if err != nil || result.Canonical != "local" || before != 1 {
+		t.Fatalf("scope before hook result=%+v err=%v before=%d", result, err, before)
+	}
+}
+
 func TestCancellationBeforeDispatchIsClassified(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -584,6 +649,28 @@ func TestFinalizerDoesNotReplaceExecutionError(t *testing.T) {
 	}
 	if result == nil || result.Code != "TOOL_FAILED" || result.Kind != OutcomeFailure || result.ModelFacing != "partial" {
 		t.Fatalf("finalizer replaced execution failure: %+v", result)
+	}
+}
+
+func TestStructuredFailurePreservesHostCodeAndMetadata(t *testing.T) {
+	registry := New(Options{})
+	if err := registry.Register(&Definition{
+		Name: "structured_failure", InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema,
+		Execute: func(context.Context, ExecContext, json.RawMessage) (any, error) {
+			return nil, NewFailureError("workspace_unavailable", "workspace is not ready", map[string]any{"retryable": true, "retry_hint": "wait"})
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	result, err := registry.Run(context.Background(), ExecContext{}, "structured_failure", "c1", []byte(`{}`))
+	if err == nil || result == nil || result.Failure == nil {
+		t.Fatalf("structured failure result=%+v err=%v", result, err)
+	}
+	if result.Code != "workspace_unavailable" || result.Failure.Code != "workspace_unavailable" || result.Failure.Message != "workspace is not ready" {
+		t.Fatalf("structured failure=%+v", result.Failure)
+	}
+	if result.Failure.Meta["retryable"] != true || result.Failure.Meta["retry_hint"] != "wait" {
+		t.Fatalf("structured failure metadata=%+v", result.Failure.Meta)
 	}
 }
 

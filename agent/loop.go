@@ -95,9 +95,10 @@ type Compactor interface {
 
 // Config controls the loop.
 type Config struct {
-	Model        string
-	Owner        string
-	SystemPrompt string
+	Model         string
+	Owner         string
+	SystemPrompt  string
+	PromptVersion string
 
 	MaxStepsPerTurn   int
 	MaxToolCalls      int
@@ -1248,6 +1249,10 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 	resp, err := l.Chat.Generate(ctx, req, callback)
 	if err != nil {
 		streamStarted := streamedText.Len() > 0 || streamedReasoning.Len() > 0 || len(streamedCalls) > 0 || len(streamedMedia) > 0
+		var providerErr *llm.Error
+		if errors.As(err, &providerErr) && providerErr.StreamStarted {
+			streamStarted = true
+		}
 		if streamStarted {
 			calls := make([]session.ToolCall, 0, len(streamedCallOrder))
 			for _, callID := range streamedCallOrder {
@@ -1263,7 +1268,7 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 			}
 		}
 		code := modelErrorCode(err)
-		if appendErr := l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventRequestError, Data: session.RequestErrorPayloadWithRetryable(code, err.Error(), streamStarted, llm.IsRetryable(err))}); appendErr != nil {
+		if appendErr := l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventRequestError, Data: session.RequestErrorPayloadWithMetadata(code, err.Error(), streamStarted, llm.IsRetryable(err), requestMetadataFromError(err))}); appendErr != nil {
 			return false, "", appendErr
 		}
 		return false, "", err
@@ -1686,7 +1691,6 @@ func (l *Loop) appendRequestHeader(ctx context.Context, lease session.Lease, em 
 			return fmt.Errorf("resolve provider request snapshot: %w", err)
 		}
 	}
-	requestHash := fmt.Sprintf("%x", sha256.Sum256(requestSnapshot))
 	systemSections := make([]string, 0, len(req.System))
 	for _, message := range req.System {
 		for _, part := range message.Parts {
@@ -1695,12 +1699,29 @@ func (l *Loop) appendRequestHeader(ctx context.Context, lease session.Lease, em 
 			}
 		}
 	}
+	promptHash := fmt.Sprintf("%x", sha256.Sum256([]byte(strings.Join(systemSections, ""))))
+	toolsBytes, err := json.Marshal(req.Tools)
+	if err != nil {
+		return fmt.Errorf("encode tool schemas: %w", err)
+	}
+	toolsHash := fmt.Sprintf("%x", sha256.Sum256(toolsBytes))
+	requestHash := fmt.Sprintf("%x", sha256.Sum256(requestSnapshot))
+	metadata := session.RequestHeaderMetadata{PromptVersion: l.Config.PromptVersion, PromptHash: promptHash, ToolsHash: toolsHash}
 	if req.Capabilities != nil {
-		data := session.RequestHeaderPayloadWithSnapshot(req.Model, l.Chat.Name(), systemSections, toolSchemas, configHash, requestHash, []llm.Capabilities{*req.Capabilities}, requestSnapshot)
+		data := session.RequestHeaderPayloadWithSnapshotAndMetadata(req.Model, l.Chat.Name(), systemSections, toolSchemas, configHash, requestHash, []llm.Capabilities{*req.Capabilities}, metadata, requestSnapshot)
 		return l.append(ctx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventRequestHeader, Data: data})
 	}
-	data := session.RequestHeaderPayloadWithSnapshot(req.Model, l.Chat.Name(), systemSections, toolSchemas, configHash, requestHash, nil, requestSnapshot)
+	data := session.RequestHeaderPayloadWithSnapshotAndMetadata(req.Model, l.Chat.Name(), systemSections, toolSchemas, configHash, requestHash, nil, metadata, requestSnapshot)
 	return l.append(ctx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventRequestHeader, Data: data})
+}
+
+func requestMetadataFromError(err error) *llm.RequestMetadata {
+	var providerErr *llm.Error
+	if !errors.As(err, &providerErr) || providerErr.Metadata == nil {
+		return nil
+	}
+	metadata := *providerErr.Metadata
+	return &metadata
 }
 
 func (l *Loop) appendUsage(ctx context.Context, lease session.Lease, em *emitter, turnID, stepID string, resp *llm.Response) error {

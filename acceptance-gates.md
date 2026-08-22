@@ -37,7 +37,7 @@ go test -tags integration ./internal/projectchat/... -count=1
 | Surface reconstruction | `session.Surface.Project` folds compaction and validates tool/result pairing (H-SURFACE-008) | `session/surface_test.go`, `agent/e2e_test.go` (scenario C) |
 | Host-owned single-writer/durability | Wzhooh `chat_runs` lease/fence and `chat_events` ledger; AgentKit receives the host `FencedStore` adapter | `wzhooh-back/internal/projectchat` integration/contract tests |
 | tool/call before side-effect | Loop persists `EventToolCall` BEFORE executing the executor; `Recover` marks any call without a result `TOOL_OUTCOME_UNKNOWN` (no blind retry) | `agent/e2e_test.go` (scenario G) |
-| read-before-edit + CAS | `LocalFileSystem` observation registry + content-hash version CAS (`ErrStaleVersion`/`ErrNotObserved`) | `integration/local/local_test.go`, `tools/core/core_test.go`, `agent/e2e_test.go` (scenarios A, B) |
+| read-before-edit + CAS | host-owned file tool + `LocalFileSystem` observation registry + content-hash version CAS (`ErrStaleVersion`/`ErrNotObserved`) | Wzhooh host-tool tests and `integration/local/local_test.go` |
 | sandbox containment | `LocalSandbox` same boundary for file and command admission; stable `SANDBOX_DENIED_*` codes; never suggests a bash bypass | `integration/local/local_test.go`, `agent/e2e_test.go` (scenario I) |
 | crash recovery | `FencedStore.Recover` (turn close + `TOOL_OUTCOME_UNKNOWN`), run by the loop before any new work | `agent/agent_test.go`, `wzhooh-back/internal/projectchat` host-store tests |
 | context overflow/compaction integrity | `preflight` prune->compact->bounded retry; durable `compaction/start -> summary -> user/message(surface_op=replace) -> end` + ledger checkpoint | `agent/agent_test.go`, `agent/e2e_test.go` (scenarios E, F) |
@@ -52,9 +52,9 @@ go test -tags integration ./internal/projectchat/... -count=1
 - **≥90% P1 core points** — loop, session, surface, fenced store, compaction,
   sandbox, CAS, recovery, pruner, typed definitions, `oneOf`, and ordered
   bounded scheduling implemented with sentinels and deterministic schemas.
-- **core tools have typed schemas and contract tests** — `tools/core` input and
-  output schemas are generated from the typed `DefineTool[I,O]` contracts and
-  exercised by `tools/core/core_test.go` and the parity suite
+- **host tools have typed schemas and contract tests** — backend-owned input and
+  output schemas are generated from typed `DefineTool[I,O]` contracts; AgentKit
+  itself tests only the generic registration and execution runtime
   `wzhooh-back/internal/projectchat/agentkit_e2b_test.go`.
 - **Host replay and durable projection** — Wzhooh's host adapter owns the
   canonical `chat_events` ledger and public projection; AgentKit's in-memory

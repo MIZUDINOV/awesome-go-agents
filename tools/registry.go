@@ -50,6 +50,7 @@ type Registry struct {
 	mu              sync.RWMutex
 	definitions     map[string]*Definition
 	preExecute      []Hook
+	beforeExecute   []BeforeExecuteHook
 	postExecute     []PostHook
 	defaultTimeout  time.Duration
 	sem             chan struct{}
@@ -333,22 +334,42 @@ func (r *Registry) MustRegister(def *Definition) {
 // AddPreExecute / AddPostExecute append pipeline hooks. Safe to call while
 // runs are in flight: runs operate on a snapshot taken at dispatch time.
 func (r *Registry) AddPreExecute(hook Hook) {
+	if hook == nil {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.preExecute = append(r.preExecute, hook)
 }
+
+// AddBeforeExecute appends an explicit pre-dispatch decision hook. Hooks are
+// snapshotted per execution and may return a deferred result without invoking
+// the definition body.
+func (r *Registry) AddBeforeExecute(hook BeforeExecuteHook) {
+	if hook == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.beforeExecute = append(r.beforeExecute, hook)
+}
+
 func (r *Registry) AddPostExecute(hook PostHook) {
+	if hook == nil {
+		return
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.postExecute = append(r.postExecute, hook)
 }
 
-func (r *Registry) snapshotHooks() (pre []Hook, post []PostHook) {
+func (r *Registry) snapshotHooks() (pre []Hook, before []BeforeExecuteHook, post []PostHook) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	pre = append([]Hook(nil), r.preExecute...)
+	before = append([]BeforeExecuteHook(nil), r.beforeExecute...)
 	post = append([]PostHook(nil), r.postExecute...)
-	return pre, post
+	return pre, before, post
 }
 
 // Get returns a registered tool.
@@ -506,6 +527,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 		ec.Runtime = r
 	}
 	parentCtx := ctx
+	shortCircuited := false
 	timeout := def.Timeout
 	if timeout <= 0 {
 		timeout = r.defaultTimeout
@@ -529,11 +551,11 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			result.WaitingReason = ""
 			result.ConcludesTurn = false
 			result.Code = code
-			result.Failure = &Failure{Code: code, Message: failureMessage(retErr)}
+			result.Failure = failureFor(retErr)
 		}
 		if result == nil && retErr != nil {
 			code := toolErrorCode(retErr)
-			result = &Result{Name: name, CallID: callID, Kind: OutcomeFailure, Code: code, Failure: &Failure{Code: code, Message: failureMessage(retErr)}}
+			result = &Result{Name: name, CallID: callID, Kind: OutcomeFailure, Code: code, Failure: failureFor(retErr)}
 		}
 		if result == nil {
 			return
@@ -548,7 +570,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 		result = frozen
 	}()
 	defer func() {
-		if def.FinalizeContent == nil {
+		if shortCircuited || def.FinalizeContent == nil {
 			return
 		}
 		if retErr != nil && result != nil && result.Kind != OutcomeFailure {
@@ -565,11 +587,11 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			result.WaitingReason = ""
 			result.ConcludesTurn = false
 			result.Code = code
-			result.Failure = &Failure{Code: code, Message: failureMessage(retErr)}
+			result.Failure = failureFor(retErr)
 		}
 		if result == nil {
 			code := toolErrorCode(retErr)
-			result = &Result{Name: name, CallID: callID, Kind: OutcomeFailure, Code: code, Failure: &Failure{Code: code, Message: failureMessage(retErr)}}
+			result = &Result{Name: name, CallID: callID, Kind: OutcomeFailure, Code: code, Failure: failureFor(retErr)}
 		}
 		beforeFinalize := result.Freeze()
 		var finalizeErr error
@@ -614,7 +636,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 			result.WaitingReason = ""
 			result.ConcludesTurn = false
 			result.Code = code
-			result.Failure = &Failure{Code: code, Message: failureMessage(retErr)}
+			result.Failure = failureFor(retErr)
 		}
 		result = result.Freeze()
 	}()
@@ -641,11 +663,11 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 				result.WaitingReason = ""
 				result.ConcludesTurn = false
 				result.Code = "TOOL_PANIC"
-				result.Failure = &Failure{Code: result.Code, Message: failureMessage(retErr)}
+				result.Failure = failureFor(retErr)
 			}
 		}
 	}()
-	preHooks, postHooks := r.snapshotHooks()
+	preHooks, beforeHooks, postHooks := r.snapshotHooks()
 	policies, guards, postPolicies := r.snapshotPolicies()
 	dispatchStarted := false
 	defer func() {
@@ -675,7 +697,7 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 	execution := Execution{SessionID: ec.SessionID, RunID: ec.RunID, TurnID: ec.TurnID, StepID: ec.StepID, CallID: callID, Name: name, Arguments: append(json.RawMessage(nil), args...), Mutates: def.MutatesWorkspace}
 	failAfterExecution := func(execErr error) (*Result, error) {
 		code := toolErrorCode(execErr)
-		result = &Result{Name: name, CallID: callID, Kind: OutcomeFailure, Code: code, Failure: &Failure{Code: code, Message: failureMessage(execErr)}}
+		result = &Result{Name: name, CallID: callID, Kind: OutcomeFailure, Code: code, Failure: failureFor(execErr)}
 		for _, hook := range postHooks {
 			if hookErr := hook(ctx, execution, result); hookErr != nil {
 				return result, fmt.Errorf("tool post-execute: %w", hookErr)
@@ -734,6 +756,27 @@ func (r *Registry) run(ctx context.Context, ec ExecContext, name, callID string,
 	for _, hook := range preHooks {
 		if err := hook(ctx, name, args); err != nil {
 			return nil, err
+		}
+	}
+	for _, hook := range beforeHooks {
+		decision, shortResult, err := hook(ctx, ec, execution)
+		if err != nil {
+			return nil, fmt.Errorf("tool before-execute: %w", err)
+		}
+		switch decision {
+		case BeforeExecuteContinue:
+			if shortResult != nil {
+				return nil, ErrInvalidBeforeExecuteResult
+			}
+		case BeforeExecuteShortCircuit:
+			if err := validateBeforeExecuteResult(shortResult, name, callID); err != nil {
+				return nil, err
+			}
+			shortCircuited = true
+			result = shortResult
+			return result, nil
+		default:
+			return nil, ErrInvalidBeforeExecuteResult
 		}
 	}
 	dispatchStarted = true
@@ -888,6 +931,7 @@ func (r *Registry) snapshot() *Registry {
 		copy.definitions[name] = cloneDefinition(definition)
 	}
 	copy.preExecute = append([]Hook(nil), r.preExecute...)
+	copy.beforeExecute = append([]BeforeExecuteHook(nil), r.beforeExecute...)
 	copy.postExecute = append([]PostHook(nil), r.postExecute...)
 	copy.policies = append([]Policy(nil), r.policies...)
 	copy.guards = append([]Guard(nil), r.guards...)

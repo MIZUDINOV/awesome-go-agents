@@ -36,6 +36,7 @@ type Error struct {
 	StatusCode    int
 	Retryable     bool
 	StreamStarted bool
+	Metadata      *RequestMetadata
 	// Cause preserves the provider's typed error before wrapping.
 	Cause error
 }

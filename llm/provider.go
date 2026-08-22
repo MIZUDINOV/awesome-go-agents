@@ -6,6 +6,14 @@ import (
 	"time"
 )
 
+// RequestMetadata contains provider-neutral correlation identifiers. Provider
+// adapters may populate it on errors when a response has already assigned IDs.
+type RequestMetadata struct {
+	Provider           string `json:"provider,omitempty"`
+	RequestID          string `json:"request_id,omitempty"`
+	ProviderResponseID string `json:"provider_response_id,omitempty"`
+}
+
 // ToolChoice controls how the model selects tools when Tools are present.
 type ToolChoice string
 

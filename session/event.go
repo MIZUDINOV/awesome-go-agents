@@ -580,14 +580,26 @@ func ToolResumeStartedPayload(callID, name, resumeKey string) json.RawMessage {
 // snapshot; otherwise it remains the provider-neutral request. It is durable
 // so the request context used by a step can be reconstructed on replay.
 func RequestHeaderPayload(model, provider string, system []string, tools []string, configHash, requestHash string, capabilities ...llm.Capabilities) json.RawMessage {
-	return requestHeaderPayload(model, provider, system, tools, configHash, requestHash, capabilities, nil)
+	return requestHeaderPayload(model, provider, system, tools, configHash, requestHash, capabilities, RequestHeaderMetadata{}, nil)
 }
 
 func RequestHeaderPayloadWithSnapshot(model, provider string, system []string, tools []string, configHash, requestHash string, capabilities []llm.Capabilities, requestSnapshot json.RawMessage) json.RawMessage {
-	return requestHeaderPayload(model, provider, system, tools, configHash, requestHash, capabilities, requestSnapshot)
+	return RequestHeaderPayloadWithSnapshotAndMetadata(model, provider, system, tools, configHash, requestHash, capabilities, RequestHeaderMetadata{}, requestSnapshot)
 }
 
-func requestHeaderPayload(model, provider string, system []string, tools []string, configHash, requestHash string, capabilities []llm.Capabilities, requestSnapshot json.RawMessage) json.RawMessage {
+// RequestHeaderMetadata records prompt provenance without changing provider
+// wire payloads.
+type RequestHeaderMetadata struct {
+	PromptVersion string `json:"prompt_version,omitempty"`
+	PromptHash    string `json:"prompt_hash,omitempty"`
+	ToolsHash     string `json:"tools_hash,omitempty"`
+}
+
+func RequestHeaderPayloadWithSnapshotAndMetadata(model, provider string, system []string, tools []string, configHash, requestHash string, capabilities []llm.Capabilities, metadata RequestHeaderMetadata, requestSnapshot json.RawMessage) json.RawMessage {
+	return requestHeaderPayload(model, provider, system, tools, configHash, requestHash, capabilities, metadata, requestSnapshot)
+}
+
+func requestHeaderPayload(model, provider string, system []string, tools []string, configHash, requestHash string, capabilities []llm.Capabilities, metadata RequestHeaderMetadata, requestSnapshot json.RawMessage) json.RawMessage {
 	payload := map[string]any{
 		"model": model, "provider": provider,
 		"system": system, "tools": tools,
@@ -595,6 +607,15 @@ func requestHeaderPayload(model, provider string, system []string, tools []strin
 	}
 	if len(capabilities) > 0 {
 		payload["capabilities"] = capabilities[0]
+	}
+	if metadata.PromptVersion != "" {
+		payload["prompt_version"] = metadata.PromptVersion
+	}
+	if metadata.PromptHash != "" {
+		payload["prompt_hash"] = metadata.PromptHash
+	}
+	if metadata.ToolsHash != "" {
+		payload["tools_hash"] = metadata.ToolsHash
 	}
 	if len(requestSnapshot) > 0 {
 		payload["request_snapshot"] = requestSnapshot
@@ -624,16 +645,34 @@ func RequestContextPayloadWithCapabilities(model string, contextWindow, maxOutpu
 // committed. It makes a failed step observable and replayable without
 // pretending that a model response was produced.
 func RequestErrorPayload(code, message string, streamStarted bool) json.RawMessage {
-	return RequestErrorPayloadWithRetryable(code, message, streamStarted, false)
+	return RequestErrorPayloadWithMetadata(code, message, streamStarted, false, nil)
 }
 
 // RequestErrorPayloadWithRetryable adds provider-neutral retryability without
 // exposing provider wire fields. The legacy helper remains available for
 // readers and callers that do not have a classified provider error.
 func RequestErrorPayloadWithRetryable(code, message string, streamStarted, retryable bool) json.RawMessage {
-	return mustJSON(map[string]any{
+	return RequestErrorPayloadWithMetadata(code, message, streamStarted, retryable, nil)
+}
+
+// RequestErrorPayloadWithMetadata preserves safe provider-neutral correlation
+// IDs without exposing provider wire fields.
+func RequestErrorPayloadWithMetadata(code, message string, streamStarted, retryable bool, metadata *llm.RequestMetadata) json.RawMessage {
+	payload := map[string]any{
 		"code": code, "message": message, "stream_started": streamStarted, "retryable": retryable,
-	})
+	}
+	if metadata != nil {
+		if metadata.Provider != "" {
+			payload["provider"] = metadata.Provider
+		}
+		if metadata.RequestID != "" {
+			payload["request_id"] = metadata.RequestID
+		}
+		if metadata.ProviderResponseID != "" {
+			payload["provider_response_id"] = metadata.ProviderResponseID
+		}
+	}
+	return mustJSON(payload)
 }
 
 // CompactionStartPayload opens a compaction transaction. generation increases

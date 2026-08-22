@@ -43,6 +43,15 @@ Wzhooh PostgreSQL rows and `chat_events` remain the canonical run and event
 ledger. A host adapter maps a claimed fenced run into these public AgentKit
 ports; it must not create a second `agentkit_*` history or lease.
 
+## Tool ownership
+
+AgentKit contains no product tool implementations. Hosts define concrete
+typed tools with `DefineTool[I,O]`, provide their adapters and side effects,
+and register those definitions in a `Registry`. AgentKit owns only the
+provider-neutral schema, validation, policy, execution pipeline, continuation,
+and observation machinery. Reference or test adapters belong outside the
+library's production tool surface.
+
 ## Acceptance
 
 `acceptance-gates.md` is the executable verification matrix. Exploratory
