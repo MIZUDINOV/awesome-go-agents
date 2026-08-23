@@ -287,6 +287,35 @@ func TestRunBatchRollingBarrierAndAbort(t *testing.T) {
 	}
 }
 
+func TestRunBatchStopsAfterTerminalTool(t *testing.T) {
+	registry := New(Options{MaxParallel: 2})
+	lateStarted := false
+	registry.MustRegister(&Definition{
+		Name: "ask", InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema, MutatesWorkspace: true,
+		Execute: func(context.Context, ToolRunContext, json.RawMessage) (any, error) {
+			return map[string]any{"questions": []any{}}, nil
+		},
+		ResolveContinuation: func(json.RawMessage, any) (ToolContinuation, string, string, error) {
+			return ToolConclude, "", "", nil
+		},
+	})
+	registry.MustRegister(&Definition{
+		Name: "late", InputSchema: OrObjectSchema, OutputSchema: AnyOutputSchema, MutatesWorkspace: true,
+		Execute: func(context.Context, ToolRunContext, json.RawMessage) (any, error) {
+			lateStarted = true
+			return "late", nil
+		},
+	})
+
+	outcomes := registry.RunBatch(context.Background(), ToolRunContext{}, []Call{
+		{Name: "ask", CallID: "questions", Input: []byte(`{}`)},
+		{Name: "late", CallID: "late", Input: []byte(`{}`)},
+	})
+	if lateStarted || len(outcomes) != 2 || !errors.Is(outcomes[1].Err, ErrAbortedBeforeDispatch) {
+		t.Fatalf("terminal batch outcomes=%#v late_started=%v", outcomes, lateStarted)
+	}
+}
+
 func TestZeroMaxParallelMeansUnlimited(t *testing.T) {
 	registry := New(Options{MaxParallel: 0})
 	started := make(chan struct{}, 2)

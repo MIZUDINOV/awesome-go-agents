@@ -82,14 +82,272 @@ func TestDeferredToolCanResumeThroughAgentAPI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var deferred, resumeStarted, result bool
+	var deferred, resumeStarted, result, deferredContent bool
 	for _, event := range events {
 		deferred = deferred || event.Type == session.EventToolDeferred
 		resumeStarted = resumeStarted || event.Type == session.EventToolResumeStarted && event.CallID == "call-1"
 		result = result || event.Type == session.EventToolResult && event.CallID == "call-1"
+		if event.Type == session.EventToolDeferred && event.CallID == "call-1" {
+			var payload struct {
+				Content json.RawMessage `json:"content"`
+			}
+			deferredContent = json.Unmarshal(event.Data, &payload) == nil && len(payload.Content) > 0
+		}
 	}
-	if !deferred || !resumeStarted || !result {
-		t.Fatalf("deferred=%v resume_started=%v result=%v, want durable resume barrier", deferred, resumeStarted, result)
+	if !deferred || !deferredContent || !resumeStarted || !result {
+		t.Fatalf("deferred=%v content=%v resume_started=%v result=%v, want durable resume barrier", deferred, deferredContent, resumeStarted, result)
+	}
+}
+
+func TestMaterializedDeferredResumeCanFinishAfterResumeBarrier(t *testing.T) {
+	store := session.NewMemoryStore()
+	ctx := context.Background()
+	lease, err := store.ClaimLease(ctx, "materialized-resume-session", "seed", time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.AppendFenced(ctx, lease, []session.Event{
+		{RunID: "run-1", TurnID: "turn-1", Type: session.EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", Type: session.EventStepStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolCall, ID: "call-1", Data: session.ToolCallPayload("call-1", "ask_questions", json.RawMessage(`{}`))},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolDeferred, Data: session.ToolDeferredPayload("ask_questions", "questions:call-1", "questions", json.RawMessage(`{"questions":[]}`), map[string]any{"status": "waiting"})},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolResumeStarted, Data: session.ToolResumeStartedPayloadWithMode("call-1", "ask_questions", "questions:call-1", true)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	loop := NewLoop("materialized-resume-session", store, tools.New(tools.Options{}), &scriptedProvider{steps: []scriptedStep{{text: "done", finish: llm.FinishReasonStop}}}, Config{Model: "m", Owner: "worker", SystemPrompt: "sys"})
+	if err := loop.ResumeMaterializedTool(ctx, ToolResume{
+		CallID: "call-1", ResumeKey: "questions:call-1",
+		Result: &tools.Result{CallID: "call-1", Name: "ask_questions", Canonical: map[string]any{"answers": []any{}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Load(ctx, "materialized-resume-session", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeStarted, results, unknown := 0, 0, false
+	for _, event := range events {
+		if event.Type == session.EventToolResumeStarted && event.CallID == "call-1" {
+			resumeStarted++
+		}
+		if event.Type != session.EventToolResult || event.CallID != "call-1" {
+			continue
+		}
+		results++
+		var payload struct {
+			Code string `json:"code"`
+		}
+		_ = json.Unmarshal(event.Data, &payload)
+		unknown = unknown || payload.Code == "TOOL_OUTCOME_UNKNOWN"
+	}
+	if resumeStarted != 1 || results != 1 || unknown {
+		t.Fatalf("resume_started=%d results=%d unknown=%v", resumeStarted, results, unknown)
+	}
+}
+
+func TestMaterializedDeferredResumeContinuesAfterResultCrash(t *testing.T) {
+	store := session.NewMemoryStore()
+	ctx := context.Background()
+	lease, err := store.ClaimLease(ctx, "materialized-result-crash", "seed", time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.AppendFenced(ctx, lease, []session.Event{
+		{RunID: "run-1", TurnID: "turn-1", Type: session.EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", Type: session.EventStepStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolCall, ID: "call-1", Data: session.ToolCallPayload("call-1", "ask_questions", json.RawMessage(`{}`))},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolDeferred, Data: session.ToolDeferredPayload("ask_questions", "questions:call-1", "questions", json.RawMessage(`{"questions":[]}`), map[string]any{"status": "waiting"})},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolResumeStarted, Data: session.ToolResumeStartedPayloadWithMode("call-1", "ask_questions", "questions:call-1", true)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolResult, Data: session.ToolResultStructuredPayloadWithContent("call-1", "ask_questions", json.RawMessage(`{"answers":[]}`), nil, "", false, nil, nil, false)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	chat := &scriptedProvider{steps: []scriptedStep{{text: "continued", finish: llm.FinishReasonStop}}}
+	loop := NewLoop("materialized-result-crash", store, tools.New(tools.Options{}), chat, Config{Model: "m", Owner: "worker", SystemPrompt: "sys"})
+	if err := loop.ResumeMaterializedTool(ctx, ToolResume{
+		CallID: "call-1", ResumeKey: "questions:call-1",
+		Result: &tools.Result{CallID: "call-1", Name: "ask_questions", Canonical: map[string]any{"answers": []any{}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.calls) != 1 {
+		t.Fatalf("provider calls = %d, want one continuation call", len(chat.calls))
+	}
+	events, err := store.Load(ctx, "materialized-result-crash", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeStarted, results, stepEnds := 0, 0, 0
+	for _, event := range events {
+		switch event.Type {
+		case session.EventToolResumeStarted:
+			if event.CallID == "call-1" {
+				resumeStarted++
+			}
+		case session.EventToolResult:
+			if event.CallID == "call-1" {
+				results++
+			}
+		case session.EventStepEnd:
+			if event.StepID == "step-1" {
+				stepEnds++
+			}
+		}
+	}
+	if resumeStarted != 1 || results != 1 || stepEnds != 1 {
+		t.Fatalf("resume_started=%d results=%d original_step_ends=%d", resumeStarted, results, stepEnds)
+	}
+}
+
+func TestToolResumeRetainsLegacyUnkeyedFieldShape(t *testing.T) {
+	request := ToolResume{"call-1", "resume-1", nil, nil}
+	if request.CallID != "call-1" || request.ResumeKey != "resume-1" {
+		t.Fatalf("legacy ToolResume fields changed: %+v", request)
+	}
+}
+
+func TestMaterializedDeferredFailureIsPersistedAsError(t *testing.T) {
+	store := session.NewMemoryStore()
+	ctx := context.Background()
+	lease, err := store.ClaimLease(ctx, "materialized-failure", "seed", time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.AppendFenced(ctx, lease, []session.Event{
+		{RunID: "run-1", TurnID: "turn-1", Type: session.EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", Type: session.EventStepStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolCall, ID: "call-1", Data: session.ToolCallPayload("call-1", "workspace", json.RawMessage(`{}`))},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolDeferred, Data: session.ToolDeferredPayload("workspace", "workspace:call-1", "workspace", nil, nil)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	loop := NewLoop("materialized-failure", store, tools.New(tools.Options{}), &scriptedProvider{steps: []scriptedStep{{text: "recovered", finish: llm.FinishReasonStop}}}, Config{Model: "m", Owner: "worker", SystemPrompt: "sys"})
+	if err := loop.ResumeMaterializedTool(ctx, ToolResume{
+		CallID: "call-1", ResumeKey: "workspace:call-1",
+		Result: &tools.Result{
+			CallID: "call-1", Name: "workspace", Code: "workspace_failed",
+			ModelFacing: map[string]any{"ok": false},
+			Failure:     &tools.Failure{Code: "workspace_failed", Message: "workspace failed"},
+		},
+		Err: errors.New("workspace failed"),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.Load(ctx, "materialized-failure", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range events {
+		if event.Type != session.EventToolResult || event.CallID != "call-1" {
+			continue
+		}
+		var payload struct {
+			IsError bool   `json:"is_error"`
+			Code    string `json:"code"`
+		}
+		if err := json.Unmarshal(event.Data, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if !payload.IsError || payload.Code != "workspace_failed" {
+			t.Fatalf("materialized failure payload = %+v", payload)
+		}
+		return
+	}
+	t.Fatal("materialized failure result was not persisted")
+}
+
+func TestMaterializedDeferredBatchResolvesEveryCallBeforeContinuing(t *testing.T) {
+	store := session.NewMemoryStore()
+	ctx := context.Background()
+	lease, err := store.ClaimLease(ctx, "materialized-failure-batch", "seed", time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := []session.ToolCall{
+		{CallID: "call-1", Name: "write", Arguments: json.RawMessage(`{"path":"a"}`)},
+		{CallID: "call-2", Name: "bash", Arguments: json.RawMessage(`{"command":"false"}`)},
+	}
+	_, err = store.AppendFenced(ctx, lease, []session.Event{
+		{RunID: "run-1", TurnID: "turn-1", Type: session.EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", Type: session.EventStepStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", Type: session.EventAssistantMessage, Data: session.AssistantContent("", "", calls)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolCall, ID: "call-1", Data: session.ToolCallPayload("call-1", "write", calls[0].Arguments)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolDeferred, Data: session.ToolDeferredPayload("write", "workspace:call-1", "workspace_activation", nil, nil)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-2", Type: session.EventToolCall, ID: "call-2", Data: session.ToolCallPayload("call-2", "bash", calls[1].Arguments)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-2", Type: session.EventToolDeferred, Data: session.ToolDeferredPayload("bash", "workspace:call-2", "workspace_activation", nil, nil)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	chat := &scriptedProvider{steps: []scriptedStep{{text: "recovered", finish: llm.FinishReasonStop}}}
+	loop := NewLoop("materialized-failure-batch", store, tools.New(tools.Options{}), chat, Config{Model: "m", Owner: "worker", SystemPrompt: "sys"})
+	failure := func(callID, name string) ToolResume {
+		return ToolResume{
+			CallID: callID, ResumeKey: "workspace:" + callID,
+			Result: &tools.Result{CallID: callID, Name: name, Code: "workspace_activation_failed", ModelFacing: map[string]any{"ok": false}, Failure: &tools.Failure{Code: "workspace_activation_failed", Message: "workspace failed"}},
+			Err:    errors.New("workspace failed"),
+		}
+	}
+	if err := loop.ResumeMaterializedTools(ctx, []ToolResume{failure("call-1", "write"), failure("call-2", "bash")}); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.calls) != 1 {
+		t.Fatalf("provider calls = %d, want one continuation call", len(chat.calls))
+	}
+	providerResults := map[string]bool{}
+	for _, message := range chat.calls[0].Messages {
+		if message.Role != llm.RoleTool {
+			continue
+		}
+		for _, result := range message.ToolResults() {
+			providerResults[result.CallID] = result.IsError
+		}
+	}
+	if !providerResults["call-1"] || !providerResults["call-2"] {
+		t.Fatalf("provider tool results = %#v", providerResults)
+	}
+	events, err := store.Load(ctx, "materialized-failure-batch", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	results := map[string]bool{}
+	stepEnds := 0
+	for _, event := range events {
+		if event.Type == session.EventStepEnd && event.StepID == "step-1" {
+			stepEnds++
+		}
+		if event.Type != session.EventToolResult {
+			continue
+		}
+		var payload struct {
+			IsError bool   `json:"is_error"`
+			Code    string `json:"code"`
+		}
+		if err := json.Unmarshal(event.Data, &payload); err != nil {
+			t.Fatal(err)
+		}
+		if event.CallID == "call-1" || event.CallID == "call-2" {
+			results[event.CallID] = payload.IsError && payload.Code == "workspace_activation_failed"
+		}
+	}
+	if !results["call-1"] || !results["call-2"] || stepEnds != 1 {
+		t.Fatalf("results=%v original_step_ends=%d", results, stepEnds)
 	}
 }
 
@@ -156,6 +414,70 @@ func TestDeferredToolResumesOriginalCallWithoutNewTurn(t *testing.T) {
 	}
 	if resolvedStepEnds != 1 || resolvedStepEndIndex <= resultIndex {
 		t.Fatalf("deferred step lifecycle step_ends=%d result=%d step_end=%d", resolvedStepEnds, resultIndex, resolvedStepEndIndex)
+	}
+}
+
+func TestDeferredToolResumeContinuesAfterResultCrash(t *testing.T) {
+	store := session.NewMemoryStore()
+	ctx := context.Background()
+	lease, err := store.ClaimLease(ctx, "deferred-result-crash", "seed", time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.AppendFenced(ctx, lease, []session.Event{
+		{RunID: "run-1", TurnID: "turn-1", Type: session.EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", Type: session.EventStepStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolCall, ID: "call-1", Data: session.ToolCallPayload("call-1", "side_effect", json.RawMessage(`{}`))},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolDeferred, Data: session.ToolDeferredPayload("side_effect", "workspace:call-1", "workspace", nil, nil)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolResumeStarted, Data: session.ToolResumeStartedPayload("call-1", "side_effect", "workspace:call-1")},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolResult, Data: session.ToolResultStructuredPayloadWithContent("call-1", "side_effect", json.RawMessage(`{"ok":true}`), nil, "", false, nil, nil, false)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	chat := &scriptedProvider{steps: []scriptedStep{{text: "continued", finish: llm.FinishReasonStop}}}
+	registry := tools.New(tools.Options{})
+	executions := 0
+	registry.MustRegister(&tools.Definition{
+		Name: "side_effect", Description: "side effect", InputSchema: json.RawMessage(`{"type":"object"}`), OutputSchema: tools.AnyOutputSchema,
+		Execute: func(context.Context, tools.ToolRunContext, json.RawMessage) (any, error) {
+			executions++
+			return map[string]any{"ok": true}, nil
+		},
+	})
+	loop := NewLoop("deferred-result-crash", store, registry, chat, Config{Model: "m", Owner: "worker", SystemPrompt: "sys"})
+	if err := loop.ResumeDeferredTools(ctx, []DeferredToolResume{{CallID: "call-1", ResumeKey: "workspace:call-1"}}); err != nil {
+		t.Fatal(err)
+	}
+	if executions != 0 || len(chat.calls) != 1 {
+		t.Fatalf("tool executions=%d provider calls=%d, want no retry and one continuation", executions, len(chat.calls))
+	}
+	events, err := store.Load(ctx, "deferred-result-crash", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeStarted, results, stepEnds := 0, 0, 0
+	for _, event := range events {
+		switch event.Type {
+		case session.EventToolResumeStarted:
+			if event.CallID == "call-1" {
+				resumeStarted++
+			}
+		case session.EventToolResult:
+			if event.CallID == "call-1" {
+				results++
+			}
+		case session.EventStepEnd:
+			if event.StepID == "step-1" {
+				stepEnds++
+			}
+		}
+	}
+	if resumeStarted != 1 || results != 1 || stepEnds != 1 {
+		t.Fatalf("resume_started=%d results=%d original_step_ends=%d", resumeStarted, results, stepEnds)
 	}
 }
 

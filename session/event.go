@@ -539,6 +539,24 @@ func ToolResultStructuredPayloadWithContent(callID, name string, content json.Ra
 	return mustJSON(payload)
 }
 
+// ToolDeferredPayload records the model-facing presentation of a deferred
+// call without pretending that the tool has produced a result. The host can
+// project this payload immediately while the same call remains resumable.
+func ToolDeferredPayload(name, resumeKey, waitingReason string, content json.RawMessage, ui map[string]any) json.RawMessage {
+	payload := map[string]any{
+		"name":           name,
+		"resume_key":     resumeKey,
+		"waiting_reason": waitingReason,
+	}
+	if len(content) > 0 {
+		payload["content"] = content
+	}
+	if ui != nil {
+		payload["ui"] = ui
+	}
+	return mustJSON(payload)
+}
+
 // ToolResultStructuredPayloadWithOutput is retained for reading/migration
 // helpers that must reproduce legacy rows. New loop writes must use
 // ToolResultStructuredPayloadWithContent so canonical values never enter the
@@ -570,9 +588,21 @@ func ToolResultStructuredPayloadWithOutput(callID, name string, output, content 
 // ready. Recovery treats this as potentially side-effecting and never retries
 // it blindly.
 func ToolResumeStartedPayload(callID, name, resumeKey string) json.RawMessage {
-	return mustJSON(map[string]any{
+	return ToolResumeStartedPayloadWithMode(callID, name, resumeKey, false)
+}
+
+// ToolResumeStartedPayloadWithMode records whether the host has already
+// materialized the deferred result. Materialized resumes may safely append
+// that result after a crash; non-materialized resumes must be treated as
+// unknown because the original tool may have side effects.
+func ToolResumeStartedPayloadWithMode(callID, name, resumeKey string, materialized bool) json.RawMessage {
+	payload := map[string]any{
 		"call_id": callID, "name": name, "resume_key": resumeKey,
-	})
+	}
+	if materialized {
+		payload["materialized"] = true
+	}
+	return mustJSON(payload)
 }
 
 // RequestHeaderPayload records the request header and an optional provider

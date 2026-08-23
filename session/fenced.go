@@ -414,6 +414,7 @@ func danglingCallIDs(events []Event) []string {
 		callDispatched
 		callDeferred
 		callResuming
+		callMaterializedResuming
 		callResult
 		callApprovalPending
 		callApprovalResolved
@@ -451,7 +452,14 @@ func danglingCallIDs(events []Event) []string {
 		case EventToolResumeStarted:
 			if e.CallID != "" {
 				remember(e.CallID)
-				state[e.CallID] = callResuming
+				var payload struct {
+					Materialized bool `json:"materialized"`
+				}
+				if decodeJSON(e.Data, &payload) == nil && payload.Materialized {
+					state[e.CallID] = callMaterializedResuming
+				} else {
+					state[e.CallID] = callResuming
+				}
 			}
 		case EventAssistantMessage:
 			var payload struct {
@@ -501,7 +509,12 @@ func danglingCallIDs(events []Event) []string {
 func pendingDeferredScopes(events []Event) (map[string]bool, map[string]bool) {
 	state := make(map[string]bool)
 	locations := make(map[string]Event)
+	results := make(map[string]bool)
+	closedSteps := make(map[string]bool)
 	for _, event := range events {
+		if event.Type == EventStepEnd && event.StepID != "" && event.TurnID != "" {
+			closedSteps[draftKey(event.RunID, event.TurnID, event.StepID)] = true
+		}
 		if event.CallID == "" {
 			continue
 		}
@@ -510,12 +523,30 @@ func pendingDeferredScopes(events []Event) (map[string]bool, map[string]bool) {
 			state[event.CallID] = true
 			locations[event.CallID] = event
 		case EventToolResumeStarted, EventToolResult:
+			if event.Type == EventToolResumeStarted {
+				var payload struct {
+					Materialized bool `json:"materialized"`
+				}
+				if decodeJSON(event.Data, &payload) == nil && payload.Materialized {
+					state[event.CallID] = true
+					continue
+				}
+			}
 			state[event.CallID] = false
+			if event.Type == EventToolResult {
+				results[event.CallID] = true
+			}
 		}
 	}
 	steps := make(map[string]bool)
 	turns := make(map[string]bool)
 	for callID, pending := range state {
+		if !pending && results[callID] {
+			event := locations[callID]
+			if event.Type == EventToolDeferred && !closedSteps[draftKey(event.RunID, event.TurnID, event.StepID)] {
+				pending = true
+			}
+		}
 		if !pending {
 			continue
 		}

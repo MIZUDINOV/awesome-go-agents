@@ -289,6 +289,7 @@ func runRollingBatch(ctx context.Context, limit int, calls []Call, executionMode
 	}
 	done := make(chan completed, len(calls))
 	active, next := 0, 0
+	terminal := false
 	if limit <= 0 || limit > len(calls) {
 		limit = len(calls)
 	}
@@ -299,11 +300,12 @@ func runRollingBatch(ctx context.Context, limit int, calls []Call, executionMode
 			done <- completed{index: index, result: result, err: err}
 		}()
 	}
-	drainOne := func() {
+	drainOne := func() completed {
 		item := <-done
 		outcomes[item.index].Result = item.result
 		outcomes[item.index].Err = item.err
 		active--
+		return item
 	}
 	markUnstarted := func() {
 		if ctx.Err() == nil {
@@ -314,9 +316,25 @@ func runRollingBatch(ctx context.Context, limit int, calls []Call, executionMode
 			next++
 		}
 	}
+	markTerminal := func() {
+		for next < len(calls) {
+			outcomes[next].Err = fmt.Errorf("%w: a previous tool concluded the turn", ErrAbortedBeforeDispatch)
+			next++
+		}
+	}
+	isTerminal := func(result *Result) bool {
+		return result != nil && (result.Continuation == ToolConclude || result.Continuation == ToolDeferred || result.ConcludesTurn)
+	}
 	for next < len(calls) || active > 0 {
 		if ctx.Err() != nil {
 			markUnstarted()
+			for active > 0 {
+				drainOne()
+			}
+			break
+		}
+		if terminal {
+			markTerminal()
 			for active > 0 {
 				drainOne()
 			}
@@ -328,18 +346,24 @@ func runRollingBatch(ctx context.Context, limit int, calls []Call, executionMode
 		}
 		if next < len(calls) && !executionMode(calls[next]) {
 			for active > 0 {
-				drainOne()
+				item := drainOne()
+				terminal = terminal || isTerminal(item.result)
 			}
 			if ctx.Err() != nil {
 				markUnstarted()
 				break
 			}
+			if terminal {
+				continue
+			}
 			outcomes[next].Result, outcomes[next].Err = run(calls[next])
+			terminal = isTerminal(outcomes[next].Result)
 			next++
 			continue
 		}
 		if active > 0 {
-			drainOne()
+			item := drainOne()
+			terminal = terminal || isTerminal(item.result)
 		}
 	}
 	return outcomes

@@ -466,6 +466,18 @@ func (h *Handle) Reject(ctx context.Context, callID string) error {
 
 // ResumeTool completes a deferred tool under the loop's claimed lease.
 func (h *Handle) ResumeTool(ctx context.Context, request ToolResume) error {
+	return h.resumeTool(ctx, request, false)
+}
+
+// ResumeMaterializedTool completes a deferred tool whose host-owned result is
+// already durable. It shares the same single-run guard as ResumeTool.
+func (h *Handle) ResumeMaterializedTool(ctx context.Context, request ToolResume) error {
+	return h.resumeTool(ctx, request, true)
+}
+
+// ResumeMaterializedTools records a complete materialized outcome batch before
+// continuing the original model turn.
+func (h *Handle) ResumeMaterializedTools(ctx context.Context, requests []ToolResume) error {
 	h.mu.Lock()
 	if h.status == StatusDisposed {
 		h.mu.Unlock()
@@ -495,6 +507,42 @@ func (h *Handle) ResumeTool(ctx context.Context, request ToolResume) error {
 			h.emitStatus(StatusIdle)
 		}
 	}()
+	return h.loop.ResumeMaterializedTools(runCtx, requests)
+}
+
+func (h *Handle) resumeTool(ctx context.Context, request ToolResume, materialized bool) error {
+	h.mu.Lock()
+	if h.status == StatusDisposed {
+		h.mu.Unlock()
+		return ErrAgentDisposed
+	}
+	if h.status == StatusRunning {
+		h.mu.Unlock()
+		return ErrAgentBusy
+	}
+	h.status = StatusRunning
+	runCtx, cancel := context.WithCancel(ctx)
+	h.runCancel = cancel
+	h.signalChanged()
+	h.mu.Unlock()
+	h.emitStatus(StatusRunning)
+	defer func() {
+		cancel()
+		h.mu.Lock()
+		h.runCancel = nil
+		disposed := h.status == StatusDisposed
+		if !disposed {
+			h.status = StatusIdle
+		}
+		h.signalChanged()
+		h.mu.Unlock()
+		if !disposed {
+			h.emitStatus(StatusIdle)
+		}
+	}()
+	if materialized {
+		return h.loop.ResumeMaterializedTool(runCtx, request)
+	}
 	return h.loop.ResumeTool(runCtx, request)
 }
 
