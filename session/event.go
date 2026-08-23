@@ -518,6 +518,12 @@ func ToolResultStructuredPayloadWithOptions(callID, name string, content json.Ra
 // payload. Canonical execution values are intentionally absent; replay only
 // needs model-facing content, error state, metadata and lifecycle contexts.
 func ToolResultStructuredPayloadWithContent(callID, name string, content json.RawMessage, meta map[string]any, code string, isError bool, blocks []ContentBlock, contexts []llm.Message, concludesTurn bool) json.RawMessage {
+	return ToolResultStructuredPayloadWithMaterialized(callID, name, content, meta, code, isError, blocks, contexts, concludesTurn, false)
+}
+
+// ToolResultStructuredPayloadWithMaterialized adds the durable provenance of a
+// deferred result without changing the provider-facing tool payload.
+func ToolResultStructuredPayloadWithMaterialized(callID, name string, content json.RawMessage, meta map[string]any, code string, isError bool, blocks []ContentBlock, contexts []llm.Message, concludesTurn, materialized bool) json.RawMessage {
 	payload := map[string]any{"call_id": callID, "name": name, "content": content, "is_error": isError}
 	if meta != nil {
 		payload["meta"] = meta
@@ -535,6 +541,9 @@ func ToolResultStructuredPayloadWithContent(callID, name string, content json.Ra
 	}
 	if concludesTurn {
 		payload["concludes_turn"] = true
+	}
+	if materialized {
+		payload["materialized"] = true
 	}
 	return mustJSON(payload)
 }

@@ -122,6 +122,12 @@ func TestMaterializedDeferredResumeCanFinishAfterResumeBarrier(t *testing.T) {
 	loop := NewLoop("materialized-resume-session", store, tools.New(tools.Options{}), &scriptedProvider{steps: []scriptedStep{{text: "done", finish: llm.FinishReasonStop}}}, Config{Model: "m", Owner: "worker", SystemPrompt: "sys"})
 	if err := loop.ResumeMaterializedTool(ctx, ToolResume{
 		CallID: "call-1", ResumeKey: "questions:call-1",
+		Result: &tools.Result{CallID: "call-1", Name: "different_tool", Canonical: map[string]any{"answers": []any{}}},
+	}); err == nil {
+		t.Fatal("materialized resume accepted a different tool name")
+	}
+	if err := loop.ResumeMaterializedTool(ctx, ToolResume{
+		CallID: "call-1", ResumeKey: "questions:call-1",
 		Result: &tools.Result{CallID: "call-1", Name: "ask_questions", Canonical: map[string]any{"answers": []any{}}},
 	}); err != nil {
 		t.Fatal(err)
@@ -215,6 +221,54 @@ func TestToolResumeRetainsLegacyUnkeyedFieldShape(t *testing.T) {
 	}
 }
 
+func TestSingleDeferredResumeKeepsBatchOpenUntilEveryCallResolves(t *testing.T) {
+	store := session.NewMemoryStore()
+	ctx := context.Background()
+	lease, err := store.ClaimLease(ctx, "single-resume-batch", "seed", time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := []session.ToolCall{
+		{CallID: "call-1", Name: "question_one", Arguments: json.RawMessage(`{}`)},
+		{CallID: "call-2", Name: "question_two", Arguments: json.RawMessage(`{}`)},
+	}
+	_, err = store.AppendFenced(ctx, lease, []session.Event{
+		{RunID: "run-1", TurnID: "turn-1", Type: session.EventTurnStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", Type: session.EventStepStart, Data: json.RawMessage(`{}`)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", Type: session.EventAssistantMessage, Data: session.AssistantContent("", "", calls)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolCall, ID: "call-1", Data: session.ToolCallPayload("call-1", "question_one", calls[0].Arguments)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-1", Type: session.EventToolDeferred, Data: session.ToolDeferredPayload("question_one", "questions:call-1", "questions", nil, nil)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-2", Type: session.EventToolCall, ID: "call-2", Data: session.ToolCallPayload("call-2", "question_two", calls[1].Arguments)},
+		{RunID: "run-1", TurnID: "turn-1", StepID: "step-1", CallID: "call-2", Type: session.EventToolDeferred, Data: session.ToolDeferredPayload("question_two", "questions:call-2", "questions", nil, nil)},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReleaseLease(ctx, lease); err != nil {
+		t.Fatal(err)
+	}
+	chat := &scriptedProvider{steps: []scriptedStep{{text: "continued"}}}
+	loop := NewLoop("single-resume-batch", store, tools.New(tools.Options{}), chat, Config{Model: "m", Owner: "worker", SystemPrompt: "sys"})
+	if err := loop.ResumeTool(ctx, ToolResume{CallID: "call-1", ResumeKey: "questions:call-1", Result: &tools.Result{Canonical: map[string]any{"answer": "one"}}}); !errors.Is(err, ErrToolDeferred) {
+		t.Fatalf("first resume error = %v, want deferred", err)
+	}
+	firstEvents, err := store.Load(ctx, "single-resume-batch", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, event := range firstEvents {
+		if event.Type == session.EventStepEnd && event.StepID == "step-1" {
+			t.Fatal("first single resume closed the step before the second result")
+		}
+	}
+	if err := loop.ResumeTool(ctx, ToolResume{CallID: "call-2", ResumeKey: "questions:call-2", Result: &tools.Result{Canonical: map[string]any{"answer": "two"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if len(chat.calls) != 1 {
+		t.Fatalf("provider calls = %d, want one continuation", len(chat.calls))
+	}
+}
+
 func TestMaterializedDeferredFailureIsPersistedAsError(t *testing.T) {
 	store := session.NewMemoryStore()
 	ctx := context.Background()
@@ -304,23 +358,28 @@ func TestMaterializedDeferredBatchResolvesEveryCallBeforeContinuing(t *testing.T
 			Err:    errors.New("workspace failed"),
 		}
 	}
-	if err := loop.ResumeMaterializedTools(ctx, []ToolResume{failure("call-1", "write"), failure("call-2", "bash")}); err != nil {
+	if err := loop.ResumeMaterializedTools(ctx, []ToolResume{failure("call-2", "bash"), failure("call-1", "write")}); err != nil {
 		t.Fatal(err)
 	}
 	if len(chat.calls) != 1 {
 		t.Fatalf("provider calls = %d, want one continuation call", len(chat.calls))
 	}
 	providerResults := map[string]bool{}
+	providerOrder := make([]string, 0, 2)
 	for _, message := range chat.calls[0].Messages {
 		if message.Role != llm.RoleTool {
 			continue
 		}
 		for _, result := range message.ToolResults() {
 			providerResults[result.CallID] = result.IsError
+			providerOrder = append(providerOrder, result.CallID)
 		}
 	}
 	if !providerResults["call-1"] || !providerResults["call-2"] {
 		t.Fatalf("provider tool results = %#v", providerResults)
+	}
+	if len(providerOrder) != 2 || providerOrder[0] != "call-1" || providerOrder[1] != "call-2" {
+		t.Fatalf("provider tool result order = %v, want [call-1 call-2]", providerOrder)
 	}
 	events, err := store.Load(ctx, "materialized-failure-batch", 0, 0)
 	if err != nil {

@@ -28,6 +28,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -419,6 +420,12 @@ func (l *Loop) resumeTool(ctx context.Context, request ToolResume, materialized 
 	if deferred.Type != session.EventToolDeferred {
 		return fmt.Errorf("agent: deferred tool %s was not found", request.CallID)
 	}
+	if toolName == "" {
+		return fmt.Errorf("agent: deferred tool %s has no durable tool name", request.CallID)
+	}
+	if err := validateToolResultIdentity(request.Result, request.CallID, toolName); err != nil {
+		return err
+	}
 	for _, event := range l.snapshotEvents() {
 		if event.Type == session.EventStepEnd && event.TurnID == deferred.TurnID && event.StepID == deferred.StepID {
 			stepEnded = true
@@ -430,6 +437,9 @@ func (l *Loop) resumeTool(ctx context.Context, request ToolResume, materialized 
 	if resultExists {
 		if turnEnded {
 			return nil
+		}
+		if hasUnresolvedDeferredToolInStep(l.snapshotEvents(), deferred.TurnID, deferred.StepID) {
+			return ErrToolDeferred
 		}
 		var payload struct {
 			ConcludesTurn bool `json:"concludes_turn"`
@@ -469,17 +479,14 @@ func (l *Loop) resumeTool(ctx context.Context, request ToolResume, materialized 
 	if result == nil {
 		result = &tools.Result{Name: toolName, CallID: request.CallID}
 	}
-	if result.CallID == "" {
-		result.CallID = request.CallID
-	}
-	if result.Name == "" {
-		result.Name = toolName
-	}
-	continuation, err := l.appendToolOutcome(durableContext(ctx), lease, em, tools.Outcome{
-		Call: tools.Call{Name: result.Name, CallID: request.CallID}, Result: result, Err: request.Err,
-	}, deferred.TurnID, deferred.StepID)
+	continuation, err := l.appendToolOutcomeWithMaterialized(durableContext(ctx), lease, em, tools.Outcome{
+		Call: tools.Call{Name: toolName, CallID: request.CallID}, Result: result, Err: request.Err,
+	}, deferred.TurnID, deferred.StepID, materialized)
 	if err != nil {
 		return err
+	}
+	if hasUnresolvedDeferredToolInStep(l.snapshotEvents(), deferred.TurnID, deferred.StepID) {
+		return ErrToolDeferred
 	}
 	if err := l.append(durableContext(ctx), lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: deferred.RunID, TurnID: deferred.TurnID, StepID: deferred.StepID, CallID: request.CallID, Type: session.EventStepEnd, Data: strJSON("deferred_resolved")}); err != nil {
 		return err
@@ -554,6 +561,16 @@ func (l *Loop) resumeDeferredToolBatch(ctx context.Context, requests []deferredT
 	if len(requests) == 0 {
 		return nil
 	}
+	ordered := append([]deferredToolBatchResume(nil), requests...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		left, _, _, _, _ := deferredToolRecord(events, ordered[i].resume)
+		right, _, _, _, _ := deferredToolRecord(events, ordered[j].resume)
+		if left.Seq == 0 || right.Seq == 0 {
+			return false
+		}
+		return left.Seq < right.Seq
+	})
+	requests = ordered
 
 	var first session.Event
 	concludes := false
@@ -577,7 +594,41 @@ func (l *Loop) resumeDeferredToolBatch(ctx context.Context, requests []deferredT
 		if callEvent.Type == session.EventToolCall && json.Unmarshal(callEvent.Data, &call) != nil {
 			return fmt.Errorf("agent: deferred tool %s has invalid call payload", request.resume.CallID)
 		}
-		if call.CallID == "" {
+		if call.CallID == "" || call.Name == "" {
+			return fmt.Errorf("agent: deferred tool %s has no durable call", request.resume.CallID)
+		}
+		if request.materialized {
+			if request.result == nil {
+				return fmt.Errorf("agent: materialized deferred result is required")
+			}
+			if err := validateToolResultIdentity(request.result, call.CallID, call.Name); err != nil {
+				return err
+			}
+		}
+	}
+
+	first = session.Event{}
+	for _, request := range requests {
+		callEvent, deferred, resultExists, resumeStarted, resumeMaterialized := deferredToolRecord(events, request.resume)
+		if deferred.Type != session.EventToolDeferred {
+			return fmt.Errorf("agent: deferred tool %s was not found", request.resume.CallID)
+		}
+		if first.Type == "" {
+			first = deferred
+		} else if deferred.RunID != first.RunID || deferred.TurnID != first.TurnID || deferred.StepID != first.StepID {
+			return fmt.Errorf("agent: deferred tool %s is not in the resumed model tool batch", request.resume.CallID)
+		}
+		if resultExists {
+			continue
+		}
+		if resumeStarted && (!request.materialized || !resumeMaterialized) {
+			return ErrDeferredExecutionStarted
+		}
+		var call session.ToolCall
+		if callEvent.Type == session.EventToolCall && json.Unmarshal(callEvent.Data, &call) != nil {
+			return fmt.Errorf("agent: deferred tool %s has invalid call payload", request.resume.CallID)
+		}
+		if call.CallID == "" || call.Name == "" {
 			return fmt.Errorf("agent: deferred tool %s has no durable call", request.resume.CallID)
 		}
 		em := &emitter{sessionID: l.SessionID, runID: deferred.RunID, n: l.eventCount()}
@@ -591,14 +642,7 @@ func (l *Loop) resumeDeferredToolBatch(ctx context.Context, requests []deferredT
 			}
 		}
 		result, runErr := request.result, request.err
-		if request.materialized {
-			if result.CallID == "" {
-				result.CallID = request.resume.CallID
-			}
-			if result.Name == "" {
-				result.Name = call.Name
-			}
-		} else {
+		if !request.materialized {
 			outcomes := l.Tools.RunBatch(ctx, tools.ToolRunContext{
 				SessionID: l.SessionID, RunID: deferred.RunID, TurnID: deferred.TurnID, StepID: deferred.StepID,
 				CallID: request.resume.CallID, Vars: mergeVars(l.Config.Vars), Sandbox: l.Config.Sandbox,
@@ -613,10 +657,10 @@ func (l *Loop) resumeDeferredToolBatch(ctx context.Context, requests []deferredT
 				runErr = fmt.Errorf("agent: deferred tool %s did not produce one outcome", request.resume.CallID)
 			}
 		}
-		continuation, err := l.appendToolOutcome(durableContext(ctx), lease, em, tools.Outcome{
+		continuation, err := l.appendToolOutcomeWithMaterialized(durableContext(ctx), lease, em, tools.Outcome{
 			Call:   tools.Call{Name: call.Name, CallID: request.resume.CallID, Input: append(json.RawMessage(nil), call.Arguments...)},
 			Result: result, Err: runErr,
-		}, deferred.TurnID, deferred.StepID)
+		}, deferred.TurnID, deferred.StepID, request.materialized)
 		if err != nil {
 			return err
 		}
@@ -628,11 +672,8 @@ func (l *Loop) resumeDeferredToolBatch(ctx context.Context, requests []deferredT
 		return nil
 	}
 	events = l.snapshotEvents()
-	for _, pending := range pendingDeferredToolResumes(events) {
-		_, deferred, resultExists, _, _ := deferredToolRecord(events, pending)
-		if !resultExists && deferred.TurnID == first.TurnID && deferred.StepID == first.StepID {
-			return ErrToolDeferred
-		}
+	if hasUnresolvedDeferredToolInStep(events, first.TurnID, first.StepID) {
+		return ErrToolDeferred
 	}
 	stepEnded, turnEnded := false, false
 	for _, event := range events {
@@ -674,6 +715,58 @@ func toolResultConcludesTurn(events []session.Event, callID string) bool {
 			ConcludesTurn bool `json:"concludes_turn"`
 		}
 		return json.Unmarshal(event.Data, &payload) == nil && payload.ConcludesTurn
+	}
+	return false
+}
+
+func validateToolResultIdentity(result *tools.Result, callID, name string) error {
+	if result == nil {
+		return nil
+	}
+	if result.CallID != "" && result.CallID != callID {
+		return fmt.Errorf("agent: deferred tool result call id mismatch")
+	}
+	if result.Name != "" && result.Name != name {
+		return fmt.Errorf("agent: deferred tool result tool name mismatch")
+	}
+	return nil
+}
+
+func bindToolResultIdentity(result *tools.Result, call tools.Call) (*tools.Result, error) {
+	if err := validateToolResultIdentity(result, call.CallID, call.Name); err != nil {
+		return nil, err
+	}
+	if result == nil || (result.CallID != "" && result.Name != "") {
+		return result, nil
+	}
+	bound := *result
+	if bound.CallID == "" {
+		bound.CallID = call.CallID
+	}
+	if bound.Name == "" {
+		bound.Name = call.Name
+	}
+	return &bound, nil
+}
+
+func hasUnresolvedDeferredToolInStep(events []session.Event, turnID, stepID string) bool {
+	requests := make(map[string]DeferredToolResume)
+	for _, event := range events {
+		if event.Type != session.EventToolDeferred || event.TurnID != turnID || event.StepID != stepID || event.CallID == "" {
+			continue
+		}
+		var payload struct {
+			ResumeKey string `json:"resume_key"`
+		}
+		if json.Unmarshal(event.Data, &payload) == nil && payload.ResumeKey != "" {
+			requests[event.CallID] = DeferredToolResume{CallID: event.CallID, ResumeKey: payload.ResumeKey}
+		}
+	}
+	for _, request := range requests {
+		_, deferred, resultExists, _, _ := deferredToolRecord(events, request)
+		if deferred.Type == session.EventToolDeferred && !resultExists {
+			return true
+		}
 	}
 	return false
 }
@@ -819,6 +912,13 @@ func (l *Loop) ResumeApprovedTool(ctx context.Context, request tools.ApprovalReq
 	if callEvent.Type != session.EventToolCall {
 		return fmt.Errorf("agent: approval call %s was not found", request.CallID)
 	}
+	var call session.ToolCall
+	if err := json.Unmarshal(callEvent.Data, &call); err != nil || call.CallID != request.CallID || call.Name == "" {
+		return fmt.Errorf("agent: approval call %s has invalid durable call payload", request.CallID)
+	}
+	if call.Name != request.ToolName {
+		return fmt.Errorf("agent: approval tool name mismatch")
+	}
 	runID, turnID, stepID := callEvent.RunID, callEvent.TurnID, callEvent.StepID
 	if runID == "" {
 		runID = request.RunID
@@ -845,7 +945,7 @@ func (l *Loop) ResumeApprovedTool(ctx context.Context, request tools.ApprovalReq
 	continuation := toolContinue
 	if !approved {
 		if !resultExists {
-			if err := l.appendToolResultErr(persistCtx, lease, em, request.CallID, request.ToolName, tools.ErrApprovalDenied, turnID, stepID); err != nil {
+			if err := l.appendToolResultErr(persistCtx, lease, em, request.CallID, call.Name, tools.ErrApprovalDenied, turnID, stepID); err != nil {
 				return err
 			}
 		}
@@ -856,7 +956,7 @@ func (l *Loop) ResumeApprovedTool(ctx context.Context, request tools.ApprovalReq
 			}
 			return l.append(dispatchCtx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: runID, TurnID: turnID, StepID: stepID, CallID: callID, Type: session.EventToolRunning, Data: strJSON("running")})
 		}
-		calls := []tools.Call{{Name: request.ToolName, CallID: request.CallID, Input: append(json.RawMessage(nil), request.Arguments...)}}
+		calls := []tools.Call{{Name: call.Name, CallID: request.CallID, Input: append(json.RawMessage(nil), call.Arguments...)}}
 		outcomes := l.Tools.RunBatch(resumeCtx, tools.ToolRunContext{SessionID: l.SessionID, RunID: runID, TurnID: turnID, StepID: stepID, Vars: mergeVars(l.Config.Vars), Sandbox: l.Config.Sandbox, Artifacts: l.Config.Artifacts, Lease: &lease, OnDispatch: onDispatch}, calls)
 		if err := validateToolOutcomes(calls, outcomes); err != nil {
 			return err
@@ -1546,9 +1646,20 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 }
 
 func (l *Loop) appendToolOutcome(ctx context.Context, lease session.Lease, em *emitter, outcome tools.Outcome, turnID, stepID string) (toolContinuation, error) {
+	return l.appendToolOutcomeWithMaterialized(ctx, lease, em, outcome, turnID, stepID, false)
+}
+
+func (l *Loop) appendToolOutcomeWithMaterialized(ctx context.Context, lease session.Lease, em *emitter, outcome tools.Outcome, turnID, stepID string, materialized bool) (toolContinuation, error) {
+	if outcome.Result != nil {
+		bound, err := bindToolResultIdentity(outcome.Result, outcome.Call)
+		if err != nil {
+			return toolContinue, err
+		}
+		outcome.Result = bound
+	}
 	if outcome.Err != nil {
 		if outcome.Result != nil {
-			if err := l.appendToolFailureResult(ctx, lease, em, outcome.Result, outcome.Err, turnID, stepID); err != nil {
+			if err := l.appendToolFailureResult(ctx, lease, em, outcome.Result, outcome.Err, turnID, stepID, materialized); err != nil {
 				return toolContinue, err
 			}
 			return toolContinue, nil
@@ -1598,13 +1709,13 @@ func (l *Loop) appendToolOutcome(ctx context.Context, lease session.Lease, em *e
 	if outcome.Result.Continuation == tools.ToolConclude || outcome.Result.ConcludesTurn {
 		continuation = toolConclude
 	}
-	if err := l.appendToolResult(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, contentEncoded, outcome.Result.UI, outcome.Result.Code, outcome.Result.Content, outcome.Result.AdditionalContexts, outcome.Result.ConcludesTurn, turnID, stepID); err != nil {
+	if err := l.appendToolResult(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, contentEncoded, outcome.Result.UI, outcome.Result.Code, outcome.Result.Content, outcome.Result.AdditionalContexts, outcome.Result.ConcludesTurn, materialized, turnID, stepID); err != nil {
 		return toolContinue, err
 	}
 	return continuation, nil
 }
 
-func (l *Loop) appendToolFailureResult(ctx context.Context, lease session.Lease, em *emitter, result *tools.Result, fallback error, turnID, stepID string) error {
+func (l *Loop) appendToolFailureResult(ctx context.Context, lease session.Lease, em *emitter, result *tools.Result, fallback error, turnID, stepID string, materialized bool) error {
 	code, recovery := toolFailure(fallback)
 	if result.Code != "" {
 		code = result.Code
@@ -1627,7 +1738,7 @@ func (l *Loop) appendToolFailureResult(ctx context.Context, lease session.Lease,
 			return fmt.Errorf("encode tool failure content: %w", err)
 		}
 	}
-	data := session.ToolResultStructuredPayloadWithContent(result.CallID, result.Name, content, result.UI, code, true, result.Content, result.AdditionalContexts, false)
+	data := session.ToolResultStructuredPayloadWithMaterialized(result.CallID, result.Name, content, result.UI, code, true, result.Content, result.AdditionalContexts, false, materialized)
 	ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: result.CallID,
 		Type: session.EventToolResult, Data: data, SourceSeqs: l.assistantSourceSeqs(result.CallID, turnID, stepID)}
 	return l.append(ctx, lease, ev)
@@ -1645,8 +1756,8 @@ func validateToolOutcomes(calls []tools.Call, outcomes []tools.Outcome) error {
 	return nil
 }
 
-func (l *Loop) appendToolResult(ctx context.Context, lease session.Lease, em *emitter, callID, name string, content json.RawMessage, meta map[string]any, code string, blocks []session.ContentBlock, contexts []llm.Message, concludesTurn bool, turnID, stepID string) error {
-	data := session.ToolResultStructuredPayloadWithContent(callID, name, content, meta, code, false, blocks, contexts, concludesTurn)
+func (l *Loop) appendToolResult(ctx context.Context, lease session.Lease, em *emitter, callID, name string, content json.RawMessage, meta map[string]any, code string, blocks []session.ContentBlock, contexts []llm.Message, concludesTurn, materialized bool, turnID, stepID string) error {
+	data := session.ToolResultStructuredPayloadWithMaterialized(callID, name, content, meta, code, false, blocks, contexts, concludesTurn, materialized)
 	ev := session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: callID,
 		Type: session.EventToolResult, Data: data, SourceSeqs: l.assistantSourceSeqs(callID, turnID, stepID)}
 	return l.append(ctx, lease, ev)

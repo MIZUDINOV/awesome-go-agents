@@ -718,6 +718,22 @@ func TestPendingApprovalResumesAfterAgentRestart(t *testing.T) {
 	}
 }
 
+func TestApprovedResumeRejectsSubstitutedToolIdentity(t *testing.T) {
+	store := newMemoryStore()
+	request := tools.ApprovalRequest{SessionID: "approval-identity", RunID: "run-1", TurnID: "turn-1", StepID: "turn-1-step-00", CallID: "approval-1", ToolName: "protected", Arguments: json.RawMessage(`{"path":"original"}`), Reason: "test"}
+	if _, err := store.Append(context.Background(), "approval-identity", []session.Event{
+		{ID: "approval-call", SessionID: request.SessionID, RunID: request.RunID, TurnID: request.TurnID, StepID: request.StepID, CallID: request.CallID, Type: session.EventToolCall, Data: session.ToolCallPayload(request.CallID, request.ToolName, request.Arguments)},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loop := NewLoop("approval-identity", store, tools.New(tools.Options{}), &scriptedProvider{}, Config{Model: "m", Owner: "worker", SystemPrompt: "sys"})
+	request.ToolName = "different_tool"
+	request.Arguments = json.RawMessage(`{"path":"substituted"}`)
+	if err := loop.ResumeApprovedTool(context.Background(), request, true); err == nil {
+		t.Fatal("substituted approval tool identity was accepted")
+	}
+}
+
 func TestResumedApprovalHonorsHandleCancel(t *testing.T) {
 	store := newMemoryStore()
 	request := tools.ApprovalRequest{SessionID: "approval-cancel", RunID: "run-old", CallID: "approval-cancel-1", ToolName: "protected", Arguments: json.RawMessage(`{}`), Reason: "test"}
