@@ -902,6 +902,29 @@ func TestParallelToolCallsEnabled(t *testing.T) {
 	}
 }
 
+func TestLoopPassesConfiguredToolChoiceToProvider(t *testing.T) {
+	chat := &scriptedProvider{steps: []scriptedStep{{calls: []llm.ToolCallRequest{{CallID: "commit", Name: "commit", Arguments: jsonLit(`{}`)}}}}}
+	registry := tools.New(tools.Options{})
+	registry.MustRegister(&tools.Definition{
+		Name: "commit", InputSchema: tools.OrObjectSchema, OutputSchema: tools.AnyOutputSchema,
+		Execute: func(context.Context, tools.ToolRunContext, json.RawMessage) (any, error) {
+			return map[string]any{"ok": true}, nil
+		},
+		ResolveContinuation: func(json.RawMessage, any) (tools.ToolContinuation, string, string, error) {
+			return tools.ToolConclude, "", "", nil
+		},
+	})
+	loop := NewLoop("required-tool", newMemoryStore(), registry, chat, Config{Model: "m", Owner: "test", SystemPrompt: "sys", ToolChoice: llm.ToolChoiceRequired})
+	if _, err := loop.Run(context.Background(), "commit"); err != nil {
+		t.Fatal(err)
+	}
+	chat.mu.Lock()
+	defer chat.mu.Unlock()
+	if len(chat.calls) != 1 || chat.calls[0].ToolChoice != llm.ToolChoiceRequired {
+		t.Fatalf("tool choice = %q, calls=%d", chat.calls[0].ToolChoice, len(chat.calls))
+	}
+}
+
 // TestCompactionOnOverflow: when a Compactor is configured, crossing the
 // pressure threshold performs a durable compaction (summary events appended).
 func TestCompactionOnOverflow(t *testing.T) {

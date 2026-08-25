@@ -109,6 +109,9 @@ type Config struct {
 	MaxContextRetries int
 
 	Stream bool
+	// ToolChoice controls model tool selection for this loop. Empty preserves
+	// the provider's default automatic selection.
+	ToolChoice llm.ToolChoice
 
 	// ProviderConfig is opaque JSON embedded in llm.Request.Config.
 	ProviderConfig json.RawMessage
@@ -1383,6 +1386,9 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 		reqValue = llm.Request{Model: cfg.Model, System: []llm.Message{{Role: llm.RoleSystem, Parts: []llm.Part{{Type: llm.PartText, Text: systemPrompt}}}}, Messages: deref(msgs), Tools: l.Tools.ModelTools(), MaxTokens: cfg.MaxTokens, Config: append(json.RawMessage(nil), cfg.ProviderConfig...), Stream: cfg.Stream}
 	}
 	req := &reqValue
+	if cfg.ToolChoice != "" {
+		req.ToolChoice = cfg.ToolChoice
+	}
 	if resolvedCapabilities != nil {
 		req.Capabilities = resolvedCapabilities
 	}
