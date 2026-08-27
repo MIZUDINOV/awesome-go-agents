@@ -38,8 +38,12 @@ import (
 	"github.com/MIZUDINOV/awesome-go-agents/integration"
 	"github.com/MIZUDINOV/awesome-go-agents/llm"
 	"github.com/MIZUDINOV/awesome-go-agents/session"
+	"github.com/MIZUDINOV/awesome-go-agents/skill"
+	"github.com/MIZUDINOV/awesome-go-agents/skilltool"
 	"github.com/MIZUDINOV/awesome-go-agents/tools"
 )
+
+const CurrentSkillSchemaVersion = "agentkit-skills-v2"
 
 // Sentinel loop errors.
 var (
@@ -58,6 +62,21 @@ var (
 	ErrToolDeferred             = errors.New("agent: tool execution deferred")
 	ErrDeferredExecutionStarted = errors.New("agent: deferred tool execution already started")
 )
+
+type SkillInvocationError struct {
+	Code string
+	Name string
+	Err  error
+}
+
+func (e *SkillInvocationError) Error() string {
+	if e == nil {
+		return "agent: skill invocation failed"
+	}
+	return fmt.Sprintf("agent: skill invocation %q failed: %v", e.Name, e.Err)
+}
+
+func (e *SkillInvocationError) Unwrap() error { return e.Err }
 
 // Chat is the provider-neutral model seam.
 type Chat interface {
@@ -148,6 +167,9 @@ type Config struct {
 	ToolGuidance     []memctx.Section
 	RuntimeContext   []memctx.Section
 	WorkspaceContext []memctx.Section
+	// Skills is an optional run-scoped runtime. Pinned runtimes preserve the
+	// exact catalog and bodies selected by the host at run creation.
+	Skills *skill.Runtime
 	// NextStep supplies durable steering/injected inputs claimed immediately
 	// before a model step. The public Agent handle installs this callback;
 	// standalone Loop users may leave it nil.
@@ -1227,7 +1249,8 @@ func (l *Loop) appendStepInputs(ctx context.Context, lease session.Lease, em *em
 		if err := l.append(ctx, lease, session.Event{ID: input.ID + ":claimed", SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventInboxClaimed, Data: payload}); err != nil {
 			return err
 		}
-		if err := l.append(ctx, lease, session.Event{ID: input.ID + ":input", SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: typ, Data: session.UserTextWithInbox(input.Text, input.ID)}); err != nil {
+		input.Type = typ
+		if err := l.appendSkillAwareInput(ctx, lease, em, turnID, stepID, input); err != nil {
 			return err
 		}
 		if err := l.append(ctx, lease, session.Event{ID: input.ID + ":completed", SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventInboxCompleted, Data: payload}); err != nil {
@@ -1319,15 +1342,22 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 	}()
 	if attempt == 0 {
 		if initialInput != nil {
-			inputID := em.id()
-			if initialInput.ID != "" {
-				inputID = initialInput.ID + ":input"
+			_, explicitSkill := parseSkillCommand(initialInput.Text)
+			if explicitSkill && initialInput.Type == session.EventUserMessage && l.Config.Skills != nil {
+				if err := l.prepareSkills(ctx, lease, em, turnID, stepID); err != nil {
+					return false, "", err
+				}
 			}
-			if err := l.append(ctx, lease, session.Event{ID: inputID, SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: initialInput.Type, Data: session.UserTextWithInbox(initialInput.Text, initialInput.ID)}); err != nil {
+			if err := l.appendInitialInput(ctx, lease, em, turnID, stepID, *initialInput); err != nil {
 				return false, "", err
 			}
 		}
 		if len(inputs) > 0 {
+			if hasExplicitSkillInput(inputs) && l.Config.Skills != nil {
+				if err := l.prepareSkills(ctx, lease, em, turnID, stepID); err != nil {
+					return false, "", err
+				}
+			}
 			if err := l.appendStepInputs(ctx, lease, em, turnID, step, inputs); err != nil {
 				if l.Config.RequeueStep != nil {
 					l.Config.RequeueStep(inputs)
@@ -1335,6 +1365,9 @@ func (l *Loop) step(ctx context.Context, lease session.Lease, em *emitter, turnI
 				return false, "", err
 			}
 		}
+	}
+	if err := l.prepareSkills(ctx, lease, em, turnID, stepID); err != nil {
+		return false, "", err
 	}
 
 	var resolvedCapabilities *llm.Capabilities
@@ -1718,6 +1751,25 @@ func (l *Loop) appendToolOutcomeWithMaterialized(ctx context.Context, lease sess
 	if err := l.appendToolResult(ctx, lease, em, outcome.Call.CallID, outcome.Call.Name, contentEncoded, outcome.Result.UI, outcome.Result.Code, outcome.Result.Content, outcome.Result.AdditionalContexts, outcome.Result.ConcludesTurn, materialized, turnID, stepID); err != nil {
 		return toolContinue, err
 	}
+	if outcome.Call.Name == "skill" {
+		if loaded, ok := outcome.Result.Canonical.(skilltool.Output); ok && loaded.Activated {
+			payload := session.SkillInvocationEventPayload{
+				SchemaVersion: CurrentSkillSchemaVersion,
+				Name:          loaded.Name,
+				Provider:      loaded.Provider,
+				Source:        loaded.Source,
+				Version:       loaded.Version,
+				ContentHash:   loaded.ContentHash,
+				Origin:        "model",
+			}
+			if err := l.append(ctx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, CallID: outcome.Call.CallID, Type: session.EventSkillLoaded, Data: session.SkillInvocationPayload(payload)}); err != nil {
+				return toolContinue, err
+			}
+			if l.Config.Skills != nil {
+				l.Config.Skills.MarkLoaded(loaded.Name)
+			}
+		}
+	}
 	return continuation, nil
 }
 
@@ -1957,6 +2009,13 @@ func (l *Loop) appendRequestHeader(ctx context.Context, lease session.Lease, em 
 	toolsHash := fmt.Sprintf("%x", sha256.Sum256(toolsBytes))
 	requestHash := fmt.Sprintf("%x", sha256.Sum256(requestSnapshot))
 	metadata := session.RequestHeaderMetadata{PromptVersion: l.Config.PromptVersion, PromptHash: promptHash, ToolsHash: toolsHash}
+	if l.Config.Skills != nil {
+		if snapshot, ok := l.Config.Skills.Snapshot(); ok {
+			metadata.SkillCatalogHash = l.Config.Skills.Catalog().Hash
+			metadata.SkillSnapshotHash = snapshot.SnapshotHash
+			metadata.SkillSchemaVersion = CurrentSkillSchemaVersion
+		}
+	}
 	if req.Capabilities != nil {
 		data := session.RequestHeaderPayloadWithSnapshotAndMetadata(req.Model, l.Chat.Name(), systemSections, toolSchemas, configHash, requestHash, []llm.Capabilities{*req.Capabilities}, metadata, requestSnapshot)
 		return l.append(ctx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventRequestHeader, Data: data})
@@ -2302,6 +2361,180 @@ func (l *Loop) project(ctx context.Context) ([]*llm.Message, *session.Projection
 	return session.NewSurface(session.SurfaceSpec{}).Project(events)
 }
 
+func (l *Loop) appendInitialInput(ctx context.Context, lease session.Lease, em *emitter, turnID, stepID string, input StepInput) error {
+	return l.appendSkillAwareInput(ctx, lease, em, turnID, stepID, input)
+}
+
+func (l *Loop) appendSkillAwareInput(ctx context.Context, lease session.Lease, em *emitter, turnID, stepID string, input StepInput) error {
+	inputID := em.id()
+	if input.ID != "" {
+		inputID = input.ID + ":input"
+	}
+	name, command := parseSkillCommand(input.Text)
+	if (input.Type != session.EventUserMessage && input.Type != session.EventSteeringMessage) || !command || l.Config.Skills == nil {
+		return l.append(ctx, lease, session.Event{ID: inputID, SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: input.Type, Data: session.UserTextWithInbox(input.Text, input.ID)})
+	}
+	if !skill.IsName(name) {
+		return l.append(ctx, lease, session.Event{ID: inputID, SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: input.Type, Data: session.UserTextWithInbox(input.Text, input.ID)})
+	}
+	definition, err := l.Config.Skills.GetUser(ctx, name)
+	if err != nil {
+		if errors.Is(err, skill.ErrSkillNotFound) || errors.Is(err, skill.ErrPolicyDenied) || errors.Is(err, skill.ErrAlreadyLoaded) {
+			return l.append(ctx, lease, session.Event{ID: inputID, SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: input.Type, Data: session.UserTextWithInbox(input.Text, input.ID)})
+		}
+		return classifySkillInvocation(name, err)
+	}
+	payload := session.SkillInvocationEventPayload{
+		SchemaVersion: CurrentSkillSchemaVersion,
+		Name:          definition.Name,
+		Provider:      definition.Provider,
+		Source:        definition.Source,
+		Version:       definition.Version,
+		ContentHash:   definition.ContentHash,
+		Origin:        "user",
+		Text:          skilltool.Render(definition),
+	}
+	if err := l.append(ctx, lease, session.Event{ID: inputID, SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventSkillInvocation, Data: session.SkillInvocationPayload(payload)}); err != nil {
+		return err
+	}
+	l.Config.Skills.MarkUserLoaded(name)
+	return nil
+}
+
+func hasExplicitSkillInput(inputs []StepInput) bool {
+	for _, input := range inputs {
+		if input.Type == session.EventSteeringMessage {
+			if _, command := parseSkillCommand(input.Text); command {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func parseSkillCommand(text string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(text))
+	if len(fields) == 0 || fields[0] != "/skill" {
+		return "", false
+	}
+	if len(fields) != 2 {
+		return "", true
+	}
+	return fields[1], true
+}
+
+func classifySkillInvocation(name string, err error) error {
+	code := "SKILL_LOAD_FAILED"
+	switch {
+	case errors.Is(err, skill.ErrSkillNotFound):
+		code = "SKILL_NOT_FOUND"
+	case errors.Is(err, skill.ErrPolicyDenied):
+		code = "SKILL_POLICY_DENIED"
+	case errors.Is(err, skill.ErrPinnedMismatch), errors.Is(err, skill.ErrProviderDisposed):
+		code = "SKILL_PIN_MISMATCH"
+	case errors.Is(err, skill.ErrAlreadyLoaded):
+		code = "SKILL_ALREADY_LOADED"
+	}
+	return &SkillInvocationError{Code: code, Name: name, Err: err}
+}
+
+func (l *Loop) prepareSkills(ctx context.Context, lease session.Lease, em *emitter, turnID, stepID string) error {
+	runtime := l.Config.Skills
+	if runtime == nil || !hasModelSkillTool(l.Tools.ModelTools()) {
+		return nil
+	}
+	if _, err := runtime.Refresh(ctx); err != nil && !errors.Is(err, skill.ErrIncompleteCatalog) {
+		return fmt.Errorf("agent: refresh skills: %w", err)
+	}
+	snapshot, ok := runtime.Snapshot()
+	if !ok {
+		return nil
+	}
+	catalog := runtime.Catalog()
+	events := l.snapshotEvents()
+	_, projection, err := l.project(ctx)
+	if err != nil {
+		return err
+	}
+	shadowedSeqs := make(map[uint64]struct{}, len(projection.ShadowedSeqs))
+	for _, seq := range projection.ShadowedSeqs {
+		shadowedSeqs[seq] = struct{}{}
+	}
+	var previous session.SkillCatalogEventPayload
+	var previousSeq uint64
+	for _, event := range events {
+		if event.Type == session.EventSkillInvocation {
+			var invocation session.SkillInvocationEventPayload
+			_, isShadowed := shadowedSeqs[event.Seq]
+			if !isShadowed && json.Unmarshal(event.Data, &invocation) == nil && invocation.Origin == "user" && skill.IsName(invocation.Name) && len(invocation.ContentHash) == sha256.Size*2 {
+				runtime.MarkUserLoaded(invocation.Name)
+			}
+		}
+		if event.Type == session.EventSkillLoaded && visibleSkillActivation(events, shadowedSeqs, event.CallID) {
+			var invocation session.SkillInvocationEventPayload
+			if json.Unmarshal(event.Data, &invocation) == nil && invocation.Origin == "model" && skill.IsName(invocation.Name) && len(invocation.ContentHash) == sha256.Size*2 {
+				runtime.MarkLoaded(invocation.Name)
+			}
+		}
+		if event.Type != session.EventSkillCatalog {
+			continue
+		}
+		var payload session.SkillCatalogEventPayload
+		if json.Unmarshal(event.Data, &payload) == nil && validSkillCatalogPayload(payload) && event.Seq >= previousSeq {
+			previous, previousSeq = payload, event.Seq
+		}
+	}
+	if len(catalog.Skills) == 0 && previousSeq == 0 {
+		return nil
+	}
+	shadowed := false
+	for _, seq := range projection.ShadowedSeqs {
+		if seq == previousSeq {
+			shadowed = true
+			break
+		}
+	}
+	if previousSeq > 0 && previous.CatalogHash == catalog.Hash && !shadowed {
+		return nil
+	}
+	summaries := make([]session.SkillSummaryRef, 0, len(catalog.Skills))
+	for _, summary := range catalog.Skills {
+		summaries = append(summaries, session.SkillSummaryRef{Name: summary.Name, Description: summary.Description})
+	}
+	payload := session.SkillCatalogEventPayload{
+		SchemaVersion: CurrentSkillSchemaVersion,
+		Complete:      catalog.Complete,
+		CatalogHash:   catalog.Hash,
+		SnapshotHash:  snapshot.SnapshotHash,
+		SnapshotID:    snapshot.SnapshotHash,
+		Update:        previousSeq > 0,
+		Text:          runtime.RenderCatalog(previousSeq > 0),
+		Skills:        summaries,
+	}
+	return l.append(ctx, lease, session.Event{ID: em.id(), SessionID: l.SessionID, RunID: em.runID, TurnID: turnID, StepID: stepID, Type: session.EventSkillCatalog, Data: session.SkillCatalogPayload(payload)})
+}
+
+func validSkillCatalogPayload(payload session.SkillCatalogEventPayload) bool {
+	if payload.SchemaVersion == "" || len(payload.CatalogHash) != sha256.Size*2 || payload.Text == "" {
+		return false
+	}
+	for _, summary := range payload.Skills {
+		if !skill.IsName(summary.Name) || strings.TrimSpace(summary.Description) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func hasModelSkillTool(definitions []*llm.ToolDefinition) bool {
+	for _, definition := range definitions {
+		if definition != nil && definition.Name == "skill" {
+			return true
+		}
+	}
+	return false
+}
+
 // emitterIDFor builds a stable event id for a code-known event.
 func (l *Loop) emitterIDFor(kind string, n uint64) string {
 	return fmt.Sprintf("ev:%s:%s:%s:%d", l.SessionID, l.Config.Owner, kind, n)
@@ -2426,6 +2659,7 @@ func shadowedSeqsRetainingTail(events []session.Event, retain int, alreadyShadow
 			surface = append(surface, event)
 		}
 	}
+	protected := protectedSkillSurfaceSeqs(surface)
 	// A fresh request must remain usable even when history is short: preserve
 	// the configured tail where possible, but always leave at least one newest
 	// surface event verbatim rather than refusing every compaction.
@@ -2475,9 +2709,79 @@ func shadowedSeqsRetainingTail(events []session.Event, retain int, alreadyShadow
 	}
 	out := make([]uint64, 0, cut)
 	for _, event := range surface[:cut] {
-		out = append(out, event.Seq)
+		if !protected[event.Seq] {
+			out = append(out, event.Seq)
+		}
 	}
 	return out
+}
+
+// Skill instructions are durable operational context, not ordinary chat
+// prose. Preserve explicit injections and the complete assistant/result group
+// of model skill loads so compaction cannot keep only an activation marker.
+func protectedSkillSurfaceSeqs(surface []session.Event) map[uint64]bool {
+	protected := make(map[uint64]bool)
+	for _, event := range surface {
+		if event.Type == session.EventSkillInvocation {
+			protected[event.Seq] = true
+		}
+		if event.Type == session.EventToolResult && toolResultIsSkillActivation(event.Data) {
+			protected[event.Seq] = true
+			for _, source := range event.SourceSeqs {
+				protected[source] = true
+			}
+		}
+	}
+	for changed := true; changed; {
+		changed = false
+		for _, event := range surface {
+			if event.Type != session.EventToolResult {
+				continue
+			}
+			linked := protected[event.Seq]
+			for _, source := range event.SourceSeqs {
+				linked = linked || protected[source]
+			}
+			if !linked {
+				continue
+			}
+			if !protected[event.Seq] {
+				protected[event.Seq], changed = true, true
+			}
+			for _, source := range event.SourceSeqs {
+				if !protected[source] {
+					protected[source], changed = true, true
+				}
+			}
+		}
+	}
+	return protected
+}
+
+func toolResultIsSkillActivation(data json.RawMessage) bool {
+	var payload struct {
+		Name    string          `json:"name"`
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(data, &payload) != nil || payload.Name != "skill" {
+		return false
+	}
+	var content string
+	return json.Unmarshal(payload.Content, &content) == nil && strings.HasPrefix(strings.TrimSpace(content), "<skill_content ")
+}
+
+func visibleSkillActivation(events []session.Event, shadowed map[uint64]struct{}, callID string) bool {
+	if callID == "" {
+		return false
+	}
+	for _, event := range events {
+		if event.Type != session.EventToolResult || event.CallID != callID || !toolResultIsSkillActivation(event.Data) {
+			continue
+		}
+		_, isShadowed := shadowed[event.Seq]
+		return !isShadowed
+	}
+	return false
 }
 
 func surfaceIndex(events []session.Event, seq uint64) int {

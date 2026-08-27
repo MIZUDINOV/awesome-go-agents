@@ -332,14 +332,27 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 		messages []*llm.Message
 	}
 	nodes := make([]surfaceNode, 0)
+	var latestSkillCatalogSeq uint64
+	for _, event := range events {
+		if event.Type == EventSkillCatalog && !shadowed[event.Seq] && event.Seq > latestSkillCatalogSeq {
+			latestSkillCatalogSeq = event.Seq
+		}
+	}
 	completedReplacement := make(map[uint64]surfaceReplacement)
+	replacementSources := make(map[uint64]bool)
 	for _, replacement := range replacements {
+		for _, seq := range replacement.sourceSeqs {
+			replacementSources[seq] = true
+		}
 		if replacement.replacementSeq > 0 {
 			completedReplacement[replacement.replacementSeq] = replacement
 		}
 	}
 	for _, event := range events {
 		if !event.Type.Surface() {
+			continue
+		}
+		if event.Type == EventSkillCatalog && event.Seq != latestSkillCatalogSeq && !replacementSources[event.Seq] {
 			continue
 		}
 		if event.Type == EventUserMessage {
@@ -427,7 +440,7 @@ func (s *Surface) Project(events []Event) ([]*llm.Message, *Projection, error) {
 
 func projectSurfaceEvent(event Event) (*llm.Message, error) {
 	switch event.Type {
-	case EventUserMessage, EventSteeringMessage, EventInjectedContext:
+	case EventUserMessage, EventSteeringMessage, EventInjectedContext, EventSkillCatalog, EventSkillInvocation:
 		var payload struct {
 			Text string `json:"text"`
 		}

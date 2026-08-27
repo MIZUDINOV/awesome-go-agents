@@ -61,6 +61,29 @@ and observation machinery. The only built-in exception is the `run_code`
 transport bridge used by Code Mode; it is not a product tool. Reference or
 test adapters belong outside the library's production tool surface.
 
+## Skill ownership
+
+AgentKit owns only the provider-neutral skill mechanism: registry and provider
+interfaces, parsing, deterministic discovery, immutable snapshots, policy
+checks, durable catalog projection, explicit invocation handling, and the
+generic model-facing `skill` loader. It does not ship product skill names,
+descriptions, bodies, visual references, publication storage, or admin APIs.
+Pinned runs load only from providers that explicitly guarantee immutable
+lookup; mutable filesystem discovery remains live-only.
+
+Skill activation loads the complete `SKILL.md` instructions only. A host may
+provide pinned manifest resources and contained relative-path resources through
+the resolver interfaces; the model reads exactly one referenced resource with
+a later `skill` call. Resource loading is denied until the durable skill
+activation has been restored into the runtime.
+
+Hosts such as Wzhooh define and publish concrete skills through the AgentKit
+API and register every real product tool in their own backend composition root.
+The `allowed-tools` frontmatter field is advisory metadata only: it never
+registers a tool, grants a capability, or widens the active tool policy.
+Skill catalogs and load metadata use the existing host session ledger; they
+must not create a second durable history.
+
 ## Acceptance
 
 `acceptance-gates.md` is the executable verification matrix. Exploratory

@@ -45,6 +45,9 @@ const (
 	EventUserMessage       EventType = "user/message"
 	EventSteeringMessage   EventType = "steering/message"
 	EventInjectedContext   EventType = "context/injected"
+	EventSkillCatalog      EventType = "skill/catalog"
+	EventSkillInvocation   EventType = "skill/invocation"
+	EventSkillLoaded       EventType = "skill/loaded"
 	EventInboxQueued       EventType = "inbox/queued"
 	EventInboxClaimed      EventType = "inbox/claimed"
 	EventInboxRequeued     EventType = "inbox/requeued"
@@ -85,6 +88,7 @@ var knownTypes = map[EventType]bool{
 	EventStepStart: true, EventStepEnd: true,
 	EventUserMessage: true, EventAssistantChunk: true, EventAssistantMessage: true,
 	EventSteeringMessage: true, EventInjectedContext: true,
+	EventSkillCatalog: true, EventSkillInvocation: true, EventSkillLoaded: true,
 	EventInboxQueued: true, EventInboxClaimed: true, EventInboxRequeued: true, EventInboxCompleted: true, EventInboxDiscarded: true,
 	EventApprovalRequested: true, EventApprovalResolved: true,
 	EventToolCall: true, EventToolResult: true,
@@ -105,7 +109,7 @@ func (t EventType) Extension() bool {
 		return false
 	}
 	switch parts[0] {
-	case "request", "turn", "step", "user", "steering", "context", "inbox", "approval", "assistant", "tool", "compaction", "usage":
+	case "request", "turn", "step", "user", "steering", "context", "skill", "inbox", "approval", "assistant", "tool", "compaction", "usage":
 		return false
 	default:
 		return true
@@ -119,7 +123,7 @@ func (t EventType) Extension() bool {
 // surface operation; the projector applies it only after the transaction end.
 func (t EventType) Surface() bool {
 	switch t {
-	case EventUserMessage, EventSteeringMessage, EventInjectedContext, EventAssistantMessage, EventToolResult, EventContextSnapshot:
+	case EventUserMessage, EventSteeringMessage, EventInjectedContext, EventSkillCatalog, EventSkillInvocation, EventAssistantMessage, EventToolResult, EventContextSnapshot:
 		return true
 	default:
 		return false
@@ -629,9 +633,49 @@ func RequestHeaderPayloadWithSnapshot(model, provider string, system []string, t
 // RequestHeaderMetadata records prompt provenance without changing provider
 // wire payloads.
 type RequestHeaderMetadata struct {
-	PromptVersion string `json:"prompt_version,omitempty"`
-	PromptHash    string `json:"prompt_hash,omitempty"`
-	ToolsHash     string `json:"tools_hash,omitempty"`
+	PromptVersion      string `json:"prompt_version,omitempty"`
+	PromptHash         string `json:"prompt_hash,omitempty"`
+	ToolsHash          string `json:"tools_hash,omitempty"`
+	SkillCatalogHash   string `json:"skill_catalog_hash,omitempty"`
+	SkillSnapshotHash  string `json:"skill_snapshot_hash,omitempty"`
+	SkillSchemaVersion string `json:"skill_schema_version,omitempty"`
+}
+
+// SkillCatalogEventPayload is a complete replacement of the model-visible
+// skill catalog. Summaries intentionally contain no provider locators.
+type SkillCatalogEventPayload struct {
+	SchemaVersion string            `json:"schema_version"`
+	Complete      bool              `json:"complete"`
+	CatalogHash   string            `json:"catalog_hash"`
+	SnapshotHash  string            `json:"snapshot_hash"`
+	SnapshotID    string            `json:"snapshot_identity"`
+	Update        bool              `json:"update"`
+	Text          string            `json:"text"`
+	Skills        []SkillSummaryRef `json:"skills"`
+}
+
+type SkillSummaryRef struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
+type SkillInvocationEventPayload struct {
+	SchemaVersion string `json:"schema_version"`
+	Name          string `json:"name"`
+	Provider      string `json:"provider"`
+	Source        string `json:"source"`
+	Version       string `json:"version"`
+	ContentHash   string `json:"content_hash"`
+	Origin        string `json:"origin"`
+	Text          string `json:"text"`
+}
+
+func SkillCatalogPayload(payload SkillCatalogEventPayload) json.RawMessage {
+	return mustJSON(payload)
+}
+
+func SkillInvocationPayload(payload SkillInvocationEventPayload) json.RawMessage {
+	return mustJSON(payload)
 }
 
 func RequestHeaderPayloadWithSnapshotAndMetadata(model, provider string, system []string, tools []string, configHash, requestHash string, capabilities []llm.Capabilities, metadata RequestHeaderMetadata, requestSnapshot json.RawMessage) json.RawMessage {
@@ -655,6 +699,15 @@ func requestHeaderPayload(model, provider string, system []string, tools []strin
 	}
 	if metadata.ToolsHash != "" {
 		payload["tools_hash"] = metadata.ToolsHash
+	}
+	if metadata.SkillCatalogHash != "" {
+		payload["skill_catalog_hash"] = metadata.SkillCatalogHash
+	}
+	if metadata.SkillSnapshotHash != "" {
+		payload["skill_snapshot_hash"] = metadata.SkillSnapshotHash
+	}
+	if metadata.SkillSchemaVersion != "" {
+		payload["skill_schema_version"] = metadata.SkillSchemaVersion
 	}
 	if len(requestSnapshot) > 0 {
 		payload["request_snapshot"] = requestSnapshot
