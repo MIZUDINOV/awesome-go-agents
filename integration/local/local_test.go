@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -61,9 +62,21 @@ func TestLocalFSReadWriteEditCAS(t *testing.T) {
 	// stale version must fail
 	if _, err := fs.EditText(ctx, target, integration.EditRequest{OldString: "LINE1", NewString: "x"}, integration.EditIntent{ExpectedVersion: res.Version}); !errors.Is(err, integration.ErrStaleVersion) {
 		t.Errorf("expected ErrStaleVersion, got %v", err)
+	} else {
+		var fsErr *integration.FSError
+		if !errors.As(err, &fsErr) || fsErr.Code != integration.FSStaleVersion {
+			t.Errorf("stale edit is not structured: %v", err)
+		}
 	}
 	// ambiguous match
-	_, _ = fs.WriteText(ctx, target, "dup dup\n", integration.WriteIntent{Overwrite: true})
+	current, err := fs.Stat(ctx, target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = fs.WriteText(ctx, target, "dup dup\n", integration.ReplaceIfVersionIntent(current.Version))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fs.EditText(ctx, target, integration.EditRequest{OldString: "dup", NewString: "DUP"}, integration.EditIntent{}); !errors.Is(err, integration.ErrAmbiguousMatch) {
 		t.Errorf("expected ErrAmbiguousMatch, got %v", err)
 	}
@@ -81,6 +94,152 @@ func TestLocalFSReadWriteEditCAS(t *testing.T) {
 	}
 }
 
+func TestLocalFSWriteCreatesNestedParentsAfterContainment(t *testing.T) {
+	root := newTestEnv(t)
+	filesystem := NewLocalFileSystem(root)
+	target, err := filesystem.Resolve(context.Background(), "nested/deeper/site.ts", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := filesystem.WriteText(context.Background(), target, "export const ready = true\n", integration.CreateIfAbsentIntent())
+	if err != nil {
+		t.Fatalf("write nested file: %v", err)
+	}
+	if !result.Created {
+		t.Fatal("nested write did not create file")
+	}
+	if got, err := os.ReadFile(filepath.Join(root, "nested", "deeper", "site.ts")); err != nil || string(got) != "export const ready = true\n" {
+		t.Fatalf("nested file = %q, err=%v", got, err)
+	}
+}
+
+func TestLocalFSNestedWriteFailsWhenParentIsFile(t *testing.T) {
+	root := newTestEnv(t)
+	filesystem := NewLocalFileSystem(root)
+	if err := os.WriteFile(filepath.Join(root, "parent"), []byte("file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	target := integration.Target{Path: filepath.Join(root, "parent", "child.txt")}
+	_, err := filesystem.WriteText(context.Background(), target, "content", integration.CreateIfAbsentIntent())
+	var fsErr *integration.FSError
+	if !errors.As(err, &fsErr) || fsErr.Code != integration.FSParentCreateFailed {
+		t.Fatalf("parent file error = %v", err)
+	}
+}
+
+func TestLocalFSVersionedReadClassifiesTypeEncodingAndSize(t *testing.T) {
+	root := newTestEnv(t)
+	filesystem := NewLocalFileSystem(root)
+	if err := os.Mkdir(filepath.Join(root, "dir"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		prepare func() string
+		limit   int64
+		code    integration.FSErrorCode
+	}{
+		{"missing", func() string { return filepath.Join(root, "missing.txt") }, 1024, integration.FSNotFound},
+		{"directory", func() string { return filepath.Join(root, "dir") }, 1024, integration.FSNotRegularFile},
+		{"binary", func() string {
+			p := filepath.Join(root, "binary.dat")
+			_ = os.WriteFile(p, []byte{0xff, 0xfe}, 0o600)
+			return p
+		}, 1024, integration.FSNotText},
+		{"too-large", func() string {
+			p := filepath.Join(root, "large.txt")
+			_ = os.WriteFile(p, []byte("12345"), 0o600)
+			return p
+		}, 4, integration.FSTooLarge},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := filesystem.ReadTextVersioned(context.Background(), integration.Target{Path: tc.prepare()}, tc.limit)
+			var fsErr *integration.FSError
+			if !errors.As(err, &fsErr) || fsErr.Code != tc.code {
+				t.Fatalf("read error = %v, want %s", err, tc.code)
+			}
+		})
+	}
+}
+
+func TestLocalFSWritePreservesPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not authoritative on Windows")
+	}
+	root := newTestEnv(t)
+	filesystem := NewLocalFileSystem(root)
+	target, err := filesystem.Resolve(context.Background(), "script.sh", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := filesystem.WriteText(context.Background(), target, "one", integration.CreateIfAbsentIntent())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target.Path, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := filesystem.WriteText(context.Background(), target, "two", integration.ReplaceIfVersionIntent(created.Version)); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o750 {
+		t.Fatalf("permissions = %o", info.Mode().Perm())
+	}
+}
+
+func TestLocalFSDeleteRequiresCurrentVersion(t *testing.T) {
+	root := newTestEnv(t)
+	filesystem := NewLocalFileSystem(root)
+	target, err := filesystem.Resolve(context.Background(), "delete-me.txt", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := filesystem.WriteText(context.Background(), target, "one", integration.CreateIfAbsentIntent())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := filesystem.Delete(context.Background(), target, "wrong"); !errors.Is(err, integration.ErrStaleVersion) {
+		t.Fatalf("stale delete error = %v", err)
+	}
+	if _, err := filesystem.Delete(context.Background(), target, created.Version); err != nil {
+		t.Fatalf("guarded delete: %v", err)
+	}
+	if _, err := os.Stat(target.Path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("file still exists: %v", err)
+	}
+}
+
+func TestLocalFSEditPreservesCRLFAndAllowsWhitespaceLiteral(t *testing.T) {
+	root := newTestEnv(t)
+	filesystem := NewLocalFileSystem(root)
+	target, err := filesystem.Resolve(context.Background(), "windows.txt", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err := filesystem.WriteText(context.Background(), target, "first\r\n  second\r\n", integration.CreateIfAbsentIntent())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := filesystem.EditText(context.Background(), target, integration.EditRequest{OldString: "  ", NewString: "\t"}, integration.EditIntent{ExpectedVersion: created.Version})
+	if err != nil {
+		t.Fatalf("edit whitespace literal: %v", err)
+	}
+	if result.Replaced != 1 {
+		t.Fatalf("replaced = %d", result.Replaced)
+	}
+	got, err := os.ReadFile(target.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "first\r\n\tsecond\r\n" {
+		t.Fatalf("CRLF was not preserved: %q", got)
+	}
+}
+
 func TestLocalFSContainment(t *testing.T) {
 	root := newTestEnv(t)
 	fs := NewLocalFileSystem(root)
@@ -95,6 +254,19 @@ func TestLocalFSContainment(t *testing.T) {
 	_, err := canonicalWithin(filepath.Join(root, "..", "escape.txt"), root)
 	if !errors.Is(err, integration.ErrTargetOutsideRoot) {
 		t.Errorf("expected ErrTargetOutsideRoot, got %v", err)
+	}
+}
+
+func TestLocalFSRejectsSymlinkEscape(t *testing.T) {
+	root := newTestEnv(t)
+	outside := t.TempDir()
+	link := filepath.Join(root, "outside-link")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Skipf("symlinks unavailable in this environment: %v", err)
+	}
+	filesystem := NewLocalFileSystem(root)
+	if _, err := filesystem.Resolve(context.Background(), "outside-link/secret.txt", root); !errors.Is(err, integration.ErrTargetOutsideRoot) {
+		t.Fatalf("symlink escape error = %v", err)
 	}
 }
 
@@ -133,6 +305,20 @@ func TestLocalSandboxReadOnlyDeniesWrites(t *testing.T) {
 	// bash mutation denied in read-only.
 	if err := sb.CheckCommand(ctx, "u1", integration.Command{Command: "rm -rf /", Workdir: root}, integration.AccessWrite); err == nil {
 		t.Error("expected bash denial in read-only session")
+	}
+}
+
+func TestLocalSandboxDeniesProtectedPathsBeforeIO(t *testing.T) {
+	root := newTestEnv(t)
+	sandbox := NewLocalSandbox(root)
+	for _, name := range []string{".git/config", ".ENV.production", "nested/.ssh/id_ed25519", "certs/site.pem", ".wzhooh/state"} {
+		for _, access := range []integration.Access{integration.AccessRead, integration.AccessWrite} {
+			_, err := sandbox.ResolvePath(context.Background(), "u1", name, root, access)
+			var denial *integration.Denial
+			if !errors.As(err, &denial) || denial.Code != "SANDBOX_DENIED_PROTECTED_PATH" {
+				t.Fatalf("ResolvePath(%q, %q) = %v", name, access, err)
+			}
+		}
 	}
 }
 

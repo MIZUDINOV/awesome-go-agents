@@ -13,6 +13,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -43,7 +44,7 @@ type obsKey struct {
 
 type obsEntry struct {
 	state   Observation
-	version string
+	version integration.FileVersion
 }
 
 // NewLocalFileSystem returns a filesystem confined to root.
@@ -52,9 +53,9 @@ func NewLocalFileSystem(root string) *LocalFileSystem {
 }
 
 // Version computes the content version (SHA-256 hex) of data.
-func Version(data []byte) string {
+func Version(data []byte) integration.FileVersion {
 	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+	return integration.FileVersion(hex.EncodeToString(sum[:]))
 }
 
 // Resolve canonicalizes rawPath against cwd and confines it to Root
@@ -80,7 +81,20 @@ func (f *LocalFileSystem) Resolve(_ context.Context, rawPath, cwd string) (integ
 	if err != nil {
 		return integration.Target{}, err
 	}
-	return integration.Target{Path: canonical}, nil
+	displayPath := filepath.ToSlash(relToRoot(canonical, f.Root))
+	if integration.IsProtectedWorkspacePath(displayPath) {
+		return integration.Target{}, integration.SandboxDenied("SANDBOX_DENIED_PROTECTED_PATH", "file", displayPath,
+			"protected workspace metadata and credentials are not available to model-facing tools")
+	}
+	return integration.Target{Key: canonical, Path: canonical, DisplayPath: displayPath}, nil
+}
+
+func relToRoot(target, root string) string {
+	rel, err := filepath.Rel(root, target)
+	if err != nil || rel == "." {
+		return "."
+	}
+	return rel
 }
 
 // canonicalWithin resolves path to a clean absolute path and verifies it stays
@@ -133,81 +147,140 @@ func (f *LocalFileSystem) Stat(_ context.Context, target integration.Target) (in
 		if errors.Is(err, fs.ErrNotExist) {
 			return integration.FileInfo{Exists: false}, nil
 		}
-		return integration.FileInfo{}, fmt.Errorf("stat %s: %w", target.Path, err)
+		return integration.FileInfo{}, classifyLocalFileError("stat", target.Path, err)
+	}
+	version, err := fileVersion(target.Path, info)
+	if err != nil {
+		return integration.FileInfo{}, classifyLocalFileError("stat version", target.Path, err)
 	}
 	return integration.FileInfo{
 		Exists:  true,
 		IsDir:   info.IsDir(),
 		Size:    info.Size(),
-		Version: fileVersion(target.Path, info),
+		Version: version,
+		Kind:    fileKind(info.Mode()),
 	}, nil
+}
+
+func fileKind(mode fs.FileMode) integration.FileKind {
+	switch {
+	case mode.IsRegular():
+		return integration.FileKindFile
+	case mode.IsDir():
+		return integration.FileKindDirectory
+	case mode&fs.ModeSymlink != 0:
+		return integration.FileKindSymlink
+	default:
+		return integration.FileKindOther
+	}
 }
 
 // fileVersion derives a content version from the file (hash) or, for
 // directories, a size+mtime digest.
-func fileVersion(path string, info os.FileInfo) string {
+func fileVersion(path string, info os.FileInfo) (integration.FileVersion, error) {
 	if info.IsDir() {
 		sum := sha256.Sum256([]byte(fmt.Sprintf("%s:%d:%d", path, info.Size(), info.ModTime().UnixNano())))
-		return hex.EncodeToString(sum[:])
+		return integration.FileVersion(hex.EncodeToString(sum[:])), nil
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	return Version(data)
+	return Version(data), nil
 }
 
 func (f *LocalFileSystem) ReadText(ctx context.Context, target integration.Target) (string, error) {
+	read, err := f.ReadTextVersioned(ctx, target, 0)
+	return read.Content, err
+}
+
+func (f *LocalFileSystem) ReadTextVersioned(ctx context.Context, target integration.Target, maxBytes int64) (integration.TextRead, error) {
+	if err := ctx.Err(); err != nil {
+		return integration.TextRead{}, integration.NewFSError(integration.FSAborted, true, "retry after cancellation", err)
+	}
+	info, err := os.Stat(target.Path)
+	if err != nil {
+		return integration.TextRead{}, classifyLocalFileError("read", target.Path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return integration.TextRead{}, integration.NewFSError(integration.FSNotRegularFile, false, "select a regular text file", nil)
+	}
+	if maxBytes > 0 && info.Size() > maxBytes {
+		return integration.TextRead{}, integration.NewFSError(integration.FSTooLarge, false, "use a bounded search or artifact for large files", nil)
+	}
 	data, err := os.ReadFile(target.Path)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return "", fmt.Errorf("read %s: file does not exist", target.Path)
-		}
-		return "", fmt.Errorf("read %s: %w", target.Path, err)
+		return integration.TextRead{}, classifyLocalFileError("read", target.Path, err)
+	}
+	if maxBytes > 0 && int64(len(data)) > maxBytes {
+		return integration.TextRead{}, integration.NewFSError(integration.FSTooLarge, false, "use a bounded search or artifact for large files", nil)
 	}
 	if !utf8Valid(data) {
-		return "", fmt.Errorf("read %s: not valid UTF-8 text", target.Path)
+		return integration.TextRead{}, integration.NewFSError(integration.FSNotText, false, "select a UTF-8 text file", nil)
 	}
-	return string(data), nil
+	return integration.TextRead{Content: string(data), Version: Version(data), Size: int64(len(data))}, nil
 }
 
-func (f *LocalFileSystem) ReadBytes(_ context.Context, target integration.Target) ([]byte, error) {
-	return os.ReadFile(target.Path)
+func (f *LocalFileSystem) ReadBytes(ctx context.Context, target integration.Target) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, integration.NewFSError(integration.FSAborted, true, "retry after cancellation", err)
+	}
+	data, err := os.ReadFile(target.Path)
+	if err != nil {
+		return nil, classifyLocalFileError("read bytes", target.Path, err)
+	}
+	return data, nil
 }
 
-func (f *LocalFileSystem) WriteText(_ context.Context, target integration.Target, content string, intent integration.WriteIntent) (integration.WriteResult, error) {
+func (f *LocalFileSystem) WriteText(ctx context.Context, target integration.Target, content string, intent integration.WriteIntent) (integration.WriteResult, error) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
+	kind, expectedVersion, err := intent.Normalized()
+	if err != nil {
+		return integration.WriteResult{}, err
+	}
+	if err := ensureParentInsideRoot(target.Path, f.Root); err != nil {
+		return integration.WriteResult{}, err
+	}
 
 	info, err := os.Stat(target.Path)
 	exists := err == nil
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return integration.WriteResult{}, fmt.Errorf("write %s: %w", target.Path, err)
+		return integration.WriteResult{}, classifyLocalFileError("write", target.Path, err)
 	}
 	if exists && info.IsDir() {
-		return integration.WriteResult{}, fmt.Errorf("write %s: target is a directory", target.Path)
+		return integration.WriteResult{}, integration.NewFSError(integration.FSNotRegularFile, false, "select a regular file path", nil)
 	}
 
-	if intent.CreateIfAbsent && exists {
-		return integration.WriteResult{}, fmt.Errorf("%w: %s", integration.ErrAlreadyExists, target.Path)
+	if kind == integration.WriteIntentCreateIfAbsent && exists {
+		return integration.WriteResult{}, integration.NewFSError(integration.FSAlreadyExists, true, "read the existing file before replacing it", integration.ErrAlreadyExists)
 	}
-	if exists && intent.ExpectedVersion != "" {
-		current := fileVersion(target.Path, info)
-		if current != intent.ExpectedVersion {
-			return integration.WriteResult{}, fmt.Errorf("%w: %s (expected %s)", integration.ErrStaleVersion, target.Path, intent.ExpectedVersion)
+	if kind == integration.WriteIntentReplaceIfVersion {
+		if !exists {
+			return integration.WriteResult{}, staleLocalFileError(target.Path)
+		}
+		current, versionErr := fileVersion(target.Path, info)
+		if versionErr != nil {
+			return integration.WriteResult{}, classifyLocalFileError("write version", target.Path, versionErr)
+		}
+		if current != expectedVersion {
+			return integration.WriteResult{}, staleLocalFileError(target.Path)
 		}
 	}
-	if exists && !intent.Overwrite {
-		return integration.WriteResult{}, fmt.Errorf("write %s: refusing to overwrite without overwrite intent", target.Path)
+	if err := ctx.Err(); err != nil {
+		return integration.WriteResult{}, integration.NewFSError(integration.FSAborted, true, "retry after cancellation", err)
 	}
 
-	if err := atomicWrite(target.Path, []byte(content)); err != nil {
-		return integration.WriteResult{}, err
+	if err := atomicWrite(target.Path, []byte(content), kind == integration.WriteIntentCreateIfAbsent); err != nil {
+		if errors.Is(err, integration.ErrAlreadyExists) {
+			return integration.WriteResult{}, integration.NewFSError(integration.FSAlreadyExists, true, "read the existing file before replacing it", err)
+		}
+		return integration.WriteResult{}, classifyLocalFileError("write commit", target.Path, err)
 	}
 	return integration.WriteResult{Version: Version([]byte(content)), Created: !exists}, nil
 }
 
-func (f *LocalFileSystem) EditText(_ context.Context, target integration.Target, edit integration.EditRequest, intent integration.EditIntent) (integration.EditResult, error) {
+func (f *LocalFileSystem) EditText(ctx context.Context, target integration.Target, edit integration.EditRequest, intent integration.EditIntent) (integration.EditResult, error) {
 	f.lock.Lock()
 	defer f.lock.Unlock()
 
@@ -219,38 +292,50 @@ func (f *LocalFileSystem) EditText(_ context.Context, target integration.Target,
 	}
 	info, err := os.Stat(target.Path)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return integration.EditResult{}, fmt.Errorf("edit %s: file does not exist", target.Path)
-		}
-		return integration.EditResult{}, fmt.Errorf("edit %s: %w", target.Path, err)
+		return integration.EditResult{}, classifyLocalFileError("edit", target.Path, err)
 	}
 	if intent.ExpectedVersion != "" {
-		current := fileVersion(target.Path, info)
+		current, versionErr := fileVersion(target.Path, info)
+		if versionErr != nil {
+			return integration.EditResult{}, classifyLocalFileError("edit version", target.Path, versionErr)
+		}
 		if current != intent.ExpectedVersion {
-			return integration.EditResult{}, fmt.Errorf("%w: %s", integration.ErrStaleVersion, target.Path)
+			return integration.EditResult{}, staleLocalFileError(target.Path)
 		}
 	}
 	data, err := os.ReadFile(target.Path)
 	if err != nil {
-		return integration.EditResult{}, fmt.Errorf("edit %s: %w", target.Path, err)
+		return integration.EditResult{}, classifyLocalFileError("edit read", target.Path, err)
+	}
+	if !utf8Valid(data) {
+		return integration.EditResult{}, integration.NewFSError(integration.FSNotText, false, "select a UTF-8 text file", nil)
 	}
 	text := string(data)
-	count := strings.Count(text, edit.OldString)
+	normalized, crlf := normalizeLineEndings(text)
+	oldString, _ := normalizeLineEndings(edit.OldString)
+	newString, _ := normalizeLineEndings(edit.NewString)
+	count := strings.Count(normalized, oldString)
 	if count == 0 {
-		return integration.EditResult{}, fmt.Errorf("edit %s: old_string not found (no match)", target.Path)
+		return integration.EditResult{}, integration.NewFSError(integration.FSEditNotFound, false, "re-read the file and provide an exact literal", nil)
 	}
 	if count > 1 && !edit.ReplaceAll {
-		return integration.EditResult{}, fmt.Errorf("%w: %s (%d matches; use replace_all or a more specific old_string)", integration.ErrAmbiguousMatch, target.Path, count)
+		return integration.EditResult{}, integration.NewFSError(integration.FSAmbiguousEdit, false, "use replace_all or a more specific literal", integration.ErrAmbiguousMatch)
 	}
 	replaced := count
-	newText := text
+	newText := normalized
 	if edit.ReplaceAll {
-		newText = strings.ReplaceAll(text, edit.OldString, edit.NewString)
+		newText = strings.ReplaceAll(normalized, oldString, newString)
 	} else {
-		newText = strings.Replace(text, edit.OldString, edit.NewString, 1)
+		newText = strings.Replace(normalized, oldString, newString, 1)
 	}
-	if err := atomicWrite(target.Path, []byte(newText)); err != nil {
-		return integration.EditResult{}, err
+	if crlf {
+		newText = strings.ReplaceAll(newText, "\n", "\r\n")
+	}
+	if err := ctx.Err(); err != nil {
+		return integration.EditResult{}, integration.NewFSError(integration.FSAborted, true, "retry after cancellation", err)
+	}
+	if err := atomicWrite(target.Path, []byte(newText), false); err != nil {
+		return integration.EditResult{}, classifyLocalFileError("edit commit", target.Path, err)
 	}
 	return integration.EditResult{
 		Version: Version([]byte(newText)), Replaced: replaced,
@@ -258,8 +343,52 @@ func (f *LocalFileSystem) EditText(_ context.Context, target integration.Target,
 	}, nil
 }
 
+func (f *LocalFileSystem) Delete(ctx context.Context, target integration.Target, expectedVersion integration.FileVersion) (integration.DeleteResult, error) {
+	f.lock.Lock()
+	defer f.lock.Unlock()
+	if expectedVersion == "" {
+		return integration.DeleteResult{}, integration.NewFSError(integration.FSNotObserved, false, "read the file before deleting it", integration.ErrNotObserved)
+	}
+	info, err := os.Stat(target.Path)
+	if err != nil {
+		return integration.DeleteResult{}, classifyLocalFileError("delete", target.Path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return integration.DeleteResult{}, integration.NewFSError(integration.FSNotRegularFile, false, "select a regular file", nil)
+	}
+	current, versionErr := fileVersion(target.Path, info)
+	if versionErr != nil {
+		return integration.DeleteResult{}, classifyLocalFileError("delete version", target.Path, versionErr)
+	}
+	if current != expectedVersion {
+		return integration.DeleteResult{}, staleLocalFileError(target.Path)
+	}
+	if err := ctx.Err(); err != nil {
+		return integration.DeleteResult{}, integration.NewFSError(integration.FSAborted, true, "retry after cancellation", err)
+	}
+	if err := os.Remove(target.Path); err != nil {
+		return integration.DeleteResult{}, classifyLocalFileError("delete commit", target.Path, err)
+	}
+	return integration.DeleteResult{Deleted: true}, nil
+}
+
+func classifyLocalFileError(operation, path string, err error) error {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return integration.NewFSError(integration.FSNotFound, false, "read the current workspace state", err)
+	case errors.Is(err, fs.ErrPermission):
+		return integration.NewFSError(integration.FSPermissionDenied, false, "use an accessible workspace file", err)
+	default:
+		return integration.NewFSError(integration.FSIO, true, "retry the filesystem operation", fmt.Errorf("%s %s: %w", operation, path, err))
+	}
+}
+
+func staleLocalFileError(path string) error {
+	return integration.NewFSError(integration.FSStaleVersion, true, "re-read the file, then retry", fmt.Errorf("%w: %s", integration.ErrStaleVersion, path))
+}
+
 // Glob lists files under dir matching pattern (sorted, bounded).
-func (f *LocalFileSystem) Glob(_ context.Context, dir, pattern string, maxResults int) ([]string, error) {
+func (f *LocalFileSystem) Glob(ctx context.Context, dir, pattern string, maxResults int) ([]string, error) {
 	root, err := canonicalWithin(dir, f.Root)
 	if err != nil {
 		return nil, err
@@ -267,10 +396,16 @@ func (f *LocalFileSystem) Glob(_ context.Context, dir, pattern string, maxResult
 	if maxResults <= 0 {
 		maxResults = 100
 	}
+	if _, err := filepath.Match(filepath.FromSlash(pattern), ""); err != nil {
+		return nil, integration.NewFSError(integration.FSInvalidPath, false, "provide a valid glob pattern", err)
+	}
 	var matches []string
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
-			return nil
+			return err
 		}
 		if d.IsDir() {
 			// Skip hidden dirs and vendor/node_modules by default depth rule.
@@ -282,6 +417,9 @@ func (f *LocalFileSystem) Glob(_ context.Context, dir, pattern string, maxResult
 		}
 		rel, err := filepath.Rel(root, path)
 		if err != nil {
+			return err
+		}
+		if integration.IsProtectedWorkspacePath(filepath.ToSlash(rel)) {
 			return nil
 		}
 		matched, err := filepath.Match(filepath.FromSlash(pattern), rel)
@@ -300,7 +438,10 @@ func (f *LocalFileSystem) Glob(_ context.Context, dir, pattern string, maxResult
 		walkErr = nil
 	}
 	if walkErr != nil {
-		return nil, walkErr
+		if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
+			return nil, integration.NewFSError(integration.FSAborted, true, "retry after cancellation", walkErr)
+		}
+		return nil, classifyLocalFileError("glob", root, walkErr)
 	}
 	sort.Strings(matches)
 	return matches, nil
@@ -308,7 +449,7 @@ func (f *LocalFileSystem) Glob(_ context.Context, dir, pattern string, maxResult
 
 // Grep scans regular text files under dir for the literal/regex pattern.
 // maxMatches bounds results; lines carry 1-based numbers.
-func (f *LocalFileSystem) Grep(_ context.Context, dir, pattern string, maxMatches int, maxBytesPerFile int64) ([]integration.GrepMatch, error) {
+func (f *LocalFileSystem) Grep(ctx context.Context, dir, pattern string, maxMatches int, maxBytesPerFile int64) ([]integration.GrepMatch, error) {
 	root, err := canonicalWithin(dir, f.Root)
 	if err != nil {
 		return nil, err
@@ -316,14 +457,20 @@ func (f *LocalFileSystem) Grep(_ context.Context, dir, pattern string, maxMatche
 	if maxMatches <= 0 {
 		maxMatches = 200
 	}
+	if maxBytesPerFile <= 0 {
+		maxBytesPerFile = 1 << 20
+	}
 	var out []integration.GrepMatch
 	re, err := compilePattern(pattern)
 	if err != nil {
-		return nil, err
+		return nil, integration.NewFSError(integration.FSInvalidPath, false, "provide a valid regular expression", err)
 	}
 	walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		if err != nil {
-			return nil
+			return err
 		}
 		if d.IsDir() {
 			name := d.Name()
@@ -336,17 +483,29 @@ func (f *LocalFileSystem) Grep(_ context.Context, dir, pattern string, maxMatche
 			return fs.ErrClosed
 		}
 		info, err := d.Info()
-		if err != nil || info.IsDir() {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if integration.IsProtectedWorkspacePath(filepath.ToSlash(rel)) {
 			return nil
 		}
 		if info.Size() > maxBytesPerFile {
 			return nil // skip oversized binaries
 		}
 		data, err := os.ReadFile(path)
-		if err != nil || !utf8Valid(data) {
+		if err != nil {
+			return err
+		}
+		if !utf8Valid(data) {
 			return nil
 		}
-		rel, _ := filepath.Rel(root, path)
 		lines := strings.Split(string(data), "\n")
 		for i, line := range lines {
 			if re.MatchString(line) {
@@ -362,7 +521,10 @@ func (f *LocalFileSystem) Grep(_ context.Context, dir, pattern string, maxMatche
 		walkErr = nil
 	}
 	if walkErr != nil {
-		return nil, walkErr
+		if errors.Is(walkErr, context.Canceled) || errors.Is(walkErr, context.DeadlineExceeded) {
+			return nil, integration.NewFSError(integration.FSAborted, true, "retry after cancellation", walkErr)
+		}
+		return nil, classifyLocalFileError("grep", root, walkErr)
 	}
 	return out, nil
 }
@@ -383,7 +545,7 @@ const (
 )
 
 // record registers an observation for the owner's session (H-FS-OBS-001..006).
-func (f *LocalFileSystem) record(target integration.Target, owner string, state integration.Observation, version string) {
+func (f *LocalFileSystem) record(target integration.Target, owner string, state integration.Observation, version integration.FileVersion) {
 	if owner == "" {
 		return
 	}
@@ -394,13 +556,13 @@ func (f *LocalFileSystem) record(target integration.Target, owner string, state 
 
 // Observe marks a target observed (read path). State is scoped per owner and
 // never leaks between users (H-FS-OBS-007).
-func (f *LocalFileSystem) Observe(_ context.Context, target integration.Target, owner string, state integration.Observation, version string) error {
+func (f *LocalFileSystem) Observe(_ context.Context, target integration.Target, owner string, state integration.Observation, version integration.FileVersion) error {
 	f.record(target, owner, state, version)
 	return nil
 }
 
 // Observed returns the recorded state/version for owner+target.
-func (f *LocalFileSystem) Observed(_ context.Context, target integration.Target, owner string) (integration.Observation, string, bool) {
+func (f *LocalFileSystem) Observed(_ context.Context, target integration.Target, owner string) (integration.Observation, integration.FileVersion, bool) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	entry, ok := f.obs[obsKey{owner: owner, path: target.Path}]
@@ -412,26 +574,48 @@ func (f *LocalFileSystem) Observed(_ context.Context, target integration.Target,
 
 // ObservedVersion returns the recorded version for owner+target and whether
 // the target was observed.
-func (f *LocalFileSystem) ObservedVersion(owner string, target integration.Target) (string, bool) {
+func (f *LocalFileSystem) ObservedVersion(owner string, target integration.Target) (integration.FileVersion, bool) {
 	_, version, ok := f.Observed(context.Background(), target, owner)
 	return version, ok
 }
 
 // ObservedState returns the recorded observation state.
-func (f *LocalFileSystem) ObservedState(owner string, target integration.Target) (integration.Observation, string, bool) {
+func (f *LocalFileSystem) ObservedState(owner string, target integration.Target) (integration.Observation, integration.FileVersion, bool) {
 	return f.Observed(context.Background(), target, owner)
 }
 
-func atomicWrite(path string, data []byte) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".agentkit-write-*")
-	if err != nil {
-		return fmt.Errorf("write %s: create temp: %w", path, err)
+func ensureParentInsideRoot(target, root string) error {
+	parent := filepath.Dir(target)
+	if _, err := canonicalWithin(parent, root); err != nil {
+		return integration.NewFSError(integration.FSSandboxDenied, false, "use a workspace-contained path", err)
 	}
-	tmpName := tmp.Name()
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		return integration.NewFSError(integration.FSParentCreateFailed, false, "use a writable workspace directory", err)
+	}
+	if _, err := canonicalWithin(parent, root); err != nil {
+		return integration.NewFSError(integration.FSSandboxDenied, false, "the parent resolved outside the workspace", err)
+	}
+	return nil
+}
+
+func atomicWrite(path string, data []byte, createOnly bool) error {
+	dir := filepath.Dir(path)
+	stagingDir, err := os.MkdirTemp(dir, ".agentkit-staging-*")
+	if err != nil {
+		return fmt.Errorf("write %s: create staging directory: %w", path, err)
+	}
+	if err := os.Chmod(stagingDir, 0o700); err != nil {
+		_ = os.RemoveAll(stagingDir)
+		return fmt.Errorf("write %s: secure staging directory: %w", path, err)
+	}
 	defer func() {
-		_ = os.Remove(tmpName)
+		_ = os.RemoveAll(stagingDir)
 	}()
+	tmpName := filepath.Join(stagingDir, "content")
+	tmp, err := os.OpenFile(tmpName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("write %s: create staged file: %w", path, err)
+	}
 	if _, err := tmp.Write(data); err != nil {
 		tmp.Close()
 		return fmt.Errorf("write %s: %w", path, err)
@@ -443,14 +627,50 @@ func atomicWrite(path string, data []byte) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("write %s: close temp: %w", path, err)
 	}
+	if info, err := os.Stat(path); err == nil {
+		if err := os.Chmod(tmpName, info.Mode().Perm()); err != nil {
+			return fmt.Errorf("write %s: preserve permissions: %w", path, err)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("write %s: inspect permissions: %w", path, err)
+	}
+	if createOnly {
+		if err := os.Link(tmpName, path); err != nil {
+			if errors.Is(err, fs.ErrExist) {
+				return fmt.Errorf("%w: %s", integration.ErrAlreadyExists, path)
+			}
+			return fmt.Errorf("write %s: publish create: %w", path, err)
+		}
+		return syncDirectory(dir)
+	}
 	if err := os.Rename(tmpName, path); err != nil {
 		return fmt.Errorf("write %s: commit: %w", path, err)
+	}
+	return syncDirectory(dir)
+}
+
+func syncDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	directory, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open parent for sync: %w", err)
+	}
+	defer directory.Close()
+	if err := directory.Sync(); err != nil {
+		return fmt.Errorf("sync parent directory: %w", err)
 	}
 	return nil
 }
 
 func utf8Valid(data []byte) bool {
 	return strings.ToValidUTF8(string(data), "\uFFFD") == string(data)
+}
+
+func normalizeLineEndings(value string) (string, bool) {
+	crlf := strings.Count(value, "\r\n") > strings.Count(strings.ReplaceAll(value, "\r\n", ""), "\n")
+	return strings.ReplaceAll(value, "\r\n", "\n"), crlf
 }
 
 // ensure interface satisfaction

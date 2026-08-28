@@ -88,6 +88,10 @@ func (s *LocalSandbox) ResolvePath(ctx context.Context, owner, rawPath, cwd stri
 		}
 		return integration.Target{}, err
 	}
+	if integration.IsProtectedWorkspacePath(target.DisplayPath) {
+		return integration.Target{}, integration.SandboxDenied("SANDBOX_DENIED_PROTECTED_PATH", "file", target.DisplayPath,
+			"protected workspace metadata and credentials are not available to model-facing tools")
+	}
 	if access == integration.AccessWrite && s.Mode(owner) == integration.ModeReadOnly {
 		return integration.Target{}, integration.SandboxDenied("SANDBOX_DENIED_READONLY", "file", target.Path,
 			"the session is read-only; write operations are blocked by policy")
@@ -158,7 +162,7 @@ func (s *LocalSandbox) withinRoot(path string) bool {
 
 func isMutatingTool(toolName string) bool {
 	switch toolName {
-	case "write", "edit", "bash":
+	case "write", "edit", "delete", "bash":
 		return true
 	}
 	return false
